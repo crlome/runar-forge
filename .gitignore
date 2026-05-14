@@ -1,0 +1,30 @@
+# Rust
+target/
+Cargo.lock.bak
+
+# npm shim binary + deps
+packages/cli-wrapper/bin/runar
+packages/cli-wrapper/bin/runar.exe
+packages/cli-wrapper/node_modules/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Storage / runtime
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+logs/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

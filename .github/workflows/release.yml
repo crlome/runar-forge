@@ -1,0 +1,119 @@
+# Build + publish release binaries for `v*` tags. Cross-compiles to
+# linux x86_64/aarch64, macOS arm64, windows x86_64 and uploads tarballs
+# (zip on Windows) plus sha256 checksums to the GitHub Release.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install cross (linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p runar-muninn
+          else
+            cargo build --release --target ${{ matrix.target }} -p runar-muninn
+          fi
+
+      - name: Codesign (macOS, ad-hoc)
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - target/${{ matrix.target }}/release/runar
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="runar-${{ matrix.target }}"
+          OUT="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "$OUT"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            BIN="target/${{ matrix.target }}/release/runar.exe"
+            cp "$BIN" "$OUT/runar.exe"
+            (cd "$OUT" && 7z a "${NAME}.zip" runar.exe >/dev/null)
+            (cd "$OUT" && certutil -hashfile "${NAME}.zip" SHA256 | grep -v "hash" | tr -d ' \r' > "${NAME}.zip.sha256" || sha256sum "${NAME}.zip" > "${NAME}.zip.sha256")
+            rm "$OUT/runar.exe"
+          else
+            BIN="target/${{ matrix.target }}/release/runar"
+            cp "$BIN" "$OUT/runar"
+            (cd "$OUT" && tar -czf "${NAME}.tar.gz" runar && (shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" 2>/dev/null || sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"))
+            rm "$OUT/runar"
+          fi
+          echo "dir=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runar-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.dir }}/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Attach binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
+            artifacts/**/*.zip
+            artifacts/**/*.zip.sha256
+          fail_on_unmatched_files: true

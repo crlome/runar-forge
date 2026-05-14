@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/muninn"]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/crlome/runar-forge"
+authors = ["RunarForge"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

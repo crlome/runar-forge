@@ -1,0 +1,33 @@
+{
+  "name": "@runar-forge/cli",
+  "version": "0.1.0",
+  "description": "npm wrapper that downloads the runar Rust binary for your platform",
+  "bin": {
+    "runar": "bin/runar.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crlome/runar-forge.git"
+  },
+  "license": "MIT"
+}

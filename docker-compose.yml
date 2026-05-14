@@ -1,0 +1,46 @@
+# RunarForge — Docker Compose
+# The TypeScript daemon services (muninn, huginn, ui) were removed in
+# the v0.2 cleanup. The `runar` Rust binary now runs natively; this
+# compose file exists only to spin up the optional Postgres + pgvector
+# backing service for users who don't want to install PG locally.
+#
+# Usage:
+#   docker compose --profile postgresql up postgres
+
+name: runar-forge
+
+# ============================================================
+# Services
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL + pgvector — backing store for `runar`
+  # Profile: postgresql
+  # ----------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: [postgresql]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: runar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-runar_password}
+      POSTGRES_DB: runar_memory
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./tools/scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runar -d runar_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+# ============================================================
+# Volumes
+# ============================================================
+volumes:
+  postgres-data:
+    driver: local

@@ -1,0 +1,110 @@
+[package]
+name = "runar-muninn"
+description = "Muninn — Persistent memory for AI coding tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "runar"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enables the bundled ONNX-based local embedding provider. Off by default
+# so the lean binary stays ~17 MB; release CI can flip this on for the
+# shipped artifact. When enabled, `RUNAR_EMBEDDINGS=local` selects the
+# fastembed-backed provider (all-MiniLM-L6-v2, 384-dim).
+local-embeddings = ["dep:fastembed"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SQLite with bundled FTS5 (statically linked, no system dependency)
+rusqlite = { version = "0.34", features = ["bundled-full"] }
+
+# PostgreSQL (tokio-postgres avoids the libsqlite3-sys conflict that sqlx has)
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+deadpool-postgres = { version = "0.14" }
+postgres-types = { version = "0.2", features = ["derive"] }
+pgvector = { version = "0.4", features = ["postgres"] }
+
+# UUID generation
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Regex for source-pattern detectors (e.g. Rust trait-impl discovery)
+regex = "1"
+
+# Interactive TUI prompts for `runar init --interactive`
+dialoguer = "0.11"
+console = "0.15"
+
+# Load ~/.runar-forge/.env at startup (unset vars only) so Claude Code
+# hooks work without requiring shell-rc edits on any platform.
+dotenvy = "0.15"
+
+# Cross-platform home directory resolution — `std::env::var("HOME")`
+# is empty on Windows; `dirs::home_dir()` falls back to USERPROFILE.
+dirs = "5"
+
+# Atomic .env writes for `runar config set` (temp file + persist).
+# Phase 5.5 — was dev-dep only until config_cmd needed it at runtime.
+tempfile = "3"
+
+# Percent-encode password into RUNAR_DB_URL during `runar config wizard`.
+# Phase 5.5. Already transitive via reqwest; pinned explicitly here.
+percent-encoding = "2"
+
+# Local ONNX embeddings (feature-gated). Pulls in ort + tokenizers +
+# onnxruntime binaries — keeps default builds lean.
+fastembed = { version = "4", optional = true }
+
+# HTTP client for OpenAI API + `runar update` manifest fetch.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+
+# SHA-256 verification for `runar update` downloads. Already transitive
+# via postgres-protocol; pinned explicitly so update.rs has a stable
+# import surface.
+sha2 = "0.10"
+hex = "0.4"
+
+# Streaming download progress for `runar update`.
+futures-util = "0.3"
+
+# Async trait support
+async-trait = "0.1"
+
+# Code analysis (Huginn): tree-sitter + language grammars + ast-grep
+tree-sitter = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+ast-grep-core = "0.39"
+ast-grep-language = "0.39"
+
+[dev-dependencies]
+tokio-test = "0.4"
