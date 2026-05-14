@@ -779,7 +779,7 @@ impl CuratorOracle {
             })
             .collect();
 
-        topics.sort_by(|a, b| b.count.cmp(&a.count));
+        topics.sort_by_key(|b| std::cmp::Reverse(b.count));
         Ok(topics)
     }
 

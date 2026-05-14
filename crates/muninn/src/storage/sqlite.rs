@@ -1637,7 +1637,7 @@ impl MemoryStorage for SqliteAdapter {
         }
         tx.commit().map_err(db_err)?;
         // Preserve FIFO order from `ids` (SELECT IN list doesn't keep it).
-        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        rows.sort_by_key(|a| a.created_at);
         Ok(rows)
     }
 

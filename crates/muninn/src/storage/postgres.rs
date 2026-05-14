@@ -1409,7 +1409,7 @@ impl MemoryStorage for PostgresAdapter {
             });
         }
         tx.commit().await.map_err(db_err)?;
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.sort_by_key(|a| a.created_at);
         Ok(out)
     }
 

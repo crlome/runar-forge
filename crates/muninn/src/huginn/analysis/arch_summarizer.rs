@@ -64,7 +64,7 @@ pub fn summarize(
     }
 
     let mut langs: Vec<(String, usize)> = lang_counts.into_iter().collect();
-    langs.sort_by(|a, b| b.1.cmp(&a.1));
+    langs.sort_by_key(|b| std::cmp::Reverse(b.1));
     let top_languages = langs.into_iter().take(5).collect::<Vec<_>>();
 
     let confirmed_stack = detect_stack(&all_imports, &top_languages);
