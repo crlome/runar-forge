@@ -793,10 +793,8 @@ async fn run_enqueue(project: Option<String>, silent: bool) {
 
     match lib.check_observation_duplicate(&content_hash, 30).await {
         Ok(true) => return,
-        Err(e) => {
-            if !silent {
-                eprintln!("muninn: dedup check failed — {e}");
-            }
+        Err(e) if !silent => {
+            eprintln!("muninn: dedup check failed — {e}");
             // Fall through; a duplicate row is less bad than losing an observation.
         }
         _ => {}
