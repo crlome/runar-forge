@@ -468,8 +468,8 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let effective_topic_key = topic_key
-        .unwrap_or_else(|| suggest_topic_key(entry_type.as_str(), &title));
+    let effective_topic_key =
+        topic_key.unwrap_or_else(|| suggest_topic_key(entry_type.as_str(), &title));
 
     let confidence = resolve_confidence(args.get("confidence"));
 
@@ -519,7 +519,10 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
 async fn tool_search(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
+    let compact = args
+        .get("compact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let project_id = args.get("projectId").and_then(|v| v.as_str());
     let entry_type: Option<EntryType> = args
         .get("type")
@@ -596,7 +599,11 @@ async fn tool_search(args: &Value, lib: &MemoryLibrarian) -> Result<String, Stri
 
     let total_tokens: usize = items
         .iter()
-        .filter_map(|v| v.get("tokensEstimate").and_then(|t| t.as_u64()).map(|u| u as usize))
+        .filter_map(|v| {
+            v.get("tokensEstimate")
+                .and_then(|t| t.as_u64())
+                .map(|u| u as usize)
+        })
         .sum();
 
     Ok(serde_json::json!({
@@ -826,10 +833,7 @@ async fn tool_merge_projects(args: &Value, lib: &MemoryLibrarian) -> Result<Stri
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let dry_run = args
-        .get("dryRun")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(true);
 
     if source.is_empty() || target.is_empty() {
         return Err("sourceProjectId and targetProjectId are required".into());

@@ -616,7 +616,8 @@ mod tests {
             vec![("Lone", "LoneType")],
         )];
         let patterns = extract(&analyses);
-        assert!(patterns.iter().all(|p| p.name != "storage-adapter"
-            && p.name != "trait-polymorphism"));
+        assert!(patterns
+            .iter()
+            .all(|p| p.name != "storage-adapter" && p.name != "trait-polymorphism"));
     }
 }

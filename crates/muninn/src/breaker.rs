@@ -54,7 +54,13 @@ fn state_path(project_id: &str) -> PathBuf {
     // Sanitize project id so arbitrary slashes don't escape the state dir.
     let safe: String = project_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     p.push(format!("breaker-{safe}.json"));
     p
@@ -144,7 +150,13 @@ fn db_state_path(project_id: &str) -> PathBuf {
     let mut p = crate::setup::runar_dir();
     let safe: String = project_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     p.push(format!("db-breaker-{safe}.json"));
     p

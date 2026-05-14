@@ -21,9 +21,8 @@ pub fn file_entries(result: &FileAnalysisResult, project_id: &str) -> Vec<Memory
 
 /// Convert a file analysis into a Muninn memory entry input.
 pub fn file_entry(result: &FileAnalysisResult, project_id: &str) -> Option<MemoryEntryInput> {
-    let is_markdown =
-        result.file_path.to_lowercase().ends_with(".md")
-            || result.file_path.to_lowercase().ends_with(".mdx");
+    let is_markdown = result.file_path.to_lowercase().ends_with(".md")
+        || result.file_path.to_lowercase().ends_with(".mdx");
 
     let (title, content, entry_type) = match &result.body {
         AnalysisBody::Deep(d) => {
@@ -32,9 +31,7 @@ pub fn file_entry(result: &FileAnalysisResult, project_id: &str) -> Option<Memor
             // rather than by analysis depth.
             let etype = if is_markdown {
                 match super::markdown_analyzer::classify_path(&result.file_path) {
-                    super::markdown_analyzer::MarkdownRole::Architecture => {
-                        EntryType::Architecture
-                    }
+                    super::markdown_analyzer::MarkdownRole::Architecture => EntryType::Architecture,
                     super::markdown_analyzer::MarkdownRole::Contextual => EntryType::Context,
                 }
             } else {
@@ -399,9 +396,7 @@ fn format_sql_table(t: &SqlTable, path: &str) -> String {
     for c in &t.columns {
         out.push_str(&format!(
             "- `{}` `{}` {}\n",
-            c.name,
-            c.data_type,
-            c.constraints
+            c.name, c.data_type, c.constraints
         ));
     }
     if !t.inline_foreign_keys.is_empty() {

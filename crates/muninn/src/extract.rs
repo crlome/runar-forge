@@ -203,14 +203,22 @@ fn extract_from_write(payload: &HookPayload) -> Vec<ExtractedInsight> {
     // CI config
     if lower.contains(".github/workflows/") || name == ".gitlab-ci.yml" || name == ".gitlab-ci.yaml"
     {
-        return vec![arch_file_insight(file_path, "CI configuration created", 0.85)];
+        return vec![arch_file_insight(
+            file_path,
+            "CI configuration created",
+            0.85,
+        )];
     }
 
     // Migration
     if (lower.contains("migration") || lower.contains("migrate"))
         && (lower.ends_with(".sql") || lower.ends_with(".rs") || lower.ends_with(".py"))
     {
-        return vec![arch_file_insight(file_path, "Database migration created", 0.80)];
+        return vec![arch_file_insight(
+            file_path,
+            "Database migration created",
+            0.80,
+        )];
     }
 
     // Config file
@@ -408,10 +416,14 @@ fn has_null_check(s: &str) -> bool {
 
 fn has_error_handling(s: &str) -> bool {
     let lower = s.to_lowercase();
-    lower.contains("try {") || lower.contains("try{")
-        || lower.contains("catch(") || lower.contains("catch (")
-        || lower.contains(".unwrap_or") || lower.contains("unwrap_or_else")
-        || lower.contains("match err") || lower.contains("=> err(")
+    lower.contains("try {")
+        || lower.contains("try{")
+        || lower.contains("catch(")
+        || lower.contains("catch (")
+        || lower.contains(".unwrap_or")
+        || lower.contains("unwrap_or_else")
+        || lower.contains("match err")
+        || lower.contains("=> err(")
         || (s.contains('?') && (lower.contains(".await") || lower.contains("fn ")))
 }
 
@@ -453,8 +465,11 @@ fn is_config_file(path: &str) -> bool {
 }
 
 fn has_env_var_read(s: &str) -> bool {
-    s.contains("env::var") || s.contains("process.env") || s.contains("os.environ")
-        || s.contains("os.getenv") || s.contains("std::env::var")
+    s.contains("env::var")
+        || s.contains("process.env")
+        || s.contains("os.environ")
+        || s.contains("os.getenv")
+        || s.contains("std::env::var")
 }
 
 fn extract_env_var_name(s: &str) -> Option<String> {
@@ -607,8 +622,9 @@ mod tests {
             "fn check(token: Token) { if let Some(t) = token.as_ref() { t.validate() } }",
         );
         let insights = extract_insights(&p);
-        assert!(insights.iter().any(|i| i.entry_type == EntryType::Bug
-            && i.title.contains("null check")));
+        assert!(insights
+            .iter()
+            .any(|i| i.entry_type == EntryType::Bug && i.title.contains("null check")));
     }
 
     #[test]
@@ -624,14 +640,11 @@ mod tests {
 
     #[test]
     fn edit_config_change_detected() {
-        let p = edit_payload(
-            "config/database.toml",
-            "pool_size = 5",
-            "pool_size = 20",
-        );
+        let p = edit_payload("config/database.toml", "pool_size = 5", "pool_size = 20");
         let insights = extract_insights(&p);
-        assert!(insights.iter().any(|i| i.entry_type == EntryType::Decision
-            && i.title.contains("Config")));
+        assert!(insights
+            .iter()
+            .any(|i| i.entry_type == EntryType::Decision && i.title.contains("Config")));
     }
 
     #[test]
@@ -675,8 +688,7 @@ mod tests {
         let insights = extract_insights(&p);
         assert!(insights
             .iter()
-            .any(|i| i.entry_type == EntryType::Architecture
-                && i.title.contains("CI")));
+            .any(|i| i.entry_type == EntryType::Architecture && i.title.contains("CI")));
     }
 
     #[test]
@@ -694,8 +706,9 @@ mod tests {
             "test storage::tests::test_save ... FAILED\nfailures: 1",
         );
         let insights = extract_insights(&p);
-        assert!(insights.iter().any(|i| i.entry_type == EntryType::Bug
-            && i.title.contains("Test failure")));
+        assert!(insights
+            .iter()
+            .any(|i| i.entry_type == EntryType::Bug && i.title.contains("Test failure")));
     }
 
     #[test]
@@ -788,6 +801,8 @@ mod tests {
     fn confidence_threshold_filters_low() {
         let p = edit_payload("src/x.rs", "a", "b");
         let insights = extract_insights(&p);
-        assert!(insights.iter().all(|i| i.confidence >= CONFIDENCE_THRESHOLD));
+        assert!(insights
+            .iter()
+            .all(|i| i.confidence >= CONFIDENCE_THRESHOLD));
     }
 }

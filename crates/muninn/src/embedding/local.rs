@@ -40,8 +40,8 @@ impl LocalOnnxEmbeddingProvider {
             .with_show_download_progress(false)
             .with_cache_dir(cache_dir);
 
-        let model = TextEmbedding::try_new(opts)
-            .map_err(|e| format!("fastembed init failed: {e}"))?;
+        let model =
+            TextEmbedding::try_new(opts).map_err(|e| format!("fastembed init failed: {e}"))?;
 
         Ok(Self {
             model: Arc::new(model),
@@ -68,7 +68,9 @@ fn resolve_model(name: &str) -> Result<(EmbeddingModel, &'static str, usize), St
         "all-minilm-l6-v2" | "minilm" | "minilm-l6-v2" => {
             (EmbeddingModel::AllMiniLML6V2, "all-MiniLM-L6-v2", 384)
         }
-        "bge-small-en-v1.5" | "bge-small" => (EmbeddingModel::BGESmallENV15, "bge-small-en-v1.5", 384),
+        "bge-small-en-v1.5" | "bge-small" => {
+            (EmbeddingModel::BGESmallENV15, "bge-small-en-v1.5", 384)
+        }
         other => {
             return Err(format!(
                 "unknown local embedding model '{other}'. Supported: all-MiniLM-L6-v2, bge-small-en-v1.5"

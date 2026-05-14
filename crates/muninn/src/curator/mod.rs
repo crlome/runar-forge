@@ -664,12 +664,14 @@ fn synthesize_onboarding(question: &ClassifiedQuestion, entries: &[&MemoryEntry]
 
     parts.push("## 1. What this project is\n".into());
     if arch.is_empty() {
-        parts.push(
-            "_No architecture entries yet. Run `runar crawl .` to populate._\n".into(),
-        );
+        parts.push("_No architecture entries yet. Run `runar crawl .` to populate._\n".into());
     } else {
         for e in arch.iter().take(3) {
-            parts.push(format!("- **{}**: {}\n", e.title, truncate(&e.content, 300)));
+            parts.push(format!(
+                "- **{}**: {}\n",
+                e.title,
+                truncate(&e.content, 300)
+            ));
         }
     }
 
@@ -1004,7 +1006,11 @@ mod tests {
     fn onboarding_synth_has_sections() {
         let classified = classify("onboard me to this project");
         assert_eq!(classified.question_type, QuestionType::OnboardingRequest);
-        let arch = mk_entry("Architecture summary", "Rust monorepo.", EntryType::Architecture);
+        let arch = mk_entry(
+            "Architecture summary",
+            "Rust monorepo.",
+            EntryType::Architecture,
+        );
         let dec = mk_entry("Chose Postgres", "Because pgvector.", EntryType::Decision);
         let ctx = AssembledContext {
             question: classified,

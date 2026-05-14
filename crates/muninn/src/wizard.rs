@@ -151,7 +151,12 @@ pub fn run_wizard() -> anyhow::Result<WizardResult> {
     if ran_crawl {
         println!("\n  Crawling {}...", cwd.display());
         let status = std::process::Command::new(setup::detect_binary_path())
-            .args(["crawl", cwd.to_str().unwrap_or("."), "--project", &project_id])
+            .args([
+                "crawl",
+                cwd.to_str().unwrap_or("."),
+                "--project",
+                &project_id,
+            ])
             .status();
         match status {
             Ok(s) if s.success() => println!("  Crawl complete."),

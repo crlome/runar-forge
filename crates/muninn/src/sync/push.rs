@@ -102,7 +102,11 @@ pub async fn cmd_push(limit: usize, dry_run: bool) -> Result<()> {
     let mut confirm: Vec<Uuid> = Vec::new();
     for row in coalesced {
         if dry_run {
-            println!("  [dry] would push entry {} ({})", row.entry_id, row.op_kind.as_str());
+            println!(
+                "  [dry] would push entry {} ({})",
+                row.entry_id,
+                row.op_kind.as_str()
+            );
             continue;
         }
 
@@ -227,7 +231,10 @@ mod tests {
         assert_eq!(a_age.len(), 1);
         let now = Utc::now();
         let kept_age_secs = (now - a_age[0]).num_seconds();
-        assert!(kept_age_secs <= 30, "expected newer row kept, got {kept_age_secs}s old");
+        assert!(
+            kept_age_secs <= 30,
+            "expected newer row kept, got {kept_age_secs}s old"
+        );
     }
 
     #[test]

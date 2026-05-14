@@ -58,10 +58,7 @@ pub const PG_MIGRATIONS: &[(&str, &str)] = &[
         "010_add_sync_outbox",
         include_str!("pg_sql/010_add_sync_outbox.sql"),
     ),
-    (
-        "011_add_author",
-        include_str!("pg_sql/011_add_author.sql"),
-    ),
+    ("011_add_author", include_str!("pg_sql/011_add_author.sql")),
 ];
 
 pub struct PostgresAdapter {
@@ -1135,7 +1132,10 @@ impl MemoryStorage for PostgresAdapter {
             placeholders.join(",")
         );
 
-        client.execute(sql.as_str(), &id_refs).await.map_err(db_err)?;
+        client
+            .execute(sql.as_str(), &id_refs)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -1346,10 +1346,7 @@ impl MemoryStorage for PostgresAdapter {
 
     // ── Phase 5.6 — Sync (outbox + state + conflicts) ─────────
 
-    async fn enqueue_outbox(
-        &self,
-        op: crate::types::OutboxInput,
-    ) -> StorageResult<Uuid> {
+    async fn enqueue_outbox(&self, op: crate::types::OutboxInput) -> StorageResult<Uuid> {
         let client = self.get_client().await?;
         let id = Uuid::new_v4();
         client
@@ -1369,10 +1366,7 @@ impl MemoryStorage for PostgresAdapter {
         Ok(id)
     }
 
-    async fn claim_outbox(
-        &self,
-        max: usize,
-    ) -> StorageResult<Vec<crate::types::OutboxRow>> {
+    async fn claim_outbox(&self, max: usize) -> StorageResult<Vec<crate::types::OutboxRow>> {
         let mut client = self.get_client().await?;
         let tx = client.transaction().await.map_err(db_err)?;
         let claim_max = max as i64;
@@ -1401,8 +1395,7 @@ impl MemoryStorage for PostgresAdapter {
             let op_kind_str: String = row.get("op_kind");
             let payload: serde_json::Value = row.get("row_payload");
             out.push(crate::types::OutboxRow {
-                id: Uuid::parse_str(&id_str)
-                    .map_err(|e| StorageError::Database(e.to_string()))?,
+                id: Uuid::parse_str(&id_str).map_err(|e| StorageError::Database(e.to_string()))?,
                 entry_id: Uuid::parse_str(&entry_id_str)
                     .map_err(|e| StorageError::Database(e.to_string()))?,
                 op_kind: crate::types::OutboxOp::parse(&op_kind_str)
@@ -1550,10 +1543,7 @@ impl MemoryStorage for PostgresAdapter {
         Ok(())
     }
 
-    async fn record_conflict(
-        &self,
-        c: &crate::types::SyncConflict,
-    ) -> StorageResult<()> {
+    async fn record_conflict(&self, c: &crate::types::SyncConflict) -> StorageResult<()> {
         let client = self.get_client().await?;
         let direction = serde_json::to_value(c.direction)
             .ok()
@@ -1593,10 +1583,7 @@ impl MemoryStorage for PostgresAdapter {
         Ok(())
     }
 
-    async fn list_conflicts(
-        &self,
-        limit: usize,
-    ) -> StorageResult<Vec<crate::types::SyncConflict>> {
+    async fn list_conflicts(&self, limit: usize) -> StorageResult<Vec<crate::types::SyncConflict>> {
         let client = self.get_client().await?;
         let rows = client
             .query(
@@ -1618,8 +1605,7 @@ impl MemoryStorage for PostgresAdapter {
             let policy_str: String = row.get("policy");
             let winner_str: String = row.get("winner_side");
             out.push(crate::types::SyncConflict {
-                id: Uuid::parse_str(&id_str)
-                    .map_err(|e| StorageError::Database(e.to_string()))?,
+                id: Uuid::parse_str(&id_str).map_err(|e| StorageError::Database(e.to_string()))?,
                 entry_id: Uuid::parse_str(&entry_id_str)
                     .map_err(|e| StorageError::Database(e.to_string()))?,
                 direction: serde_json::from_value(serde_json::Value::String(direction_str))
@@ -1650,19 +1636,17 @@ impl MemoryStorage for PostgresAdapter {
             chrono::Utc::now() - chrono::Duration::seconds(clock_skew_secs);
 
         let rows = match (after, project_filter) {
-            (Some(cursor), Some(project)) => {
-                client
-                    .query(
-                        "SELECT * FROM muninn.memory_entries
+            (Some(cursor), Some(project)) => client
+                .query(
+                    "SELECT * FROM muninn.memory_entries
                          WHERE updated_at > $1 AND updated_at <= $2
                            AND project_id = $3
                          ORDER BY updated_at ASC, id ASC
                          LIMIT $4",
-                        &[&cursor, &upper_bound, &project, &(limit as i64)],
-                    )
-                    .await
-                    .map_err(db_err)?
-            }
+                    &[&cursor, &upper_bound, &project, &(limit as i64)],
+                )
+                .await
+                .map_err(db_err)?,
             (Some(cursor), None) => client
                 .query(
                     "SELECT * FROM muninn.memory_entries

@@ -801,9 +801,6 @@ mod tests {
     #[test]
     fn resolve_confidence_unknown_string_falls_back() {
         let v = serde_json::Value::String("garbage".into());
-        assert_eq!(
-            resolve_confidence(Some(&v)).unwrap(),
-            DEFAULT_CONFIDENCE
-        );
+        assert_eq!(resolve_confidence(Some(&v)).unwrap(), DEFAULT_CONFIDENCE);
     }
 }

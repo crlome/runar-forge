@@ -334,10 +334,7 @@ mod tests {
 
     #[test]
     fn classify_path_contextual_default() {
-        assert_eq!(
-            classify_path("RELEASE-NOTES.md"),
-            MarkdownRole::Contextual
-        );
+        assert_eq!(classify_path("RELEASE-NOTES.md"), MarkdownRole::Contextual);
     }
 
     #[test]
@@ -369,10 +366,7 @@ mod tests {
 
         let empty = "";
         let hs2 = extract_headings(empty);
-        assert_eq!(
-            extract_purpose(empty, &hs2, "docs/my-thing.md"),
-            "my thing"
-        );
+        assert_eq!(extract_purpose(empty, &hs2, "docs/my-thing.md"), "my thing");
     }
 
     #[test]

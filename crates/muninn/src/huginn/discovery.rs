@@ -87,16 +87,30 @@ fn detect_for_file(f: &FileEntry) -> Vec<EntryPoint> {
     // ── Next.js ──────────────────────────────────────────────────────
     // Pages router: `pages/_app.*`, `pages/index.*`
     // App router:   `app/layout.*`, `app/page.*`
-    if matches!(name.as_str(),
-        "_app.ts" | "_app.tsx" | "_app.js" | "_app.jsx"
-        | "index.ts" | "index.tsx" | "index.js" | "index.jsx"
+    if matches!(
+        name.as_str(),
+        "_app.ts"
+            | "_app.tsx"
+            | "_app.js"
+            | "_app.jsx"
+            | "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.jsx"
     ) && (rel.contains("/pages/") || rel.starts_with("pages/"))
     {
         hits.push(ep(&f.relative_path, Framework::NextJs, 0.95));
     }
-    if matches!(name.as_str(),
-        "layout.ts" | "layout.tsx" | "layout.js" | "layout.jsx"
-        | "page.ts" | "page.tsx" | "page.js" | "page.jsx"
+    if matches!(
+        name.as_str(),
+        "layout.ts"
+            | "layout.tsx"
+            | "layout.js"
+            | "layout.jsx"
+            | "page.ts"
+            | "page.tsx"
+            | "page.js"
+            | "page.jsx"
     ) && (rel.contains("/app/") || rel.starts_with("app/"))
     {
         hits.push(ep(&f.relative_path, Framework::NextJs, 0.90));
@@ -112,13 +126,14 @@ fn detect_for_file(f: &FileEntry) -> Vec<EntryPoint> {
     // ── Flask   (app.py with Flask(__name__)) ────────────────────────
     // ── Axum/Actix (main.rs with axum::Router / actix_web::HttpServer)
     // ── Gin/Echo  (main.go with gin.Default() / echo.New()) ──────────
-    if matches!(name.as_str(), "main.ts" | "main.js")
-        && sniff(f, &["nestfactory", "@nestjs/core"])
+    if matches!(name.as_str(), "main.ts" | "main.js") && sniff(f, &["nestfactory", "@nestjs/core"])
     {
         hits.push(ep(&f.relative_path, Framework::NestJs, 0.95));
     }
-    if matches!(name.as_str(), "server.ts" | "server.js" | "app.ts" | "app.js")
-        && sniff(f, &["express()", "require('express')", "from \"express\""])
+    if matches!(
+        name.as_str(),
+        "server.ts" | "server.js" | "app.ts" | "app.js"
+    ) && sniff(f, &["express()", "require('express')", "from \"express\""])
     {
         hits.push(ep(&f.relative_path, Framework::Express, 0.90));
     }

@@ -269,13 +269,13 @@ pub fn setup_claude_code(
     let log_path = runar_dir().join("hook.log").to_string_lossy().into_owned();
     let pid_q = shell_quote(project_id);
     let mk = |args: String| hook_command(&binary_path, &args, &log_path);
-    let context_cmd   = mk(format!("context      --silent --project {pid_q}"));
-    let ping_cmd      = mk(format!("session ping --silent --project {pid_q}"));
-    let save_ack_cmd  = mk(format!("save-ack     --silent --project {pid_q}"));
-    let nudge_cmd     = mk(format!("nudge        --silent --project {pid_q}"));
-    let extract_cmd   = mk(format!("extract      --silent --project {pid_q}"));
+    let context_cmd = mk(format!("context      --silent --project {pid_q}"));
+    let ping_cmd = mk(format!("session ping --silent --project {pid_q}"));
+    let save_ack_cmd = mk(format!("save-ack     --silent --project {pid_q}"));
+    let nudge_cmd = mk(format!("nudge        --silent --project {pid_q}"));
+    let extract_cmd = mk(format!("extract      --silent --project {pid_q}"));
     // Auto-capture queue commands (Phase 6 — opt-in).
-    let enqueue_cmd   = mk(format!("enqueue      --silent --project {pid_q}"));
+    let enqueue_cmd = mk(format!("enqueue      --silent --project {pid_q}"));
     let summarize_cmd = mk(format!("summarize    --silent --project {pid_q}"));
 
     let existing_hooks = sobj.get("hooks").cloned().unwrap_or(json!({}));
@@ -316,10 +316,7 @@ pub fn setup_claude_code(
     post_tool.push(hook_entry("mcp__muninn__muninn_save", &save_ack_cmd));
     post_tool.push(hook_entry("Write|Edit|Create|MultiEdit|Bash", &extract_cmd));
     if with_auto_capture {
-        post_tool.push(hook_entry(
-            "Write|Edit|Create|MultiEdit|Bash",
-            &enqueue_cmd,
-        ));
+        post_tool.push(hook_entry("Write|Edit|Create|MultiEdit|Bash", &enqueue_cmd));
     }
 
     let mut user_prompt = user_prompt;

@@ -21,15 +21,20 @@ use tokio_postgres::NoTls;
 
 use crate::setup;
 use crate::storage::postgres::PG_MIGRATIONS;
-use crate::storage::MemoryStorage;
 use crate::storage::sqlite::MIGRATIONS as SQLITE_MIGRATIONS;
+use crate::storage::MemoryStorage;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Status {
     Pass,
-    Fail { message: String, hint: Option<String> },
-    Skip { reason: String },
+    Fail {
+        message: String,
+        hint: Option<String>,
+    },
+    Skip {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,23 +46,47 @@ pub struct Check {
 
 impl Check {
     fn pass(name: &'static str) -> Self {
-        Self { name, status: Status::Pass, detail: None }
+        Self {
+            name,
+            status: Status::Pass,
+            detail: None,
+        }
     }
     fn pass_with(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, status: Status::Pass, detail: Some(detail.into()) }
+        Self {
+            name,
+            status: Status::Pass,
+            detail: Some(detail.into()),
+        }
     }
     fn fail(name: &'static str, msg: impl Into<String>) -> Self {
-        Self { name, status: Status::Fail { message: msg.into(), hint: None }, detail: None }
+        Self {
+            name,
+            status: Status::Fail {
+                message: msg.into(),
+                hint: None,
+            },
+            detail: None,
+        }
     }
     fn fail_hint(name: &'static str, msg: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             name,
-            status: Status::Fail { message: msg.into(), hint: Some(hint.into()) },
+            status: Status::Fail {
+                message: msg.into(),
+                hint: Some(hint.into()),
+            },
             detail: None,
         }
     }
     fn skip(name: &'static str, reason: impl Into<String>) -> Self {
-        Self { name, status: Status::Skip { reason: reason.into() }, detail: None }
+        Self {
+            name,
+            status: Status::Skip {
+                reason: reason.into(),
+            },
+            detail: None,
+        }
     }
 }
 
@@ -68,7 +97,10 @@ pub struct Report {
 
 impl Report {
     pub fn ok(&self) -> bool {
-        !self.checks.iter().any(|c| matches!(c.status, Status::Fail { .. }))
+        !self
+            .checks
+            .iter()
+            .any(|c| matches!(c.status, Status::Fail { .. }))
     }
 
     pub fn print_human(&self) {
@@ -99,9 +131,21 @@ impl Report {
             }
         }
         println!();
-        let pass = self.checks.iter().filter(|c| matches!(c.status, Status::Pass)).count();
-        let skip = self.checks.iter().filter(|c| matches!(c.status, Status::Skip { .. })).count();
-        let fail = self.checks.iter().filter(|c| matches!(c.status, Status::Fail { .. })).count();
+        let pass = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.status, Status::Pass))
+            .count();
+        let skip = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.status, Status::Skip { .. }))
+            .count();
+        let fail = self
+            .checks
+            .iter()
+            .filter(|c| matches!(c.status, Status::Fail { .. }))
+            .count();
         let summary = if fail == 0 { "ALL OK" } else { "FAILED" };
         println!("{summary} ({pass} passed, {skip} skipped, {fail} failed)");
     }
@@ -363,10 +407,7 @@ fn check_env_file(path: &PathBuf) -> Check {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            return Check::fail(
-                "env file",
-                format!("read failed: {} ({e})", path.display()),
-            );
+            return Check::fail("env file", format!("read failed: {} ({e})", path.display()));
         }
     };
     let mut keys = std::collections::HashMap::<String, usize>::new();
@@ -380,21 +421,23 @@ fn check_env_file(path: &PathBuf) -> Check {
             *keys.entry(k).or_insert(0) += 1;
         }
     }
-    let dups: Vec<_> = keys.iter().filter(|(_, c)| **c > 1).map(|(k, c)| format!("{k}×{c}")).collect();
+    let dups: Vec<_> = keys
+        .iter()
+        .filter(|(_, c)| **c > 1)
+        .map(|(k, c)| format!("{k}×{c}"))
+        .collect();
     if !dups.is_empty() {
-        return Check::fail(
-            "env file",
-            format!("duplicate keys: {}", dups.join(", ")),
-        );
+        return Check::fail("env file", format!("duplicate keys: {}", dups.join(", ")));
     }
-    Check::pass_with("env file", format!("{} ({} keys)", path.display(), keys.len()))
+    Check::pass_with(
+        "env file",
+        format!("{} ({} keys)", path.display(), keys.len()),
+    )
 }
 
 fn check_storage_backend(backend: &str) -> Check {
     match backend {
-        "postgresql" | "postgres" | "sqlite" => {
-            Check::pass_with("storage", backend.to_string())
-        }
+        "postgresql" | "postgres" | "sqlite" => Check::pass_with("storage", backend.to_string()),
         other => Check::fail_hint(
             "storage",
             format!("unknown RUNAR_STORAGE: {other}"),
@@ -415,8 +458,16 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
                 "run `runar config wizard` or `runar config set RUNAR_DB_URL <url>`",
             ));
             // No URL → can't run anything else against PG.
-            for name in ["auth", "pgvector", "schema muninn", "migrations", "row counts"] {
-                report.checks.push(Check::skip(box_leak(name), "no RUNAR_DB_URL"));
+            for name in [
+                "auth",
+                "pgvector",
+                "schema muninn",
+                "migrations",
+                "row counts",
+            ] {
+                report
+                    .checks
+                    .push(Check::skip(box_leak(name), "no RUNAR_DB_URL"));
             }
             return;
         }
@@ -443,8 +494,16 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
                 format!("connect failed: {e}"),
                 "check host/port/credentials in RUNAR_DB_URL",
             ));
-            for name in ["auth", "pgvector", "schema muninn", "migrations", "row counts"] {
-                report.checks.push(Check::skip(box_leak(name), "no connection"));
+            for name in [
+                "auth",
+                "pgvector",
+                "schema muninn",
+                "migrations",
+                "row counts",
+            ] {
+                report
+                    .checks
+                    .push(Check::skip(box_leak(name), "no connection"));
             }
             return;
         }
@@ -453,8 +512,16 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
                 "db reachable",
                 format!("connect timed out after {}ms", timeout.as_millis()),
             ));
-            for name in ["auth", "pgvector", "schema muninn", "migrations", "row counts"] {
-                report.checks.push(Check::skip(box_leak(name), "no connection"));
+            for name in [
+                "auth",
+                "pgvector",
+                "schema muninn",
+                "migrations",
+                "row counts",
+            ] {
+                report
+                    .checks
+                    .push(Check::skip(box_leak(name), "no connection"));
             }
             return;
         }
@@ -465,7 +532,9 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
     match client.query_one("SELECT 1", &[]).await {
         Ok(_) => report.checks.push(Check::pass("auth")),
         Err(e) => {
-            report.checks.push(Check::fail("auth", format!("SELECT 1 failed: {e}")));
+            report
+                .checks
+                .push(Check::fail("auth", format!("SELECT 1 failed: {e}")));
             conn_handle.abort();
             return;
         }
@@ -473,12 +542,17 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
 
     // pgvector
     match client
-        .query_opt("SELECT extversion FROM pg_extension WHERE extname = 'vector'", &[])
+        .query_opt(
+            "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+            &[],
+        )
         .await
     {
         Ok(Some(row)) => {
             let v: String = row.get(0);
-            report.checks.push(Check::pass_with("pgvector", format!("v{v}")));
+            report
+                .checks
+                .push(Check::pass_with("pgvector", format!("v{v}")));
         }
         Ok(None) => {
             report.checks.push(Check::fail_hint(
@@ -488,7 +562,9 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
             ));
         }
         Err(e) => {
-            report.checks.push(Check::fail("pgvector", format!("query failed: {e}")));
+            report
+                .checks
+                .push(Check::fail("pgvector", format!("query failed: {e}")));
         }
     }
 
@@ -516,7 +592,9 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
             }
         }
         Err(e) => {
-            report.checks.push(Check::fail("schema muninn", format!("query failed: {e}")));
+            report
+                .checks
+                .push(Check::fail("schema muninn", format!("query failed: {e}")));
         }
     }
 
@@ -582,10 +660,9 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
             ));
         }
         Err(e) => {
-            report.checks.push(Check::fail(
-                "row counts",
-                format!("query failed: {e}"),
-            ));
+            report
+                .checks
+                .push(Check::fail("row counts", format!("query failed: {e}")));
         }
     }
 
@@ -597,9 +674,8 @@ async fn run_postgres_checks(report: &mut Report, opts: &DoctorOpts) {
 fn run_sqlite_checks(report: &mut Report) {
     use rusqlite::{Connection, OpenFlags};
 
-    let path_str = std::env::var("RUNAR_SQLITE_PATH").unwrap_or_else(|_| {
-        setup::runar_dir().join("memory.db").display().to_string()
-    });
+    let path_str = std::env::var("RUNAR_SQLITE_PATH")
+        .unwrap_or_else(|_| setup::runar_dir().join("memory.db").display().to_string());
     let path = PathBuf::from(&path_str);
 
     if !path.exists() {
@@ -609,35 +685,59 @@ fn run_sqlite_checks(report: &mut Report) {
             "run `runar stats` to initialize the SQLite DB",
         ));
         for name in ["auth", "schema muninn", "migrations", "row counts"] {
-            report.checks.push(Check::skip(box_leak(name), "no connection"));
+            report
+                .checks
+                .push(Check::skip(box_leak(name), "no connection"));
         }
-        report.checks.push(Check::skip("pgvector", "sqlite backend"));
-        report.checks.push(Check::skip("embedding dim", "sqlite backend"));
+        report
+            .checks
+            .push(Check::skip("pgvector", "sqlite backend"));
+        report
+            .checks
+            .push(Check::skip("embedding dim", "sqlite backend"));
         return;
     }
 
     let conn = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => {
-            report.checks.push(Check::pass_with("db reachable", path_str.clone()));
+            report
+                .checks
+                .push(Check::pass_with("db reachable", path_str.clone()));
             c
         }
         Err(e) => {
-            report.checks.push(Check::fail("db reachable", format!("open failed: {e}")));
+            report
+                .checks
+                .push(Check::fail("db reachable", format!("open failed: {e}")));
             for name in ["auth", "schema muninn", "migrations", "row counts"] {
-                report.checks.push(Check::skip(box_leak(name), "no connection"));
+                report
+                    .checks
+                    .push(Check::skip(box_leak(name), "no connection"));
             }
-            report.checks.push(Check::skip("pgvector", "sqlite backend"));
-            report.checks.push(Check::skip("embedding dim", "sqlite backend"));
+            report
+                .checks
+                .push(Check::skip("pgvector", "sqlite backend"));
+            report
+                .checks
+                .push(Check::skip("embedding dim", "sqlite backend"));
             return;
         }
     };
 
-    match conn.prepare("SELECT 1").and_then(|mut s| s.query_row([], |_| Ok(()))) {
+    match conn
+        .prepare("SELECT 1")
+        .and_then(|mut s| s.query_row([], |_| Ok(())))
+    {
         Ok(_) => report.checks.push(Check::pass("auth")),
-        Err(e) => report.checks.push(Check::fail("auth", format!("query failed: {e}"))),
+        Err(e) => report
+            .checks
+            .push(Check::fail("auth", format!("query failed: {e}"))),
     }
 
-    report.checks.push(Check::skip("pgvector", "sqlite backend (no vector extension)"));
+    report.checks.push(Check::skip(
+        "pgvector",
+        "sqlite backend (no vector extension)",
+    ));
 
     // schema
     let tables: Vec<String> = conn
@@ -651,7 +751,9 @@ fn run_sqlite_checks(report: &mut Report) {
         .unwrap_or_default();
 
     if tables.is_empty() {
-        report.checks.push(Check::fail("schema muninn", "no tables in DB"));
+        report
+            .checks
+            .push(Check::fail("schema muninn", "no tables in DB"));
     } else {
         report.checks.push(Check::pass_with(
             "schema muninn",
@@ -689,7 +791,9 @@ fn run_sqlite_checks(report: &mut Report) {
         ));
     }
 
-    report.checks.push(Check::skip("embedding dim", "sqlite backend"));
+    report
+        .checks
+        .push(Check::skip("embedding dim", "sqlite backend"));
 
     // counts
     let entries: i64 = conn
@@ -703,7 +807,9 @@ fn run_sqlite_checks(report: &mut Report) {
         .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
         .unwrap_or(-1);
     let pending: i64 = conn
-        .query_row("SELECT count(*) FROM pending_observations", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM pending_observations", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(-1);
     report.checks.push(Check::pass_with(
         "row counts",
@@ -777,10 +883,7 @@ mod tests {
     #[test]
     fn report_ok_when_only_pass_and_skip() {
         let r = Report {
-            checks: vec![
-                Check::pass("a"),
-                Check::skip("b", "reason"),
-            ],
+            checks: vec![Check::pass("a"), Check::skip("b", "reason")],
         };
         assert!(r.ok());
     }
@@ -788,10 +891,7 @@ mod tests {
     #[test]
     fn report_not_ok_when_any_fail() {
         let r = Report {
-            checks: vec![
-                Check::pass("a"),
-                Check::fail("b", "boom"),
-            ],
+            checks: vec![Check::pass("a"), Check::fail("b", "boom")],
         };
         assert!(!r.ok());
     }
@@ -815,7 +915,10 @@ mod tests {
 
     #[test]
     fn connect_timeout_honors_override() {
-        let opts = DoctorOpts { db_only: false, timeout_ms: Some(1234) };
+        let opts = DoctorOpts {
+            db_only: false,
+            timeout_ms: Some(1234),
+        };
         assert_eq!(connect_timeout(&opts), Duration::from_millis(1234));
     }
 
@@ -839,8 +942,17 @@ mod tests {
 
     #[test]
     fn check_storage_backend_recognizes_known() {
-        assert!(matches!(check_storage_backend("postgresql").status, Status::Pass));
-        assert!(matches!(check_storage_backend("sqlite").status, Status::Pass));
-        assert!(matches!(check_storage_backend("mysql").status, Status::Fail { .. }));
+        assert!(matches!(
+            check_storage_backend("postgresql").status,
+            Status::Pass
+        ));
+        assert!(matches!(
+            check_storage_backend("sqlite").status,
+            Status::Pass
+        ));
+        assert!(matches!(
+            check_storage_backend("mysql").status,
+            Status::Fail { .. }
+        ));
     }
 }

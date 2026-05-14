@@ -119,17 +119,17 @@ async fn fetch_manifest(url: &str) -> Result<Manifest> {
         .with_context(|| format!("fetch manifest {url}"))?
         .error_for_status()?;
     let body = resp.text().await?;
-    let manifest: Manifest = serde_json::from_str(&body)
-        .with_context(|| "parse manifest JSON")?;
+    let manifest: Manifest = serde_json::from_str(&body).with_context(|| "parse manifest JSON")?;
     Ok(manifest)
 }
 
 fn pick_channel<'a>(manifest: &'a Manifest, channel: &str) -> Result<&'a Channel> {
-    manifest
-        .channels
-        .get(channel)
-        .ok_or_else(|| anyhow!("channel '{channel}' not in manifest (have: {:?})",
-                               manifest.channels.keys().collect::<Vec<_>>()))
+    manifest.channels.get(channel).ok_or_else(|| {
+        anyhow!(
+            "channel '{channel}' not in manifest (have: {:?})",
+            manifest.channels.keys().collect::<Vec<_>>()
+        )
+    })
 }
 
 fn pick_artifact<'a>(channel: &'a Channel, triple: &str) -> Result<&'a Artifact> {
@@ -232,8 +232,10 @@ pub async fn run(opts: UpdateOpts) -> Result<()> {
     let triple = target_triple();
 
     println!("current: {} ({triple})", current_version());
-    println!("latest:  {} [{}] released {}",
-        channel.version, opts.channel, channel.released);
+    println!(
+        "latest:  {} [{}] released {}",
+        channel.version, opts.channel, channel.released
+    );
 
     if channel.version == current_version() {
         println!("up to date.");
@@ -247,7 +249,9 @@ pub async fn run(opts: UpdateOpts) -> Result<()> {
 
     if !opts.force && likely_inside_claude_code() {
         print_pre_swap_advice();
-        return Err(anyhow!("aborted — pass --force to swap inside an active CC session"));
+        return Err(anyhow!(
+            "aborted — pass --force to swap inside an active CC session"
+        ));
     }
 
     let artifact = pick_artifact(channel, triple)?;
@@ -261,7 +265,8 @@ pub async fn run(opts: UpdateOpts) -> Result<()> {
     if !actual.eq_ignore_ascii_case(&artifact.sha256) {
         return Err(anyhow!(
             "checksum mismatch — expected {} got {} (download discarded)",
-            artifact.sha256, actual
+            artifact.sha256,
+            actual
         ));
     }
     make_executable(tmp.path())?;
@@ -283,8 +288,10 @@ fn rollback() -> Result<()> {
     let stable = setup::stable_bin_path();
     let prev = previous_path();
     if !prev.exists() {
-        return Err(anyhow!("no previous binary at {} — nothing to roll back",
-                           prev.display()));
+        return Err(anyhow!(
+            "no previous binary at {} — nothing to roll back",
+            prev.display()
+        ));
     }
     // Swap: stable → .rollback-tmp → prev → stable
     let bin_dir = stable.parent().unwrap();
@@ -331,7 +338,9 @@ mod tests {
 
     #[test]
     fn pick_channel_errors_on_missing() {
-        let m = Manifest { channels: Default::default() };
+        let m = Manifest {
+            channels: Default::default(),
+        };
         assert!(pick_channel(&m, "stable").is_err());
     }
 }

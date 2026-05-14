@@ -43,19 +43,10 @@ pub struct SqlTable {
 
 #[derive(Debug, Clone)]
 pub enum SqlAlter {
-    AddColumn {
-        table: String,
-        column: SqlColumn,
-    },
-    DropColumn {
-        table: String,
-        column: String,
-    },
+    AddColumn { table: String, column: SqlColumn },
+    DropColumn { table: String, column: String },
     AddForeignKey(SqlForeignKey),
-    Other {
-        table: String,
-        raw: String,
-    },
+    Other { table: String, raw: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,7 +172,10 @@ fn extract_tables(sql: &str) -> Vec<SqlTable> {
 fn split_schema(full: &str) -> (Option<String>, String) {
     let full = full.trim_matches('"');
     if let Some((s, n)) = full.split_once('.') {
-        (Some(s.trim_matches('"').to_string()), n.trim_matches('"').to_string())
+        (
+            Some(s.trim_matches('"').to_string()),
+            n.trim_matches('"').to_string(),
+        )
     } else {
         (None, full.to_string())
     }
@@ -202,7 +196,9 @@ fn parse_table_body(body: &str) -> (Vec<SqlColumn>, Vec<SqlForeignKey>) {
         let upper = line.to_uppercase();
 
         // Inline foreign key
-        if upper.starts_with("FOREIGN KEY") || upper.starts_with("CONSTRAINT ") && upper.contains("FOREIGN KEY") {
+        if upper.starts_with("FOREIGN KEY")
+            || upper.starts_with("CONSTRAINT ") && upper.contains("FOREIGN KEY")
+        {
             if let Some(fk) = parse_inline_foreign_key(line) {
                 fks.push(fk);
                 continue;
@@ -285,13 +281,16 @@ fn split_top_level(s: &str, delim: char) -> Vec<String> {
 fn extract_alters(sql: &str) -> Vec<SqlAlter> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r#"(?is)ALTER\s+TABLE\s+([A-Za-z_"][\w\."]*)\s+([^;]+);"#)
-            .expect("alter regex")
+        Regex::new(r#"(?is)ALTER\s+TABLE\s+([A-Za-z_"][\w\."]*)\s+([^;]+);"#).expect("alter regex")
     });
 
     let mut out = Vec::new();
     for caps in re.captures_iter(sql) {
-        let table = caps.get(1).map(|m| m.as_str()).unwrap_or_default().to_string();
+        let table = caps
+            .get(1)
+            .map(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
         let body = caps.get(2).map(|m| m.as_str()).unwrap_or_default().trim();
         let upper = body.to_uppercase();
 
@@ -310,7 +309,10 @@ fn extract_alters(sql: &str) -> Vec<SqlAlter> {
             });
         } else if let Some(rest) = upper.strip_prefix("DROP COLUMN ") {
             let name = rest.split_whitespace().next().unwrap_or("").to_string();
-            out.push(SqlAlter::DropColumn { table, column: name });
+            out.push(SqlAlter::DropColumn {
+                table,
+                column: name,
+            });
         } else if upper.starts_with("ADD CONSTRAINT") && upper.contains("FOREIGN KEY") {
             if let Some(fk) = parse_inline_foreign_key(body) {
                 let mut fk = fk;
@@ -346,7 +348,10 @@ fn extract_indexes(sql: &str) -> Vec<SqlIndex> {
             .get(3)
             .map(|m| m.as_str().trim_matches('"').to_string())
             .unwrap_or_default();
-        let columns = caps.get(4).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+        let columns = caps
+            .get(4)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
         out.push(SqlIndex {
             name,
             table,

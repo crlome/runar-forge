@@ -45,7 +45,8 @@ pub async fn generate(
     let tech_debt = fetch(librarian, project_id, EntryType::TechDebt, 6).await?;
     let rules = fetch(librarian, project_id, EntryType::Rule, 5).await?;
 
-    let total = architecture.len() + decisions.len() + patterns.len() + tech_debt.len() + rules.len();
+    let total =
+        architecture.len() + decisions.len() + patterns.len() + tech_debt.len() + rules.len();
 
     let sections = vec![
         section("Architecture Summary", &architecture),
@@ -104,8 +105,7 @@ fn render_markdown(project_id: Option<&str>, sections: &[OnboardingSection]) -> 
     out.push(title);
     out.push(String::new());
     out.push(
-        "_Generated from memory. If a section is empty, run `runar crawl .` to populate._"
-            .into(),
+        "_Generated from memory. If a section is empty, run `runar crawl .` to populate._".into(),
     );
     out.push(String::new());
 

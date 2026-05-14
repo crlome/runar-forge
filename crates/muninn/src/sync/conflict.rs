@@ -117,7 +117,10 @@ pub fn build_audit(
     }
     SyncConflict {
         id: uuid::Uuid::new_v4(),
-        entry_id: local.map(|e| e.id).or_else(|| remote.map(|e| e.id)).unwrap(),
+        entry_id: local
+            .map(|e| e.id)
+            .or_else(|| remote.map(|e| e.id))
+            .unwrap(),
         direction,
         policy,
         winner_side: winner,
@@ -176,7 +179,10 @@ mod tests {
         let existing = entry(now, false, true);
         let incoming = entry(now + Duration::seconds(60), false, false);
         match resolve(Some(&existing), &incoming) {
-            Resolution::Skip { policy: ConflictPolicy::ResurrectBlocked, audit: true } => {}
+            Resolution::Skip {
+                policy: ConflictPolicy::ResurrectBlocked,
+                audit: true,
+            } => {}
             other => panic!("expected resurrect-blocked Skip, got {other:?}"),
         }
     }
@@ -187,7 +193,10 @@ mod tests {
         let existing = entry(now, false, false);
         let incoming = entry(now + Duration::seconds(60), false, true);
         match resolve(Some(&existing), &incoming) {
-            Resolution::Update { policy: ConflictPolicy::SoftDeleteWins, .. } => {}
+            Resolution::Update {
+                policy: ConflictPolicy::SoftDeleteWins,
+                ..
+            } => {}
             other => panic!("expected SoftDeleteWins Update, got {other:?}"),
         }
     }
@@ -198,7 +207,10 @@ mod tests {
         let existing = entry(now, true, false);
         let incoming = entry(now + Duration::seconds(60), false, false);
         match resolve(Some(&existing), &incoming) {
-            Resolution::Skip { policy: ConflictPolicy::VerifiedWins, audit: true } => {}
+            Resolution::Skip {
+                policy: ConflictPolicy::VerifiedWins,
+                audit: true,
+            } => {}
             other => panic!("expected verified-wins Skip, got {other:?}"),
         }
     }
@@ -209,7 +221,10 @@ mod tests {
         let existing = entry(now + Duration::seconds(60), false, false);
         let incoming = entry(now, true, false); // older but verified
         match resolve(Some(&existing), &incoming) {
-            Resolution::Update { policy: ConflictPolicy::VerifiedWins, .. } => {}
+            Resolution::Update {
+                policy: ConflictPolicy::VerifiedWins,
+                ..
+            } => {}
             other => panic!("expected verified-wins Update, got {other:?}"),
         }
     }
@@ -220,7 +235,10 @@ mod tests {
         let existing = entry(now, false, false);
         let incoming = entry(now + Duration::seconds(10), false, false);
         match resolve(Some(&existing), &incoming) {
-            Resolution::Update { policy: ConflictPolicy::Lww, audit: false } => {}
+            Resolution::Update {
+                policy: ConflictPolicy::Lww,
+                audit: false,
+            } => {}
             other => panic!("expected lww Update, got {other:?}"),
         }
     }
@@ -231,7 +249,10 @@ mod tests {
         let existing = entry(now, false, false);
         let incoming = entry(now - Duration::seconds(10), false, false);
         match resolve(Some(&existing), &incoming) {
-            Resolution::Skip { policy: ConflictPolicy::Lww, audit: false } => {}
+            Resolution::Skip {
+                policy: ConflictPolicy::Lww,
+                audit: false,
+            } => {}
             other => panic!("expected lww Skip, got {other:?}"),
         }
     }
@@ -242,7 +263,10 @@ mod tests {
         let existing = entry(now, false, false);
         let incoming = entry(now, false, false);
         match resolve(Some(&existing), &incoming) {
-            Resolution::Skip { policy: ConflictPolicy::Lww, .. } => {}
+            Resolution::Skip {
+                policy: ConflictPolicy::Lww,
+                ..
+            } => {}
             other => panic!("expected lww Skip, got {other:?}"),
         }
     }

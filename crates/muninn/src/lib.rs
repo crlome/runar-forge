@@ -7,8 +7,8 @@
 pub mod breaker;
 pub mod capture;
 pub mod config_cmd;
-pub mod doctor;
 pub mod curator;
+pub mod doctor;
 pub mod embedding;
 pub mod extract;
 pub mod hooks_runtime;

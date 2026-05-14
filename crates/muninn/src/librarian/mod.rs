@@ -92,7 +92,8 @@ impl MemoryLibrarian {
             // Phase 5.6.2 — outbox enqueue. Hybrid mode only; otherwise
             // no-op. Re-fetch the freshly saved row so the payload
             // reflects the post-save state (including supersession).
-            self.enqueue_outbox_for_entry(entry_id, OutboxOp::Insert).await;
+            self.enqueue_outbox_for_entry(entry_id, OutboxOp::Insert)
+                .await;
 
             // Auto-link is fire-and-forget (less critical)
             let storage = self.storage.clone();
@@ -601,11 +602,7 @@ impl MemoryLibrarian {
     }
 
     /// Migrate all entries + sessions from `source` → `target`.
-    pub async fn merge_projects(
-        &self,
-        source: &str,
-        target: &str,
-    ) -> StorageResult<MergeCounts> {
+    pub async fn merge_projects(&self, source: &str, target: &str) -> StorageResult<MergeCounts> {
         self.storage.merge_project_namespace(source, target).await
     }
 
@@ -636,11 +633,10 @@ impl MemoryLibrarian {
         self.storage.confirm_observations(ids).await
     }
 
-    pub async fn recover_stale_observations(
-        &self,
-        older_than_secs: i64,
-    ) -> StorageResult<i64> {
-        self.storage.recover_stale_observations(older_than_secs).await
+    pub async fn recover_stale_observations(&self, older_than_secs: i64) -> StorageResult<i64> {
+        self.storage
+            .recover_stale_observations(older_than_secs)
+            .await
     }
 
     pub async fn check_observation_duplicate(
@@ -725,8 +721,7 @@ impl MemoryLibrarian {
         let mut results = Vec::with_capacity(items.len());
 
         for item in items {
-            let mut tags: Vec<String> =
-                vec!["auto-capture".into(), "key-learning".into()];
+            let mut tags: Vec<String> = vec!["auto-capture".into(), "key-learning".into()];
             if let Some(pid) = project_id {
                 tags.push(pid.to_string());
             }
@@ -1180,7 +1175,14 @@ mod tests {
 
         // A checkpoint saves a session-summary memory tagged session-checkpoint
         let results = lib
-            .search("session summary", 10, Some("demo"), Some("demo"), None, None)
+            .search(
+                "session summary",
+                10,
+                Some("demo"),
+                Some("demo"),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -1358,7 +1360,12 @@ Here's a summary of what we did.\n\
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 3, "expected 3 learnings, got {}", results.len());
+        assert_eq!(
+            results.len(),
+            3,
+            "expected 3 learnings, got {}",
+            results.len()
+        );
         for r in &results {
             assert_eq!(r.action, SaveAction::Created);
         }
@@ -1370,7 +1377,9 @@ Here's a summary of what we did.\n\
             .unwrap();
         assert_eq!(second.len(), 3);
         assert!(
-            second.iter().all(|r| matches!(r.action, SaveAction::Updated)),
+            second
+                .iter()
+                .all(|r| matches!(r.action, SaveAction::Updated)),
             "repeated capture should upsert, not duplicate"
         );
     }
@@ -1382,8 +1391,7 @@ Here's a summary of what we did.\n\
         let result = lib
             .propose(MemoryEntryInput {
                 title: "API token rotation".into(),
-                content: "Rotate via <private>sk-live-abc123</private> endpoint weekly."
-                    .into(),
+                content: "Rotate via <private>sk-live-abc123</private> endpoint weekly.".into(),
                 entry_type: EntryType::Rule,
                 ..Default::default()
             })
@@ -1609,8 +1617,9 @@ Here's a summary of what we did.\n\
 
         let transitions = lib.graduate_layers(None).await.unwrap();
         assert!(
-            transitions.iter().any(|t| t.id == result.id
-                && t.new_layer == MemoryLayer::EPISODIC),
+            transitions
+                .iter()
+                .any(|t| t.id == result.id && t.new_layer == MemoryLayer::EPISODIC),
             "expected WORKING→EPISODIC transition, got {:?}",
             transitions
         );
@@ -1663,7 +1672,10 @@ Here's a summary of what we did.\n\
 
         let evicted = lib.evict_stale(None).await.unwrap();
         assert!(evicted.contains(&victim.id));
-        assert!(!evicted.contains(&protected.id), "verified must never evict");
+        assert!(
+            !evicted.contains(&protected.id),
+            "verified must never evict"
+        );
 
         // Victim was soft-deleted → storage.get filters `deleted_at IS NULL`
         // so it returns NotFound. Protected entry still fetchable.
@@ -1721,10 +1733,19 @@ Here's a summary of what we did.\n\
         let dest = test_librarian().await;
 
         // Entries must exist before edges import; edges reference their ids.
-        assert!(dest.import_entry(src.get(a.id).await.unwrap()).await.unwrap());
-        assert!(dest.import_entry(src.get(b.id).await.unwrap()).await.unwrap());
+        assert!(dest
+            .import_entry(src.get(a.id).await.unwrap())
+            .await
+            .unwrap());
+        assert!(dest
+            .import_entry(src.get(b.id).await.unwrap())
+            .await
+            .unwrap());
         assert!(dest.import_edge(edge.clone()).await.unwrap());
-        assert!(!dest.import_edge(edge).await.unwrap(), "duplicate edge skip");
+        assert!(
+            !dest.import_edge(edge).await.unwrap(),
+            "duplicate edge skip"
+        );
 
         assert!(dest.import_session(session.clone()).await.unwrap());
         assert!(

@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 // binary's perspective.
 use runar_muninn::{
     breaker, config_cmd, curator, doctor, embedding, extract, hooks_runtime, huginn, librarian,
-    mcp, protocol, setup, storage, summarizer, sync as sync_cmd, types,
-    update as update_cmd, wizard,
+    mcp, protocol, setup, storage, summarizer, sync as sync_cmd, types, update as update_cmd,
+    wizard,
 };
 
 use librarian::MemoryLibrarian;
@@ -396,15 +396,10 @@ enum ConfigAction {
     },
 
     /// Set or update a key. Atomic write; preserves comments + ordering
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
 
     /// Remove a key
-    Unset {
-        key: String,
-    },
+    Unset { key: String },
 
     /// Interactive wizard for storage backend + connection details
     Wizard,
@@ -923,11 +918,7 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
     // Close the active session with the structured summary. If none is
     // active (rare — rotate_or_create_session should have created one),
     // fall back to proposing a standalone session entry.
-    let active = lib
-        .get_active_session(Some(pid))
-        .await
-        .ok()
-        .flatten();
+    let active = lib.get_active_session(Some(pid)).await.ok().flatten();
     let summary_body = format!(
         "## Session Summary\n\n{}\n\n**Completed:** {}\n\n**Learned:** {}",
         summary.request,
@@ -957,7 +948,9 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
                 .cloned()
                 .collect(),
         };
-        let _ = lib.end_session(session.id, session_summary, Some(pid)).await;
+        let _ = lib
+            .end_session(session.id, session_summary, Some(pid))
+            .await;
     } else {
         let input = types::MemoryEntryInput {
             title: format!("Session summary — {pid}"),
@@ -1010,15 +1003,9 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum ExportLine {
-    Entry {
-        data: types::MemoryEntry,
-    },
-    Edge {
-        data: types::MemoryEdge,
-    },
-    Session {
-        data: types::Session,
-    },
+    Entry { data: types::MemoryEntry },
+    Edge { data: types::MemoryEdge },
+    Session { data: types::Session },
 }
 
 async fn run_export(
@@ -1031,9 +1018,8 @@ async fn run_export(
 
     let lib = create_librarian().await?;
 
-    let et: Option<types::EntryType> = entry_type.and_then(|s| {
-        serde_json::from_value(serde_json::Value::String(s)).ok()
-    });
+    let et: Option<types::EntryType> =
+        entry_type.and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok());
 
     let filters = types::ListFilters {
         entry_type: et,
@@ -1050,8 +1036,7 @@ async fn run_export(
     // Roundtrip needs them for supersession graphs + session summaries to
     // survive. Skip edges whose endpoints aren't in the exported entry set
     // so the destination import doesn't dangle.
-    let entry_ids: std::collections::HashSet<uuid::Uuid> =
-        entries.iter().map(|e| e.id).collect();
+    let entry_ids: std::collections::HashSet<uuid::Uuid> = entries.iter().map(|e| e.id).collect();
 
     let all_edges = lib.list_all_edges(limit).await.unwrap_or_default();
     let edges: Vec<types::MemoryEdge> = all_edges
@@ -1161,8 +1146,7 @@ async fn run_import(path: &str) -> anyhow::Result<()> {
     use std::io::BufRead;
 
     let lib = create_librarian().await?;
-    let file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
+    let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
     let reader = std::io::BufReader::new(file);
 
     let mut entries_in = 0usize;
@@ -1533,9 +1517,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Storage: {storage}");
                 if already_existed {
                     println!();
-                    println!(
-                        "  Note: .env already existed and was left untouched."
-                    );
+                    println!("  Note: .env already existed and was left untouched.");
                     println!("  To inspect or change values, use:");
                     println!("    runar config show");
                     println!("    runar config set <KEY> <VALUE>");
@@ -1678,7 +1660,9 @@ async fn main() -> anyhow::Result<()> {
             // Memory Protocol + context packet injection (PreToolUse hook payload).
             // Must NEVER panic: hook failure would break Claude Code tool calls.
             if hooks_runtime::hooks_disabled() {
-                if silent { print!("{{\"additionalContext\":\"\"}}"); }
+                if silent {
+                    print!("{{\"additionalContext\":\"\"}}");
+                }
                 return Ok(());
             }
             let resolved = Some(resolve_project_id(project));
@@ -1686,7 +1670,9 @@ async fn main() -> anyhow::Result<()> {
             let full = match tokio::time::timeout(hooks_runtime::hook_budget(), work).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    if !silent { eprintln!("context error: {e}"); }
+                    if !silent {
+                        eprintln!("context error: {e}");
+                    }
                     String::new()
                 }
                 Err(_) => {
@@ -1702,48 +1688,57 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Extract { project, silent } => {
-            if hooks_runtime::hooks_disabled() { return Ok(()); }
-            let _ = tokio::time::timeout(
-                hooks_runtime::hook_budget(),
-                run_extract(project, silent),
-            ).await;
+            if hooks_runtime::hooks_disabled() {
+                return Ok(());
+            }
+            let _ =
+                tokio::time::timeout(hooks_runtime::hook_budget(), run_extract(project, silent))
+                    .await;
         }
         Commands::Enqueue { project, silent } => {
-            if hooks_runtime::hooks_disabled() { return Ok(()); }
-            let _ = tokio::time::timeout(
-                hooks_runtime::hook_budget(),
-                run_enqueue(project, silent),
-            ).await;
+            if hooks_runtime::hooks_disabled() {
+                return Ok(());
+            }
+            let _ =
+                tokio::time::timeout(hooks_runtime::hook_budget(), run_enqueue(project, silent))
+                    .await;
         }
         Commands::Summarize {
             project,
             silent,
             max,
         } => {
-            if hooks_runtime::hooks_disabled() { return Ok(()); }
+            if hooks_runtime::hooks_disabled() {
+                return Ok(());
+            }
             // SessionEnd has more headroom — summarizer + Claude API can take
             // several seconds. Use 4× the per-hook budget here.
             let budget = hooks_runtime::hook_budget() * 4;
             let _ = tokio::time::timeout(budget, run_summarize(project, silent, max)).await;
         }
         Commands::Nudge { project, silent } => {
-            if hooks_runtime::hooks_disabled() { return Ok(()); }
-            let _ = tokio::time::timeout(
-                hooks_runtime::hook_budget(),
-                run_nudge(project, silent),
-            ).await;
+            if hooks_runtime::hooks_disabled() {
+                return Ok(());
+            }
+            let _ = tokio::time::timeout(hooks_runtime::hook_budget(), run_nudge(project, silent))
+                .await;
         }
         Commands::SaveAck { project, silent } => {
-            if hooks_runtime::hooks_disabled() { return Ok(()); }
+            if hooks_runtime::hooks_disabled() {
+                return Ok(());
+            }
             run_save_ack(project, silent);
         }
         Commands::Session { action } => match action {
             SessionAction::Ping { project, silent } => {
-                if hooks_runtime::hooks_disabled() { return Ok(()); }
+                if hooks_runtime::hooks_disabled() {
+                    return Ok(());
+                }
                 let _ = tokio::time::timeout(
                     hooks_runtime::hook_budget(),
                     run_session_ping(project, silent),
-                ).await;
+                )
+                .await;
             }
             SessionAction::List { project, limit } => {
                 let librarian = create_librarian().await?;
@@ -1940,17 +1935,31 @@ async fn main() -> anyhow::Result<()> {
             ConfigAction::Wizard => config_cmd::cmd_wizard()?,
         },
 
-        Commands::Update { check, channel, force, rollback } => {
+        Commands::Update {
+            check,
+            channel,
+            force,
+            rollback,
+        } => {
             update_cmd::run(update_cmd::UpdateOpts {
                 check_only: check,
                 channel,
                 force,
                 rollback,
-            }).await?;
+            })
+            .await?;
         }
 
-        Commands::Doctor { db, json, quiet, timeout_ms } => {
-            let opts = doctor::DoctorOpts { db_only: db, timeout_ms };
+        Commands::Doctor {
+            db,
+            json,
+            quiet,
+            timeout_ms,
+        } => {
+            let opts = doctor::DoctorOpts {
+                db_only: db,
+                timeout_ms,
+            };
             let report = doctor::run(opts).await;
             if !quiet {
                 if json {
@@ -1967,7 +1976,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Sync { action } => match action {
             SyncAction::Init { force } => sync_cmd::cmd_init(force).await?,
             SyncAction::Push { limit, dry_run } => sync_cmd::cmd_push(limit, dry_run).await?,
-            SyncAction::Pull { limit, dry_run, since } => {
+            SyncAction::Pull {
+                limit,
+                dry_run,
+                since,
+            } => {
                 let since_dt = match since {
                     Some(s) => Some(
                         chrono::DateTime::parse_from_rfc3339(&s)

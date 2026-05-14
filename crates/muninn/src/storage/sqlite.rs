@@ -39,18 +39,12 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "008_add_pending_observations",
         include_str!("sql/008_add_pending_observations.sql"),
     ),
-    (
-        "009_add_verified",
-        include_str!("sql/009_add_verified.sql"),
-    ),
+    ("009_add_verified", include_str!("sql/009_add_verified.sql")),
     (
         "010_add_sync_outbox",
         include_str!("sql/010_add_sync_outbox.sql"),
     ),
-    (
-        "011_add_author",
-        include_str!("sql/011_add_author.sql"),
-    ),
+    ("011_add_author", include_str!("sql/011_add_author.sql")),
 ];
 
 pub struct SqliteAdapter {
@@ -240,7 +234,10 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
     let confidence: f64 = row.get("confidence").unwrap_or(DEFAULT_CONFIDENCE as f64);
     let topic_key: Option<String> = row.get("topic_key").ok();
     // A10 `verified` — SQLite stores bool as INTEGER 0/1.
-    let verified: bool = row.get::<_, i32>("verified").map(|n| n != 0).unwrap_or(false);
+    let verified: bool = row
+        .get::<_, i32>("verified")
+        .map(|n| n != 0)
+        .unwrap_or(false);
     let verified_at: Option<DateTime<Utc>> = row
         .get::<_, Option<String>>("verified_at")
         .ok()
@@ -743,8 +740,8 @@ impl MemoryStorage for SqliteAdapter {
                 .map_err(db_err)?;
             }
             if let Some(ref files) = update.files_modified {
-                let encoded =
-                    serde_json::to_string(files).map_err(|e| StorageError::Database(e.to_string()))?;
+                let encoded = serde_json::to_string(files)
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
                 db.execute(
                     "UPDATE sessions SET files_modified = ?1, updated_at = ?2 WHERE id = ?3",
                     params![encoded, now, id.to_string()],
@@ -1191,7 +1188,9 @@ impl MemoryStorage for SqliteAdapter {
         let ids: Vec<String> = if let Some(ref sid) = session_str {
             let mut stmt = db.prepare(select_sql).map_err(db_err)?;
             let rows = stmt
-                .query_map(params![namespace, sid, max as i64], |r| r.get::<_, String>(0))
+                .query_map(params![namespace, sid, max as i64], |r| {
+                    r.get::<_, String>(0)
+                })
                 .map_err(db_err)?;
             rows.filter_map(|r| r.ok()).collect()
         } else {
@@ -1398,10 +1397,7 @@ impl MemoryStorage for SqliteAdapter {
         }
         db.execute(&sql, params_vec.as_slice()).map_err(db_err)?;
 
-        Ok(ids
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect())
+        Ok(ids.iter().filter_map(|s| s.parse().ok()).collect())
     }
 
     async fn list_all_edges(&self, limit: usize) -> StorageResult<Vec<MemoryEdge>> {
@@ -1505,10 +1501,7 @@ impl MemoryStorage for SqliteAdapter {
 
     // ── Phase 5.6 — Sync (outbox + state + conflicts) ─────────
 
-    async fn enqueue_outbox(
-        &self,
-        op: crate::types::OutboxInput,
-    ) -> StorageResult<Uuid> {
+    async fn enqueue_outbox(&self, op: crate::types::OutboxInput) -> StorageResult<Uuid> {
         let db = self
             .db
             .lock()
@@ -1532,10 +1525,7 @@ impl MemoryStorage for SqliteAdapter {
         Ok(id)
     }
 
-    async fn claim_outbox(
-        &self,
-        max: usize,
-    ) -> StorageResult<Vec<crate::types::OutboxRow>> {
+    async fn claim_outbox(&self, max: usize) -> StorageResult<Vec<crate::types::OutboxRow>> {
         let db = self
             .db
             .lock()
@@ -1545,9 +1535,7 @@ impl MemoryStorage for SqliteAdapter {
         // SQLite doesn't support `RETURNING` everywhere, so do it
         // inside an immediate transaction for atomicity.
         let mut rows: Vec<crate::types::OutboxRow> = Vec::with_capacity(max);
-        let tx = db
-            .unchecked_transaction()
-            .map_err(db_err)?;
+        let tx = db.unchecked_transaction().map_err(db_err)?;
         let ids: Vec<String> = {
             let mut stmt = tx
                 .prepare(
@@ -1585,10 +1573,8 @@ impl MemoryStorage for SqliteAdapter {
                 placeholders
             );
             let mut stmt = tx.prepare(&sql).map_err(db_err)?;
-            let params_vec: Vec<&dyn rusqlite::ToSql> = ids
-                .iter()
-                .map(|s| s as &dyn rusqlite::ToSql)
-                .collect();
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
             let mapped = stmt
                 .query_map(params_vec.as_slice(), |row| {
                     let id_str: String = row.get(0)?;
@@ -1618,10 +1604,10 @@ impl MemoryStorage for SqliteAdapter {
             for (id_s, eid_s, op_s, payload_s, attempts, last_err, claimed, confirmed, created) in
                 mapped
             {
-                let id = Uuid::parse_str(&id_s)
-                    .map_err(|e| StorageError::Database(e.to_string()))?;
-                let entry_id = Uuid::parse_str(&eid_s)
-                    .map_err(|e| StorageError::Database(e.to_string()))?;
+                let id =
+                    Uuid::parse_str(&id_s).map_err(|e| StorageError::Database(e.to_string()))?;
+                let entry_id =
+                    Uuid::parse_str(&eid_s).map_err(|e| StorageError::Database(e.to_string()))?;
                 let op_kind = crate::types::OutboxOp::parse(&op_s)
                     .ok_or_else(|| StorageError::Database(format!("bad op_kind {op_s}")))?;
                 let row_payload: serde_json::Value = serde_json::from_str(&payload_s)
@@ -1634,10 +1620,14 @@ impl MemoryStorage for SqliteAdapter {
                     attempts,
                     last_error: last_err,
                     claimed_at: claimed.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s).ok().map(|t| t.with_timezone(&Utc))
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|t| t.with_timezone(&Utc))
                     }),
                     confirmed_at: confirmed.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s).ok().map(|t| t.with_timezone(&Utc))
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|t| t.with_timezone(&Utc))
                     }),
                     created_at: DateTime::parse_from_rfc3339(&created)
                         .map(|t| t.with_timezone(&Utc))
@@ -1707,9 +1697,7 @@ impl MemoryStorage for SqliteAdapter {
             .db
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let cutoff = (Utc::now()
-            - chrono::Duration::seconds(older_than_secs))
-            .to_rfc3339();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
         let affected = db
             .execute(
                 "DELETE FROM sync_outbox
@@ -1725,18 +1713,21 @@ impl MemoryStorage for SqliteAdapter {
             .db
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let row: Result<(
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<i32>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ), _> = db.query_row(
+        let row: Result<
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+            _,
+        > = db.query_row(
             "SELECT last_pulled_updated_at, last_pulled_session_at,
                     last_pulled_edge_at, last_push_at, last_pull_at,
                     local_dim, remote_dim,
@@ -1774,9 +1765,7 @@ impl MemoryStorage for SqliteAdapter {
                     initialized_at: parse_opt_ts(init),
                 })
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Ok(crate::types::SyncState::default())
-            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(crate::types::SyncState::default()),
             Err(e) => Err(db_err(e)),
         }
     }
@@ -1820,10 +1809,7 @@ impl MemoryStorage for SqliteAdapter {
         Ok(())
     }
 
-    async fn record_conflict(
-        &self,
-        c: &crate::types::SyncConflict,
-    ) -> StorageResult<()> {
+    async fn record_conflict(&self, c: &crate::types::SyncConflict) -> StorageResult<()> {
         let db = self
             .db
             .lock()
@@ -1867,10 +1853,7 @@ impl MemoryStorage for SqliteAdapter {
         Ok(())
     }
 
-    async fn list_conflicts(
-        &self,
-        limit: usize,
-    ) -> StorageResult<Vec<crate::types::SyncConflict>> {
+    async fn list_conflicts(&self, limit: usize) -> StorageResult<Vec<crate::types::SyncConflict>> {
         let db = self
             .db
             .lock()
@@ -1897,7 +1880,9 @@ impl MemoryStorage for SqliteAdapter {
                 let lpay: Option<String> = row.get(7)?;
                 let rpay: Option<String> = row.get(8)?;
                 let created: String = row.get(9)?;
-                Ok((id, entry_id, direction, policy, winner, lupd, rupd, lpay, rpay, created))
+                Ok((
+                    id, entry_id, direction, policy, winner, lupd, rupd, lpay, rpay, created,
+                ))
             })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
@@ -1906,8 +1891,7 @@ impl MemoryStorage for SqliteAdapter {
         let mut out = Vec::with_capacity(rows.len());
         for (id, entry_id, direction, policy, winner, lupd, rupd, lpay, rpay, created) in rows {
             out.push(crate::types::SyncConflict {
-                id: Uuid::parse_str(&id)
-                    .map_err(|e| StorageError::Database(e.to_string()))?,
+                id: Uuid::parse_str(&id).map_err(|e| StorageError::Database(e.to_string()))?,
                 entry_id: Uuid::parse_str(&entry_id)
                     .map_err(|e| StorageError::Database(e.to_string()))?,
                 direction: serde_json::from_value(serde_json::Value::String(direction))
@@ -1945,9 +1929,8 @@ impl MemoryStorage for SqliteAdapter {
             .db
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let upper_bound = (chrono::Utc::now()
-            - chrono::Duration::seconds(clock_skew_secs))
-            .to_rfc3339();
+        let upper_bound =
+            (chrono::Utc::now() - chrono::Duration::seconds(clock_skew_secs)).to_rfc3339();
 
         // Three SQL variants depending on after / project_filter
         // combinations.  SQLite doesn't support ANY/$N parameter
@@ -2005,10 +1988,7 @@ impl MemoryStorage for SqliteAdapter {
                     )
                     .map_err(db_err)?;
                 let mapped = stmt
-                    .query_map(
-                        params![upper_bound, project, limit as i64],
-                        row_to_entry,
-                    )
+                    .query_map(params![upper_bound, project, limit as i64], row_to_entry)
                     .map_err(db_err)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(db_err)?;
@@ -2024,10 +2004,7 @@ impl MemoryStorage for SqliteAdapter {
                     )
                     .map_err(db_err)?;
                 let mapped = stmt
-                    .query_map(
-                        params![upper_bound, limit as i64],
-                        row_to_entry,
-                    )
+                    .query_map(params![upper_bound, limit as i64], row_to_entry)
                     .map_err(db_err)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(db_err)?;
@@ -2258,10 +2235,7 @@ mod tests {
         assert_eq!(entry.author.as_deref(), Some("Alice"));
         assert!(entry.verified_by.is_none());
 
-        let verified = adapter
-            .mark_verified(result.id, Some("Bob"))
-            .await
-            .unwrap();
+        let verified = adapter.mark_verified(result.id, Some("Bob")).await.unwrap();
         assert!(verified.verified);
         assert_eq!(verified.verified_by.as_deref(), Some("Bob"));
         // Original author must not be overwritten by verify.
@@ -2767,7 +2741,9 @@ mod tests {
 
         let claimed = adapter.claim_observations("proj", None, 10).await.unwrap();
         assert_eq!(claimed.len(), 2);
-        assert!(claimed.iter().all(|p| p.status == PendingStatus::Processing));
+        assert!(claimed
+            .iter()
+            .all(|p| p.status == PendingStatus::Processing));
         assert!(claimed.iter().any(|p| p.id == id1));
         assert!(claimed.iter().any(|p| p.id == id2));
 
@@ -2830,7 +2806,10 @@ mod tests {
 
         let reclaimed = adapter.claim_observations("proj", None, 10).await.unwrap();
         assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].attempt_count, 2, "attempt_count increments on reclaim");
+        assert_eq!(
+            reclaimed[0].attempt_count, 2,
+            "attempt_count increments on reclaim"
+        );
     }
 
     // ── Phase 5.6.1 — sync trait tests ─────────────────────────
@@ -2896,7 +2875,11 @@ mod tests {
         // but only confirmed should be deleted.
         let deleted = adapter.gc_outbox(0).await.unwrap();
         assert_eq!(deleted, 1);
-        assert_eq!(adapter.outbox_depth().await.unwrap(), 1, "pending preserved");
+        assert_eq!(
+            adapter.outbox_depth().await.unwrap(),
+            1,
+            "pending preserved"
+        );
     }
 
     #[tokio::test]
@@ -2935,7 +2918,10 @@ mod tests {
             ..Default::default()
         };
         adapter.write_sync_state(&updated).await.unwrap();
-        assert_eq!(adapter.read_sync_state().await.unwrap().local_dim, Some(1536));
+        assert_eq!(
+            adapter.read_sync_state().await.unwrap().local_dim,
+            Some(1536)
+        );
     }
 
     #[tokio::test]
@@ -2960,14 +2946,8 @@ mod tests {
         let listed = adapter.list_conflicts(10).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, conflict.id);
-        assert_eq!(
-            listed[0].policy,
-            crate::types::ConflictPolicy::VerifiedWins
-        );
-        assert_eq!(
-            listed[0].direction,
-            crate::types::ConflictDirection::Push
-        );
+        assert_eq!(listed[0].policy, crate::types::ConflictPolicy::VerifiedWins);
+        assert_eq!(listed[0].direction, crate::types::ConflictDirection::Push);
     }
 
     #[tokio::test]

@@ -126,7 +126,10 @@ pub async fn cmd_init(force: bool) -> Result<()> {
         .map_err(|e| anyhow!("write_sync_state failed: {e}"))?;
 
     println!();
-    println!("✔ sync_state initialized at {}", state.initialized_at.unwrap());
+    println!(
+        "✔ sync_state initialized at {}",
+        state.initialized_at.unwrap()
+    );
     println!();
     println!("Next:");
     println!("  runar sync bootstrap   # first-time full pull from remote (5.6.3)");

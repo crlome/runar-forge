@@ -20,10 +20,26 @@ use crate::setup;
 /// URL (RFC 3986 §3.2.1). Anything not unreserved or sub-delim. We keep this
 /// strict — easier to over-encode than to debug a broken URL.
 const USERINFO: &AsciiSet = &CONTROLS
-    .add(b' ').add(b'"').add(b'#').add(b'%').add(b'<').add(b'>')
-    .add(b'?').add(b'`').add(b'{').add(b'}').add(b'/').add(b':')
-    .add(b';').add(b'=').add(b'@').add(b'[').add(b'\\').add(b']')
-    .add(b'^').add(b'|');
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'=')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'|');
 
 /// One physical line of `.env` content. We round-trip these so `set` does
 /// not destroy the user's comments or blank-line spacing.
@@ -52,13 +68,15 @@ impl EnvFile {
 
     pub fn load(path: &Path) -> Result<Self> {
         let raw = if path.exists() {
-            fs::read_to_string(path)
-                .with_context(|| format!("read {}", path.display()))?
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
         } else {
             String::new()
         };
         let lines = parse(&raw);
-        Ok(Self { path: path.to_path_buf(), lines })
+        Ok(Self {
+            path: path.to_path_buf(),
+            lines,
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -71,10 +89,13 @@ impl EnvFile {
     /// All `Kv` entries in encounter order. Later duplicates win on read,
     /// but `show` lists each occurrence so a duplicated key is visible.
     pub fn entries(&self) -> Vec<(&str, &str)> {
-        self.lines.iter().filter_map(|l| match l {
-            Line::Kv { key, value, .. } => Some((key.as_str(), value.as_str())),
-            _ => None,
-        }).collect()
+        self.lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Kv { key, value, .. } => Some((key.as_str(), value.as_str())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Insert or update `key=value`. Updates the *first* occurrence in place
@@ -84,7 +105,12 @@ impl EnvFile {
         let new_raw = format!("{key}={value}");
         let mut updated = false;
         for line in self.lines.iter_mut() {
-            if let Line::Kv { key: k, value: v, raw } = line {
+            if let Line::Kv {
+                key: k,
+                value: v,
+                raw,
+            } = line
+            {
                 if k == key {
                     *v = value.to_string();
                     *raw = new_raw.clone();
@@ -94,9 +120,7 @@ impl EnvFile {
             }
         }
         if !updated {
-            if !self.lines.is_empty()
-                && !matches!(self.lines.last(), Some(Line::Blank))
-            {
+            if !self.lines.is_empty() && !matches!(self.lines.last(), Some(Line::Blank)) {
                 self.lines.push(Line::Blank);
             }
             self.lines.push(Line::Kv {
@@ -109,7 +133,8 @@ impl EnvFile {
 
     pub fn remove(&mut self, key: &str) -> bool {
         let before = self.lines.len();
-        self.lines.retain(|l| !matches!(l, Line::Kv { key: k, .. } if k == key));
+        self.lines
+            .retain(|l| !matches!(l, Line::Kv { key: k, .. } if k == key));
         self.lines.len() != before
     }
 
@@ -117,7 +142,9 @@ impl EnvFile {
     /// the rename never crosses a device boundary (which would fall back
     /// to a non-atomic copy).
     pub fn save_atomic(&self) -> Result<()> {
-        let parent = self.path.parent()
+        let parent = self
+            .path
+            .parent()
             .ok_or_else(|| anyhow!("path has no parent: {}", self.path.display()))?;
         fs::create_dir_all(parent)?;
 
@@ -152,7 +179,11 @@ fn parse_line(raw: &str) -> Line {
         let key = trimmed[..eq].trim().to_string();
         let value = trimmed[eq + 1..].to_string();
         if !key.is_empty() {
-            return Line::Kv { key, value, raw: raw.to_string() };
+            return Line::Kv {
+                key,
+                value,
+                raw: raw.to_string(),
+            };
         }
     }
     // Lines that look invalid are kept as comments so we never silently
@@ -166,7 +197,8 @@ fn parse_line(raw: &str) -> Line {
 /// conventions vary; better to over-mask than leak.
 fn is_secret_key(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
-    ["PASSWORD", "TOKEN", "SECRET", "API_KEY", "APIKEY"].iter()
+    ["PASSWORD", "TOKEN", "SECRET", "API_KEY", "APIKEY"]
+        .iter()
         .any(|needle| k.contains(needle))
 }
 
@@ -221,10 +253,18 @@ pub fn cmd_show(unmask: bool) -> Result<()> {
     println!("# {}", env.path.display());
 
     for (key, value) in env.entries() {
-        let file_val = if unmask { value.to_string() } else { mask_value(key, value) };
+        let file_val = if unmask {
+            value.to_string()
+        } else {
+            mask_value(key, value)
+        };
         let process_val = std::env::var(key).ok();
         let process_display = process_val.as_deref().map(|v| {
-            if unmask { v.to_string() } else { mask_value(key, v) }
+            if unmask {
+                v.to_string()
+            } else {
+                mask_value(key, v)
+            }
         });
 
         match process_display {
@@ -242,7 +282,11 @@ pub fn cmd_get(key: &str, unmask: bool) -> Result<()> {
     let env = EnvFile::load(&EnvFile::default_path())?;
     match env.get(key) {
         Some(v) => {
-            let out = if unmask { v.to_string() } else { mask_value(key, v) };
+            let out = if unmask {
+                v.to_string()
+            } else {
+                mask_value(key, v)
+            };
             println!("{out}");
             Ok(())
         }
@@ -319,9 +363,7 @@ pub fn cmd_wizard() -> Result<()> {
             .with_prompt("User")
             .default("runar".into())
             .interact_text()?;
-        let password: String = Password::new()
-            .with_prompt("Password")
-            .interact()?;
+        let password: String = Password::new().with_prompt("Password").interact()?;
 
         let url = build_db_url(&host, port, &db, &user, &password);
         env.upsert("RUNAR_DB_URL", &url);

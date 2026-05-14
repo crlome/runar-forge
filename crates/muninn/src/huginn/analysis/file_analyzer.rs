@@ -118,9 +118,7 @@ fn sql_purpose(sql: &super::sql_analyzer::SqlAnalysis, relative_path: &str) -> S
     let tables = sql.tables.len();
     let alters = sql.alters.len();
     let indexes = sql.indexes.len();
-    format!(
-        "{seq}{name} — {tables} table(s), {alters} alter(s), {indexes} index(es)"
-    )
+    format!("{seq}{name} — {tables} table(s), {alters} alter(s), {indexes} index(es)")
 }
 
 /// Match `impl [<generics>] Trait[<args>] for Type[<args>]` across a Rust
@@ -146,8 +144,14 @@ fn extract_rust_trait_impls(src: &str) -> Vec<TraitImpl> {
 
     let mut out = Vec::new();
     for caps in re.captures_iter(src) {
-        let trait_name = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
-        let type_name = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let trait_name = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let type_name = caps
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         if trait_name.is_empty() || type_name.is_empty() {
             continue;
         }
