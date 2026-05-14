@@ -12,9 +12,15 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 pub fn home_dir() -> PathBuf {
-    // `dirs::home_dir()` reads `HOME` on Unix and `USERPROFILE` on Windows,
-    // which makes this the single safe source of the user's home directory
-    // across every supported platform.
+    // `RUNAR_HOME` lets users (and tests) redirect every runar-managed path
+    // to a custom directory. Falls back to `dirs::home_dir()` (reads `HOME`
+    // on Unix, `USERPROFILE` on Windows) so a single env var works on every
+    // platform — `set_var("HOME", …)` alone is a no-op on Windows.
+    if let Ok(p) = std::env::var("RUNAR_HOME") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -483,21 +489,21 @@ mod tests {
 
     #[test]
     fn write_env_file_postgres() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let path = write_env_file("postgresql").unwrap();
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("RUNAR_STORAGE=postgresql"));
-        assert!(content.contains("RUNAR_DB_URL=postgresql://"));
+        crate::test_support::with_runar_home(|| {
+            let path = write_env_file("postgresql").unwrap();
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains("RUNAR_STORAGE=postgresql"));
+            assert!(content.contains("RUNAR_DB_URL=postgresql://"));
+        });
     }
 
     #[test]
     fn write_env_file_sqlite() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let path = write_env_file("sqlite").unwrap();
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("RUNAR_STORAGE=sqlite"));
-        assert!(content.contains("RUNAR_SQLITE_PATH="));
+        crate::test_support::with_runar_home(|| {
+            let path = write_env_file("sqlite").unwrap();
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains("RUNAR_STORAGE=sqlite"));
+            assert!(content.contains("RUNAR_SQLITE_PATH="));
+        });
     }
 }

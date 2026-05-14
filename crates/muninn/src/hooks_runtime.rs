@@ -109,29 +109,19 @@ pub fn tail_hook_log(n: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // HOME is process-global; parallel tests that mutate it race with each
-    // other. Serialize the HOME-mutating tests with a mutex so cargo's
-    // default parallel test runner doesn't trip them.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_tmp_home<F: FnOnce()>(f: F) {
-        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
-        f();
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-    }
+    use crate::test_support::{with_runar_home, HOME_LOCK};
 
     // Group every env-mutating test under a single combined mutex-locked
     // function so cargo's default parallel runner doesn't race them. Also
-    // serializes against `with_tmp_home` callers via the same lock.
+    // serializes against `with_runar_home` callers via the same lock. The
+    // `RUNAR_HOME` override redirects `disable_file_path()` to a tempdir
+    // so a stray `.disable-hooks` from another test can't flip the assert.
     #[test]
     fn env_var_behaviors_serial() {
         let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("RUNAR_HOME").ok();
+        std::env::set_var("RUNAR_HOME", tmp.path());
 
         std::env::remove_var("RUNAR_HOOK_BUDGET_MS");
         assert_eq!(hook_budget(), Duration::from_millis(800));
@@ -145,11 +135,16 @@ mod tests {
         std::env::set_var("RUNAR_DISABLE_HOOKS", "0");
         assert!(!hooks_disabled());
         std::env::remove_var("RUNAR_DISABLE_HOOKS");
+
+        match prev_home {
+            Some(v) => std::env::set_var("RUNAR_HOME", v),
+            None => std::env::remove_var("RUNAR_HOME"),
+        }
     }
 
     #[test]
     fn disabled_via_touch_file() {
-        with_tmp_home(|| {
+        with_runar_home(|| {
             std::env::remove_var("RUNAR_DISABLE_HOOKS");
             assert!(!hooks_disabled());
             fs::create_dir_all(runar_dir()).unwrap();
@@ -160,7 +155,7 @@ mod tests {
 
     #[test]
     fn log_appends_and_rotates() {
-        with_tmp_home(|| {
+        with_runar_home(|| {
             fs::create_dir_all(runar_dir()).unwrap();
             append_hook_log("test", "first");
             append_hook_log("test", "second");

@@ -26,3 +26,6 @@ pub mod tokens;
 pub mod types;
 pub mod update;
 pub mod wizard;
+
+#[cfg(test)]
+pub(crate) mod test_support;
