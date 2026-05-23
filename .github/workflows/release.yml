@@ -28,7 +28,10 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-          - runner: macos-13
+          # Cross-compile Intel on the arm64 runner — Apple clang cross-builds
+          # x86_64 natively, and the macos-13 (Intel) hosted runner is being
+          # retired so its label can hang queued forever.
+          - runner: macos-14
             target: x86_64-apple-darwin
             archive: tar.gz
           - runner: windows-latest
