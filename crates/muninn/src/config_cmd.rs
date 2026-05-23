@@ -403,7 +403,7 @@ mod tests {
 
     fn fixture(text: &str) -> EnvFile {
         EnvFile {
-            path: PathBuf::from("/tmp/test.env"),
+            path: std::env::temp_dir().join("runar-test.env"),
             lines: parse(text),
         }
     }

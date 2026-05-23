@@ -26,6 +26,7 @@ const TARGETS = {
   'linux-x64':    { asset: 'runar-x86_64-unknown-linux-gnu.tar.gz',  archive: 'tar.gz' },
   'linux-arm64':  { asset: 'runar-aarch64-unknown-linux-gnu.tar.gz', archive: 'tar.gz' },
   'darwin-arm64': { asset: 'runar-aarch64-apple-darwin.tar.gz',      archive: 'tar.gz' },
+  'darwin-x64':   { asset: 'runar-x86_64-apple-darwin.tar.gz',       archive: 'tar.gz' },
   'win32-x64':    { asset: 'runar-x86_64-pc-windows-msvc.zip',       archive: 'zip'    },
 }
 

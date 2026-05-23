@@ -3,9 +3,9 @@
 > Persistent, semantically-searchable memory for AI coding tools.
 > One static Rust binary. SQLite or PostgreSQL. MCP-compatible.
 
-**`runar`** is a single-binary CLI that gives Claude Code, Cursor,
-Windsurf, Trae, Gemini CLI, Continue.dev, Zed, OpenCode, Goose, Kimi,
-VS Code — any MCP-aware AI tool — a memory that survives session
+**`runar`** is a single-binary CLI that gives Claude Code, VS Code,
+OpenCode, Codex, Cursor, Windsurf, Trae, Gemini CLI, Continue.dev, Zed,
+Goose, Kimi — any MCP-aware AI tool — a memory that survives session
 closes, travels across tools, and understands codebase structure.
 
 Named after Odin's two ravens from Norse mythology:
@@ -80,6 +80,7 @@ Pick the matching tarball from
 | Linux x86_64                    | `runar-x86_64-unknown-linux-gnu.tar.gz`        |
 | Linux aarch64                   | `runar-aarch64-unknown-linux-gnu.tar.gz`       |
 | macOS arm64 (Apple Silicon)     | `runar-aarch64-apple-darwin.tar.gz`            |
+| macOS x86_64 (Intel)            | `runar-x86_64-apple-darwin.tar.gz`             |
 | Windows x86_64                  | `runar-x86_64-pc-windows-msvc.zip`             |
 
 Each tarball/zip is paired with a `.sha256` checksum.
@@ -110,6 +111,19 @@ Optional auto-capture (PostToolUse queue + SessionEnd summarizer):
 runar setup claude-code -p my-proj --with-auto-capture
 ```
 
+Other editors — same `mcp-muninn` server, different config file. `vscode`,
+`opencode`, and `codex` auto-write their config; `cursor` and `windsurf` print
+it for manual paste. Hooks (context injection, auto-capture) are Claude Code
+only — the rest are MCP tools only.
+
+```bash
+runar setup vscode      # writes .vscode/mcp.json   (servers.muninn)
+runar setup opencode    # writes opencode.json      (mcp.muninn, type=local)
+runar setup codex       # writes ~/.codex/config.toml ([mcp_servers.muninn])
+runar setup cursor      # prints MCP config for manual paste
+runar setup windsurf    # prints MCP config for manual paste
+```
+
 ---
 
 ## CLI reference
@@ -120,7 +134,7 @@ runar setup claude-code -p my-proj --with-auto-capture
 | `runar init`                 | Create `~/.runar-forge/.env`. `--interactive` runs the wizard.                 |
 | `runar config <action>`      | Manage `~/.runar-forge/.env`: `path`, `show`, `get`, `set`, `unset`, `wizard`. |
 | `runar doctor`               | 10 read-only health checks. `--db`, `--json`, `--quiet`, `--timeout-ms`.       |
-| `runar setup <tool>`         | Wire MCP into `claude-code`/`cursor`/`windsurf`. `--with-auto-capture`, `--configure`. |
+| `runar setup <tool>`         | Wire MCP into `claude-code`/`vscode`/`opencode`/`codex`/`cursor`/`windsurf`. `--with-auto-capture`, `--configure`. |
 | `runar update`               | Self-update binary via release manifest. `--check`, `--channel`, `--rollback`. |
 | `runar search <query>`       | CLI-side semantic search; `--limit`.                                           |
 | `runar save <title> <body>`  | Save a memory entry from the shell. `--project`, `--type`, `--tags`, `--topic-key`. |
@@ -325,7 +339,7 @@ to keep the shipped binary lean (~16 MB without local embeddings,
 
 CI runs the same gates on Linux, macOS, and Windows for every push
 and PR (`.github/workflows/ci.yml`). Tagging `v<x.y.z>` triggers
-`release.yml`, which cross-compiles four targets and uploads
+`release.yml`, which builds five targets and uploads
 tarballs/zip + sha256 checksums to the GitHub Release.
 
 ---

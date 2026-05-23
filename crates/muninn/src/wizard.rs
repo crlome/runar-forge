@@ -188,7 +188,8 @@ pub fn run_wizard() -> anyhow::Result<WizardResult> {
     if !ran_crawl {
         println!("    runar crawl . --project {project_id}");
     }
-    println!("    Restart Claude Code / VS Code to pick up MCP + hooks");
+    println!("    Other editors: runar setup [vscode|opencode|codex|cursor|windsurf]");
+    println!("    Restart your editor to pick up the MCP server (+ hooks on Claude Code)");
     println!();
 
     Ok(WizardResult {

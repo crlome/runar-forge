@@ -1,6 +1,6 @@
-# Build + publish release binaries for `v*` tags. Cross-compiles to
-# linux x86_64/aarch64, macOS arm64, windows x86_64 and uploads tarballs
-# (zip on Windows) plus sha256 checksums to the GitHub Release.
+# Build + publish release binaries for `v*` tags. Builds for
+# linux x86_64/aarch64, macOS arm64 + x86_64, windows x86_64 and uploads
+# tarballs (zip on Windows) plus sha256 checksums to the GitHub Release.
 name: release
 
 on:
@@ -27,6 +27,9 @@ jobs:
             cross: true
           - runner: macos-14
             target: aarch64-apple-darwin
+            archive: tar.gz
+          - runner: macos-13
+            target: x86_64-apple-darwin
             archive: tar.gz
           - runner: windows-latest
             target: x86_64-pc-windows-msvc

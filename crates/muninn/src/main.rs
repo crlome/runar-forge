@@ -79,7 +79,7 @@ enum Commands {
 
     /// Configure an AI tool to use RunarForge
     Setup {
-        /// Tool name: claude-code | cursor | windsurf
+        /// Tool name: claude-code | vscode | opencode | codex | cursor | windsurf
         tool: String,
         /// Project ID (default: auto-detect from git remote or directory name)
         #[arg(short, long)]
@@ -1641,6 +1641,25 @@ async fn main() -> anyhow::Result<()> {
                     }
                     println!("Restart Claude Code to activate.\n");
                 }
+                "vscode" => {
+                    let p = setup::setup_vscode()?;
+                    println!("RunarForge — VSCode Setup\n");
+                    println!("  MCP server 'muninn' written to {}\n", p.display());
+                    println!("Reload the VSCode window (or restart) to activate.\n");
+                }
+                "opencode" => {
+                    let p = setup::setup_opencode()?;
+                    println!("RunarForge — OpenCode Setup\n");
+                    println!("  MCP server 'muninn' written to {}\n", p.display());
+                    println!("Restart OpenCode to activate.\n");
+                }
+                "codex" => {
+                    let p = setup::setup_codex()?;
+                    println!("RunarForge — Codex Setup\n");
+                    println!("  MCP server 'muninn' written to {}", p.display());
+                    println!("  (global config — the --project flag is not used)\n");
+                    println!("Restart Codex to activate.\n");
+                }
                 "cursor" => {
                     println!("Add this to your Cursor settings (MCP section):\n");
                     println!("{}", setup::cursor_config(&setup::detect_binary_path()));
@@ -1650,7 +1669,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", setup::windsurf_config(&setup::detect_binary_path()));
                 }
                 other => {
-                    anyhow::bail!("unknown tool '{other}' (use claude-code | cursor | windsurf)")
+                    anyhow::bail!(
+                        "unknown tool '{other}' \
+                         (use claude-code | vscode | opencode | codex | cursor | windsurf)"
+                    )
                 }
             }
         }

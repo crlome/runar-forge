@@ -129,9 +129,10 @@ mod tests {
 
     #[test]
     fn cache_dir_honors_env_override() {
-        std::env::set_var("RUNAR_MODELS_DIR", "/tmp/runar-local-embeddings");
+        let custom = std::env::temp_dir().join("runar-local-embeddings");
+        std::env::set_var("RUNAR_MODELS_DIR", &custom);
         let dir = resolve_cache_dir();
-        assert_eq!(dir, std::path::PathBuf::from("/tmp/runar-local-embeddings"));
+        assert_eq!(dir, custom);
         std::env::remove_var("RUNAR_MODELS_DIR");
     }
 }
