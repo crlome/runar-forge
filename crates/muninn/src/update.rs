@@ -46,7 +46,11 @@ use sha2::{Digest, Sha256};
 
 use crate::setup;
 
-const DEFAULT_MANIFEST_URL: &str = ""; // populated once release infra exists
+// Stable redirect to the newest non-prerelease release's manifest. The
+// release pipeline (.github/workflows/release.yml) publishes manifest.json as
+// a release asset; `releases/latest/download/…` always resolves to the latest.
+const DEFAULT_MANIFEST_URL: &str =
+    "https://github.com/crlome/runar-forge/releases/latest/download/manifest.json";
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -348,9 +352,12 @@ mod tests {
     fn manifest_url_env_behavior() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Env unset → falls back to the published default manifest URL.
         std::env::remove_var("RUNAR_UPDATE_MANIFEST_URL");
-        assert!(manifest_url().is_err());
+        assert_eq!(manifest_url().unwrap(), DEFAULT_MANIFEST_URL);
+        assert!(!DEFAULT_MANIFEST_URL.is_empty());
 
+        // Env set → overrides the default.
         std::env::set_var("RUNAR_UPDATE_MANIFEST_URL", "https://example.com/m.json");
         assert_eq!(manifest_url().unwrap(), "https://example.com/m.json");
         std::env::remove_var("RUNAR_UPDATE_MANIFEST_URL");
