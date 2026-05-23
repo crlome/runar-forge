@@ -1,6 +1,6 @@
 {
   "name": "@runar-forge/cli",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "npm wrapper that downloads the runar Rust binary for your platform",
   "bin": {
     "runar": "bin/runar.js"

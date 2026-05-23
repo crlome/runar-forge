@@ -1,6 +1,9 @@
 # Build + publish release binaries for `v*` tags. Builds for
-# linux x86_64/aarch64, macOS arm64 + x86_64, windows x86_64 and uploads
-# tarballs (zip on Windows) plus sha256 checksums to the GitHub Release.
+# linux x86_64/aarch64, macOS arm64 + x86_64, windows x86_64 and uploads,
+# per target: an archive (tar.gz / zip) for npm + manual installs, a raw
+# binary for `runar update`, and sha256 checksums for both. The publish job
+# also generates manifest.json (consumed by `runar update`) and a final job
+# publishes the npm shim.
 name: release
 
 on:
@@ -80,16 +83,28 @@ jobs:
           NAME="runar-${{ matrix.target }}"
           OUT="${GITHUB_WORKSPACE}/artifacts"
           mkdir -p "$OUT"
+          # hex-only sha256 of a file (for the manifest); GNU or BSD tools.
+          raw_sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
           if [ "${{ matrix.archive }}" = "zip" ]; then
             BIN="target/${{ matrix.target }}/release/runar.exe"
+            RAW="${NAME}.exe"
             cp "$BIN" "$OUT/runar.exe"
+            # archive (for npm + humans)
             (cd "$OUT" && 7z a "${NAME}.zip" runar.exe >/dev/null)
-            (cd "$OUT" && certutil -hashfile "${NAME}.zip" SHA256 | grep -v "hash" | tr -d ' \r' > "${NAME}.zip.sha256" || sha256sum "${NAME}.zip" > "${NAME}.zip.sha256")
+            (cd "$OUT" && certutil -hashfile "${NAME}.zip" SHA256 | grep -v -i "hash" | tr -d ' \r' > "${NAME}.zip.sha256")
+            # raw binary + hex-only sha256 (for `runar update`)
+            cp "$OUT/runar.exe" "$OUT/${RAW}"
+            (cd "$OUT" && raw_sha "${RAW}" > "${RAW}.sha256")
             rm "$OUT/runar.exe"
           else
             BIN="target/${{ matrix.target }}/release/runar"
+            RAW="${NAME}"
             cp "$BIN" "$OUT/runar"
+            # archive (for npm + humans)
             (cd "$OUT" && tar -czf "${NAME}.tar.gz" runar && (shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" 2>/dev/null || sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"))
+            # raw binary + hex-only sha256 (for `runar update`)
+            cp "$OUT/runar" "$OUT/${RAW}"
+            (cd "$OUT" && raw_sha "${RAW}" > "${RAW}.sha256")
             rm "$OUT/runar"
           fi
           echo "dir=$OUT" >> "$GITHUB_OUTPUT"
@@ -110,16 +125,63 @@ jobs:
         with:
           path: artifacts
 
-      - name: List artifacts
-        run: find artifacts -type f | sort
+      - name: Assemble release dir + manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Flatten every per-target artifact into one dir. Basenames are
+          # unique (each is prefixed by its triple), so flattening is safe.
+          mkdir -p release
+          find artifacts -type f -exec cp -f {} release/ \;
 
-      - name: Attach binaries to GitHub Release
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          RELEASED="$(date -u +%Y-%m-%d)"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          # Triples must match `target_triple()` in crates/muninn/src/update.rs.
+          TARGETS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                   x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc)
+
+          artifacts_json="{}"
+          for t in "${TARGETS[@]}"; do
+            case "$t" in *windows*) asset="runar-${t}.exe";; *) asset="runar-${t}";; esac
+            sha="$(tr -d ' \r\n' < "release/${asset}.sha256")"
+            artifacts_json="$(jq --arg t "$t" --arg url "${BASE}/${asset}" --arg sha "$sha" \
+              '. + {($t): {url: $url, sha256: $sha}}' <<<"$artifacts_json")"
+          done
+          # Schema mirrors Manifest/Channel/Artifact in update.rs.
+          jq -n --arg v "$VERSION" --arg r "$RELEASED" --argjson a "$artifacts_json" \
+            '{stable: {version: $v, released: $r, artifacts: $a}}' > release/manifest.json
+
+          echo "=== manifest.json ==="; cat release/manifest.json
+          echo "=== release/ ==="; ls -1 release/
+
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.tar.gz.sha256
-            artifacts/**/*.zip
-            artifacts/**/*.zip.sha256
+          files: release/*
           fail_on_unmatched_files: true
+
+  # Publish the npm shim that downloads the matching binary. Gated so a missing
+  # NPM_TOKEN skips (instead of failing the release) until the secret is added.
+  npm-publish:
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - name: Publish @runar-forge/cli
+        working-directory: packages/cli-wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN unset — skipping npm publish."
+            exit 0
+          fi
+          npm publish --access public
