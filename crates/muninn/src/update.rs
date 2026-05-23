@@ -81,7 +81,9 @@ fn target_triple() -> &'static str {
     } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         "aarch64-apple-darwin"
     } else if cfg!(all(target_arch = "x86_64", target_os = "windows")) {
-        "x86_64-pc-windows-gnu"
+        // Must match the triple the release pipeline publishes (MSVC, not GNU)
+        // — see RELEASE_TARGETS in tests + .github/workflows/release.yml.
+        "x86_64-pc-windows-msvc"
     } else {
         "unknown"
     }
@@ -309,12 +311,30 @@ fn rollback() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Targets the release pipeline actually publishes. Keep in lockstep with
+    /// the `matrix.target` list in `.github/workflows/release.yml` — a binary
+    /// whose host triple isn't here has no artifact for `runar update` to fetch.
+    const RELEASE_TARGETS: &[&str] = &[
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ];
+
     #[test]
-    fn target_triple_returns_known_or_unknown() {
+    fn target_triple_matches_a_release_artifact() {
         let t = target_triple();
-        // Sanity: it's never empty and either matches a known triple or
-        // is the literal "unknown" sentinel.
         assert!(!t.is_empty());
+        // Runs on every supported CI host (linux x86_64/aarch64, macOS
+        // arm64/x86_64, windows x86_64-msvc), so the host triple must be one
+        // the release pipeline ships — this catches a code/CI drift such as
+        // the historical `x86_64-pc-windows-gnu` vs the published `-msvc`.
+        assert!(
+            RELEASE_TARGETS.contains(&t),
+            "target_triple() returned `{t}`, which release.yml does not publish; \
+             update target_triple() or the release matrix to match"
+        );
     }
 
     #[test]

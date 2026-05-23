@@ -97,7 +97,8 @@ Sessions are created and expired by `runar context`:
 - **Auto-expire** — no activity for 30 min → session ends with a summary
   entry, a new one starts
 - **File tracking** — every file write is persisted cumulatively in the
-  per-project ping file at `$TMPDIR/runar-ping-<project>`
+  per-project ping file in the system temp dir (`$TMPDIR/runar-ping-<project>`
+  on Unix; `%TEMP%\runar-ping-<project>` on Windows)
 
 ### What you do manually
 
@@ -192,6 +193,9 @@ runar doctor                                  # validate config + storage
 
 ```bash
 runar setup claude-code [-p <project>] [--configure]  # MCP + hooks + CLAUDE.md
+runar setup vscode                            # write .vscode/mcp.json
+runar setup opencode                          # write opencode.json
+runar setup codex                             # write ~/.codex/config.toml
 runar setup cursor                            # print MCP config
 runar setup windsurf                          # print MCP config
 ```
@@ -272,8 +276,11 @@ Conflict resolver: LWW + verified tiebreaker + soft-delete propagation.
 Audit rows in `muninn.sync_conflicts`. See INSTALLATION-GUIDE.md §12
 for the full setup, conflict matrix, and troubleshooting.
 
-`claude-code` is the only setup that auto-configures hooks — Cursor and
-Windsurf don't support per-project hooks.
+`claude-code` is the only setup that auto-configures hooks — VSCode,
+OpenCode, Codex, Cursor, and Windsurf get the MCP tools only (no
+per-project hooks). On Windows, Claude Code hooks are written in exec
+form (`command` + `args`, no shell) so they run under Git Bash or the
+PowerShell fallback; Unix uses shell form.
 
 ### Memory (Muninn)
 

@@ -44,11 +44,11 @@ chmod +x /usr/local/bin/runar
 # Windows — download runar.exe and add its directory to PATH
 ```
 
-GitHub Actions (`.github/workflows/release.yml`) cross-compiles four
-targets per `v*` tag (Linux x86_64, Linux aarch64, macOS aarch64,
+GitHub Actions (`.github/workflows/release.yml`) builds five targets
+per `v*` tag (Linux x86_64, Linux aarch64, macOS aarch64, macOS x86_64,
 Windows x86_64) and attaches the tarballs / zip plus sha256 checksums
-to the GitHub Release. The macOS binary is ad-hoc codesigned so
-Gatekeeper will not SIGKILL it on first run.
+to the GitHub Release. Both macOS binaries are ad-hoc codesigned so
+Gatekeeper will not SIGKILL them on first run.
 
 **macOS download (Apple Silicon):**
 
@@ -387,15 +387,25 @@ runar doctor
 # `git config user.name` is unset).
 ```
 
-### Cursor / Windsurf
+### Other editors (VSCode / OpenCode / Codex / Cursor / Windsurf)
 
-These tools don't support per-project hooks, but you can register the MCP
-server manually:
+These tools don't support per-project hooks (context injection and
+auto-capture are Claude Code only), but they all consume the same
+`runar mcp-muninn` stdio server. `vscode`, `opencode`, and `codex`
+auto-write their config file; `cursor` and `windsurf` print it for you
+to paste manually:
 
 ```bash
+runar setup vscode       # writes .vscode/mcp.json   (servers.muninn)
+runar setup opencode     # writes opencode.json      (mcp.muninn, type=local)
+runar setup codex        # writes ~/.codex/config.toml ([mcp_servers.muninn])
 runar setup cursor       # prints MCP config for manual paste
 runar setup windsurf     # prints MCP config for manual paste
 ```
+
+`vscode`/`opencode` write into the current directory (workspace-local);
+`codex` writes the global `~/.codex/config.toml`. All merges are
+idempotent and preserve existing servers, keys, and comments.
 
 ---
 
@@ -579,6 +589,9 @@ runar --version                          # show version
 runar stats                              # memory counts + namespaces
 runar init [--storage sqlite|postgresql] # write ~/.runar-forge/.env
 runar setup claude-code [--project <id>] # configure MCP + hooks + CLAUDE.md
+runar setup vscode                       # write .vscode/mcp.json
+runar setup opencode                     # write opencode.json
+runar setup codex                        # write ~/.codex/config.toml
 runar setup cursor                       # print Cursor MCP config
 runar setup windsurf                     # print Windsurf MCP config
 runar doctor [--db] [--json] [--quiet] [--timeout-ms <n>]

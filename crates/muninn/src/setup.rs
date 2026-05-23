@@ -178,9 +178,46 @@ pub fn resolve_hook_binary_path() -> String {
     detect_binary_path()
 }
 
+/// Mirror the running binary into `~/.runar-forge/bin/runar` and return that
+/// stable path, so every editor's MCP registration points at an atomically
+/// updated location (see `install_stable_binary`). Best-effort: on failure
+/// (perm denied, source missing) it warns and falls back to the detected path.
+pub fn resolve_stable_binary() -> String {
+    let detected = detect_binary_path();
+    match install_stable_binary(&detected) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!(
+                "warn: could not install stable binary at {}: {e} — using {detected}",
+                stable_bin_path().display()
+            );
+            detected
+        }
+    }
+}
+
+/// Read a JSON file into a `Value`, returning an empty object when the file is
+/// absent or unparseable. Mirrors the read step the Claude Code setup uses for
+/// `~/.claude.json` so every JSON-config editor merges the same way.
+fn read_json_or_empty(path: &std::path::Path) -> anyhow::Result<Value> {
+    if path.exists() {
+        Ok(serde_json::from_str(&fs::read_to_string(path)?).unwrap_or_else(|_| json!({})))
+    } else {
+        Ok(json!({}))
+    }
+}
+
+/// Write a `Value` as pretty JSON with a trailing newline.
+fn write_json_pretty(path: &std::path::Path, value: &Value) -> anyhow::Result<()> {
+    fs::write(path, serde_json::to_string_pretty(value)? + "\n")?;
+    Ok(())
+}
+
 /// Shell-quote a path for embedding in a hook command string. Wraps in
 /// single quotes and escapes any internal single quotes. Sufficient for
-/// the path strings we generate (no embedded NULs).
+/// the path strings we generate (no embedded NULs). Unix-only — Windows
+/// hooks use exec form and never build a shell string.
+#[cfg(not(windows))]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -190,6 +227,7 @@ fn shell_quote(s: &str) -> String {
 /// (replaces the historical `2>/dev/null`). Trailing `; exit 0` makes
 /// every hook return zero — Claude Code treats non-zero as a hard error
 /// and a stale binary's "command not found" used to surface as one.
+#[cfg(not(windows))]
 fn hook_command(binary_path: &str, args: &str, log_path: &str) -> String {
     format!(
         "{} {} 2>>{} ; exit 0",
@@ -199,34 +237,58 @@ fn hook_command(binary_path: &str, args: &str, log_path: &str) -> String {
     )
 }
 
+/// Build a Claude Code hook entry from a raw argument vector, choosing the
+/// representation that is robust on the host OS.
+///
+/// On **Unix** we emit *shell form*: a single command string Claude Code runs
+/// via `sh -c`, with each arg single-quoted, stderr appended to `hook.log`,
+/// and a trailing `; exit 0` so a stale binary can't surface as a hard error.
+///
+/// On **Windows** we emit *exec form* (`command` + `args`), which Claude Code
+/// spawns directly with **no shell**. This is the only representation that
+/// works whether Claude Code falls back to Git Bash *or* PowerShell — the
+/// POSIX `'…'`/`;`/`2>>` syntax is invalid under PowerShell. We lose the shell
+/// stderr redirect, but the hook subcommands already log to `hook.log`
+/// internally (`hooks_runtime::append_hook_log`) and swallow their own errors,
+/// so no safety is lost.
+fn runar_hook_entry(matcher: &str, binary_path: &str, args: &[&str], log_path: &str) -> Value {
+    #[cfg(not(windows))]
+    {
+        let quoted = args
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        hook_entry(matcher, &hook_command(binary_path, &quoted, log_path))
+    }
+    #[cfg(windows)]
+    {
+        let _ = log_path; // captured by the binary's own hook.log writer
+        json!({
+            "matcher": matcher,
+            "hooks": [{
+                "type": "command",
+                "command": binary_path,
+                "args": args,
+            }],
+        })
+    }
+}
+
 pub fn setup_claude_code(
     project_id: &str,
     with_auto_capture: bool,
 ) -> anyhow::Result<ClaudeCodeSetup> {
     let home = home_dir();
-    let detected = detect_binary_path();
 
     // Mirror the running binary into `~/.runar-forge/bin/runar` so hooks
     // and the MCP registration both point at a stable, atomically-updated
-    // path. Failure is non-fatal — fall back to the detected path.
-    let binary_path = match install_stable_binary(&detected) {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(e) => {
-            eprintln!(
-                "warn: could not install stable binary at {}: {e} — using {detected}",
-                stable_bin_path().display()
-            );
-            detected
-        }
-    };
+    // path. Failure is non-fatal — falls back to the detected path.
+    let binary_path = resolve_stable_binary();
 
     // Step 1: ~/.claude.json — register the unified mcp-muninn server
     let claude_json_path = home.join(".claude.json");
-    let mut claude_json: Value = if claude_json_path.exists() {
-        serde_json::from_str(&fs::read_to_string(&claude_json_path)?).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
+    let mut claude_json: Value = read_json_or_empty(&claude_json_path)?;
 
     let obj = claude_json
         .as_object_mut()
@@ -252,37 +314,24 @@ pub fn setup_claude_code(
     servers.remove("curator");
 
     obj.insert("mcpServers".into(), Value::Object(servers));
-    fs::write(
-        &claude_json_path,
-        serde_json::to_string_pretty(&claude_json)? + "\n",
-    )?;
+    write_json_pretty(&claude_json_path, &claude_json)?;
 
     // Step 2: .claude/settings.json in CWD — hooks
     let cwd = std::env::current_dir()?;
     let claude_dir = cwd.join(".claude");
     fs::create_dir_all(&claude_dir)?;
     let settings_path = claude_dir.join("settings.json");
-    let mut settings: Value = if settings_path.exists() {
-        serde_json::from_str(&fs::read_to_string(&settings_path)?).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
+    let mut settings: Value = read_json_or_empty(&settings_path)?;
 
     let sobj = settings
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json is not a JSON object"))?;
 
     let log_path = runar_dir().join("hook.log").to_string_lossy().into_owned();
-    let pid_q = shell_quote(project_id);
-    let mk = |args: String| hook_command(&binary_path, &args, &log_path);
-    let context_cmd = mk(format!("context      --silent --project {pid_q}"));
-    let ping_cmd = mk(format!("session ping --silent --project {pid_q}"));
-    let save_ack_cmd = mk(format!("save-ack     --silent --project {pid_q}"));
-    let nudge_cmd = mk(format!("nudge        --silent --project {pid_q}"));
-    let extract_cmd = mk(format!("extract      --silent --project {pid_q}"));
-    // Auto-capture queue commands (Phase 6 — opt-in).
-    let enqueue_cmd = mk(format!("enqueue      --silent --project {pid_q}"));
-    let summarize_cmd = mk(format!("summarize    --silent --project {pid_q}"));
+    // Render each hook from a raw arg vector. Shell-form (quoted) on Unix,
+    // exec-form (no shell) on Windows — see `runar_hook_entry`.
+    let entry =
+        |matcher: &str, args: &[&str]| runar_hook_entry(matcher, &binary_path, args, &log_path);
 
     let existing_hooks = sobj.get("hooks").cloned().unwrap_or(json!({}));
     let pre_tool = filter_runar_hooks(
@@ -315,22 +364,41 @@ pub fn setup_claude_code(
     );
 
     let mut pre_tool = pre_tool;
-    pre_tool.push(hook_entry(".*", &context_cmd));
+    pre_tool.push(entry(
+        ".*",
+        &["context", "--silent", "--project", project_id],
+    ));
 
     let mut post_tool = post_tool;
-    post_tool.push(hook_entry("Write|Edit|Create|MultiEdit", &ping_cmd));
-    post_tool.push(hook_entry("mcp__muninn__muninn_save", &save_ack_cmd));
-    post_tool.push(hook_entry("Write|Edit|Create|MultiEdit|Bash", &extract_cmd));
+    post_tool.push(entry(
+        "Write|Edit|Create|MultiEdit",
+        &["session", "ping", "--silent", "--project", project_id],
+    ));
+    post_tool.push(entry(
+        "mcp__muninn__muninn_save",
+        &["save-ack", "--silent", "--project", project_id],
+    ));
+    post_tool.push(entry(
+        "Write|Edit|Create|MultiEdit|Bash",
+        &["extract", "--silent", "--project", project_id],
+    ));
     if with_auto_capture {
-        post_tool.push(hook_entry("Write|Edit|Create|MultiEdit|Bash", &enqueue_cmd));
+        // Auto-capture queue commands (Phase 6 — opt-in).
+        post_tool.push(entry(
+            "Write|Edit|Create|MultiEdit|Bash",
+            &["enqueue", "--silent", "--project", project_id],
+        ));
     }
 
     let mut user_prompt = user_prompt;
-    user_prompt.push(hook_entry(".*", &nudge_cmd));
+    user_prompt.push(entry(".*", &["nudge", "--silent", "--project", project_id]));
 
     let mut session_end = session_end;
     if with_auto_capture {
-        session_end.push(hook_entry(".*", &summarize_cmd));
+        session_end.push(entry(
+            ".*",
+            &["summarize", "--silent", "--project", project_id],
+        ));
     }
 
     let mut hooks_obj = existing_hooks.as_object().cloned().unwrap_or_default();
@@ -344,10 +412,7 @@ pub fn setup_claude_code(
     }
     sobj.insert("hooks".into(), Value::Object(hooks_obj));
 
-    fs::write(
-        &settings_path,
-        serde_json::to_string_pretty(&settings)? + "\n",
-    )?;
+    write_json_pretty(&settings_path, &settings)?;
 
     // Step 3: Append Memory section to CLAUDE.md if missing
     let claude_md_path = cwd.join("CLAUDE.md");
@@ -374,6 +439,9 @@ pub fn setup_claude_code(
     })
 }
 
+/// Shell-form hook entry (Unix). Windows builds exec-form inline in
+/// `runar_hook_entry`, so this is only compiled off-Windows.
+#[cfg(not(windows))]
 fn hook_entry(matcher: &str, command: &str) -> Value {
     json!({
         "matcher": matcher,
@@ -427,12 +495,108 @@ pub fn windsurf_config(binary_path: &str) -> String {
     cursor_config(binary_path)
 }
 
+// ── setup vscode / opencode / codex (auto-write config) ────────────
+
+/// Auto-write `.vscode/mcp.json` in the CWD. VSCode's native MCP config uses
+/// the top-level `servers` key; a stdio server is `{ command, args }` (the
+/// `type` field defaults to stdio). Merge-preserves any sibling servers/keys.
+pub fn setup_vscode() -> anyhow::Result<PathBuf> {
+    let binary_path = resolve_stable_binary();
+    let dir = std::env::current_dir()?.join(".vscode");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("mcp.json");
+
+    let mut root = read_json_or_empty(&path)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    let servers = obj
+        .entry("servers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`servers` in {} is not an object", path.display()))?;
+    servers.insert(
+        "muninn".into(),
+        json!({ "command": binary_path, "args": ["mcp-muninn"] }),
+    );
+
+    write_json_pretty(&path, &root)?;
+    Ok(path)
+}
+
+/// Auto-write `opencode.json` in the CWD. OpenCode's config uses the top-level
+/// `mcp` key; a local (stdio) server is `{ type: "local", command: [argv...],
+/// enabled: true }`. Merge-preserves the `$schema` line and any sibling keys.
+pub fn setup_opencode() -> anyhow::Result<PathBuf> {
+    let binary_path = resolve_stable_binary();
+    let path = std::env::current_dir()?.join("opencode.json");
+
+    let mut root = read_json_or_empty(&path)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    obj.entry("$schema")
+        .or_insert_with(|| json!("https://opencode.ai/config.json"));
+    let mcp = obj
+        .entry("mcp")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`mcp` in {} is not an object", path.display()))?;
+    mcp.insert(
+        "muninn".into(),
+        json!({
+            "type": "local",
+            "command": [binary_path, "mcp-muninn"],
+            "enabled": true,
+        }),
+    );
+
+    write_json_pretty(&path, &root)?;
+    Ok(path)
+}
+
+/// Auto-write the global `~/.codex/config.toml`. Codex's MCP config is TOML
+/// and global (no per-project file), keyed by `[mcp_servers.<name>]`. We use
+/// `toml_edit` so existing comments/formatting/tables survive the merge.
+pub fn setup_codex() -> anyhow::Result<PathBuf> {
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
+
+    let binary_path = resolve_stable_binary();
+    let path = home_dir().join(".codex").join("config.toml");
+    fs::create_dir_all(path.parent().expect(".codex has a parent"))?;
+
+    let mut doc: DocumentMut = if path.exists() {
+        fs::read_to_string(&path)?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{} is not valid TOML: {e}", path.display()))?
+    } else {
+        DocumentMut::new()
+    };
+
+    // Header-style `[mcp_servers.muninn]` table (not an inline table), so the
+    // file stays hand-editable. Preserves any existing servers + comments.
+    let servers = doc
+        .entry("mcp_servers")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("`mcp_servers` in {} is not a table", path.display()))?;
+
+    let mut muninn = Table::new();
+    muninn["command"] = value(binary_path);
+    muninn["args"] = value(Array::from_iter(["mcp-muninn"]));
+    servers.insert("muninn", Item::Table(muninn));
+
+    fs::write(&path, doc.to_string())?;
+    Ok(path)
+}
+
 // ── Path helper for hook subcommands ───────────────────────────────
 
-/// Per-project temp ping file, used by session/nudge/save-ack.
+/// Per-project temp ping file, used by session/nudge/save-ack. Uses
+/// `std::env::temp_dir()` so it honors `TMPDIR` on Unix and `TEMP`/`TMP` on
+/// Windows — the old hardcoded `/tmp` fallback wrote a bogus path on Windows.
 pub fn ping_file_path(project_id: &str) -> PathBuf {
-    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(tmpdir).join(format!("runar-ping-{project_id}"))
+    std::env::temp_dir().join(format!("runar-ping-{project_id}"))
 }
 
 /// Render a Claude Code hook additionalContext response (empty = no injection).
@@ -462,12 +626,50 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn hook_entry_shape() {
         let h = hook_entry(".*", "echo hi");
         assert_eq!(h["matcher"], ".*");
         assert_eq!(h["hooks"][0]["type"], "command");
         assert_eq!(h["hooks"][0]["command"], "echo hi");
+    }
+
+    #[test]
+    fn runar_hook_entry_is_robust_per_os() {
+        let h = runar_hook_entry(
+            ".*",
+            "/bin/runar",
+            &["context", "--silent", "--project", "proj"],
+            "/log/hook.log",
+        );
+        assert_eq!(h["matcher"], ".*");
+        assert_eq!(h["hooks"][0]["type"], "command");
+        let inner = &h["hooks"][0];
+
+        // Idempotency: re-running setup must re-detect & replace this entry,
+        // which `filter_runar_hooks` keys off "runar" in the command field.
+        let cmd = inner["command"].as_str().unwrap();
+        assert!(cmd.contains("runar"));
+
+        #[cfg(not(windows))]
+        {
+            // Shell form: every token single-quoted, stderr→log, exit 0.
+            assert!(cmd.contains("'context'"));
+            assert!(cmd.contains("'--project' 'proj'"));
+            assert!(cmd.contains("2>>"));
+            assert!(cmd.ends_with("; exit 0"));
+            assert!(inner.get("args").is_none());
+        }
+        #[cfg(windows)]
+        {
+            // Exec form: bare executable + raw arg vector, no shell syntax.
+            assert_eq!(cmd, "/bin/runar");
+            assert_eq!(
+                inner["args"],
+                serde_json::json!(["context", "--silent", "--project", "proj"])
+            );
+        }
     }
 
     #[test]

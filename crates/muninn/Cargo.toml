@@ -28,6 +28,10 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Merge-preserving TOML edits for `runar setup codex` (~/.codex/config.toml).
+# `toml_edit` keeps existing comments/formatting/sibling tables on rewrite.
+toml_edit = "0.22"
+
 # SQLite with bundled FTS5 (statically linked, no system dependency)
 rusqlite = { version = "0.34", features = ["bundled-full"] }
 
