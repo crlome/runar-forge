@@ -1102,9 +1102,9 @@ runar search "test query" --limit 1
 Restart any running MCP server (Claude Code: reconnect via `/mcp` or
 restart the session) so the new env loads.
 
-> A future `runar config` + `runar doctor` CLI (Phase 5.5) will
-> replace the manual `sed` and verification steps with first-class
-> commands. Until then, this manual flow is the supported path.
+> `runar config` (`get`/`set`/`show`/`wizard`) and `runar doctor` replace the
+> manual `sed` and verification steps with first-class commands — prefer them
+> over editing `.env` by hand.
 
 ---
 

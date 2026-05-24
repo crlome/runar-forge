@@ -434,16 +434,17 @@ runar doctor                              # confirm everything still green
 ```
 
 `runar update` writes the new binary to `~/.runar-forge/bin/runar`
-through a tempfile + rename, preserving the previous build at
-`runar.previous`. Roll back instantly:
+(`runar.exe` on Windows) through a tempfile + rename, preserving the
+previous build at `runar.previous`. Roll back instantly:
 
 ```bash
 runar update --rollback                   # swap runar.previous back
 ```
 
-Reads `RUNAR_UPDATE_MANIFEST_URL` for the manifest endpoint. Until the
-release pipeline publishes one, set this env var to your own manifest
-or build from source as a fallback.
+No configuration needed: `runar update` defaults to the published manifest at
+`https://github.com/crlome/runar-forge/releases/latest/download/manifest.json`,
+downloads the raw binary for your platform, and verifies its SHA-256. Set
+`RUNAR_UPDATE_MANIFEST_URL` only to point at a fork/mirror.
 
 ### Source / manual fallback
 
