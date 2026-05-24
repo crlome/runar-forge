@@ -1,6 +1,6 @@
 {
   "name": "@runar-forge/cli",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Cross-platform launcher for the runar Rust binary (no install scripts)",
   "bin": {
     "runar": "bin/runar.js"
@@ -12,11 +12,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@runar-forge/cli-linux-x64": "0.7.0",
-    "@runar-forge/cli-linux-arm64": "0.7.0",
-    "@runar-forge/cli-darwin-x64": "0.7.0",
-    "@runar-forge/cli-darwin-arm64": "0.7.0",
-    "@runar-forge/cli-win32-x64": "0.7.0"
+    "@runar-forge/cli-linux-x64": "0.7.1",
+    "@runar-forge/cli-linux-arm64": "0.7.1",
+    "@runar-forge/cli-darwin-x64": "0.7.1",
+    "@runar-forge/cli-darwin-arm64": "0.7.1",
+    "@runar-forge/cli-win32-x64": "0.7.1"
   },
   "repository": {
     "type": "git",
