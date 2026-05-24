@@ -223,15 +223,17 @@ rollback via the steps below and open an issue with the doctor JSON.
 
 ## When to use `runar update` instead
 
-`runar update` (from `update.rs`) is the *intended* upgrade path
-once the release manifest endpoint is live. It already does the
-atomic-rename + `runar.previous` dance internally. Until the
-release manifest URL is wired up, prefer the manual flow above —
-`runar update --check` will just bail on the empty default.
+`runar update` (from `update.rs`) is now the recommended upgrade path. The
+release pipeline publishes a manifest at
+`https://github.com/crlome/runar-forge/releases/latest/download/manifest.json`,
+which is baked in as the default — so `runar update` works with no config. It
+does the download → SHA-256 verify → atomic-rename + `runar.previous` dance
+internally. Use the manual flow above only for source builds or air-gapped
+hosts.
 
-Re-codesign is **not** built into `runar update` yet (TODO). If/when
-the release pipeline ships, the binary it downloads will already be
-adhoc-signed by CI; the local re-sign step becomes optional.
+Re-codesign is **not** built into `runar update` (TODO), but the binaries it
+downloads are already ad-hoc signed by CI, so the local re-sign step is
+normally unnecessary.
 
 ---
 
