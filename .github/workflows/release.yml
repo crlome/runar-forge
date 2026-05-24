@@ -163,10 +163,12 @@ jobs:
           files: release/*
           fail_on_unmatched_files: true
 
-  # Publish the npm shim that downloads the matching binary. Gated so a missing
-  # NPM_TOKEN skips (instead of failing the release) until the secret is added.
+  # Publish the npm packages: one binary-only package per platform
+  # (@runar-forge/cli-<os>-<cpu>) plus the launcher meta-package
+  # (@runar-forge/cli). No postinstall — the binary is package content, so it
+  # installs under `ignore-scripts=true`. Gated so a missing NPM_TOKEN skips.
   npm-publish:
-    needs: publish
+    needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -175,13 +177,55 @@ jobs:
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
-      - name: Publish @runar-forge/cli
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish platform packages + launcher
         working-directory: packages/cli-wrapper
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
             echo "NPM_TOKEN unset — skipping npm publish."
             exit 0
           fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          ART="${GITHUB_WORKSPACE}/artifacts"
+
+          # triple:os:cpu — os/cpu are Node's process.platform/process.arch values.
+          rows="x86_64-unknown-linux-gnu:linux:x64 aarch64-unknown-linux-gnu:linux:arm64 \
+                x86_64-apple-darwin:darwin:x64 aarch64-apple-darwin:darwin:arm64 \
+                x86_64-pc-windows-msvc:win32:x64"
+
+          # Publish each binary-only platform package first, so the launcher's
+          # optionalDependencies already exist in the registry.
+          for row in $rows; do
+            IFS=: read -r triple os cpu <<<"$row"
+            if [ "$os" = "win32" ]; then bin="runar.exe"; src="runar-${triple}.exe"; else bin="runar"; src="runar-${triple}"; fi
+            dir="pkgs/cli-${os}-${cpu}"
+            mkdir -p "$dir"
+            # `-type f`: the download-artifact dir is also named runar-<triple>,
+            # so match the raw-binary file, not the directory.
+            cp "$(find "$ART" -type f -name "$src" | head -1)" "$dir/$bin"
+            chmod +x "$dir/$bin" || true
+            jq -n --arg n "@runar-forge/cli-${os}-${cpu}" --arg v "$VERSION" \
+                  --arg os "$os" --arg cpu "$cpu" --arg bin "$bin" \
+              '{name: $n, version: $v,
+                description: ("runar binary for " + $os + "-" + $cpu),
+                os: [$os], cpu: [$cpu], files: [$bin], license: "MIT",
+                repository: {type: "git", url: "git+https://github.com/crlome/runar-forge.git"}}' \
+              > "$dir/package.json"
+            echo "=== publishing @runar-forge/cli-${os}-${cpu}@${VERSION} ==="
+            (cd "$dir" && npm publish --access public)
+          done
+
+          # Pin the launcher's version + optionalDependencies to $VERSION, publish last.
+          tmp="$(mktemp)"
+          jq --arg v "$VERSION" \
+            '.version = $v
+             | .optionalDependencies = (["linux-x64","linux-arm64","darwin-x64","darwin-arm64","win32-x64"]
+                 | map({key: ("@runar-forge/cli-" + .), value: $v}) | from_entries)' \
+            package.json > "$tmp" && mv "$tmp" package.json
+          echo "=== publishing @runar-forge/cli@${VERSION} ==="
           npm publish --access public
