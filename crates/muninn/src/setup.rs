@@ -116,13 +116,18 @@ pub fn detect_binary_path() -> String {
         .unwrap_or_else(|_| "runar".into())
 }
 
-/// Stable, hook-friendly binary location: `~/.runar-forge/bin/runar`. Hooks
-/// point at this path so `cargo install` rewriting `~/.cargo/bin/runar`
-/// (non-atomic, may race with running hooks) cannot corrupt the active CC
-/// session. `runar update` (and re-runs of `runar setup claude-code`)
-/// refresh the file via temp + atomic rename.
+/// Stable, hook-friendly binary location: `~/.runar-forge/bin/runar`
+/// (`runar.exe` on Windows). Hooks point at this path so `cargo install`
+/// rewriting `~/.cargo/bin/runar` (non-atomic, may race with running hooks)
+/// cannot corrupt the active CC session. `runar update` (and re-runs of
+/// `runar setup claude-code`) refresh the file via temp + atomic rename.
+///
+/// The `.exe` suffix on Windows is required: the MCP registration and hooks
+/// invoke this path via `CreateProcess`, which appends `.exe` and would fail
+/// to find an extension-less file.
 pub fn stable_bin_path() -> PathBuf {
-    runar_dir().join("bin").join("runar")
+    let name = if cfg!(windows) { "runar.exe" } else { "runar" };
+    runar_dir().join("bin").join(name)
 }
 
 /// Copy `source_binary` to `~/.runar-forge/bin/runar` atomically. Previous

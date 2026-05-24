@@ -85,14 +85,16 @@ Pick the matching tarball from
 
 Each tarball/zip is paired with a `.sha256` checksum.
 
-### C. npm shim
+### C. npm
 
 ```bash
 npm install -g @runar-forge/cli
 ```
 
-The postinstall script downloads the platform-appropriate binary
-from GitHub Releases and links `runar` into your PATH.
+`@runar-forge/cli` is a tiny launcher; npm pulls the binary as the matching
+per-platform optional dependency (`@runar-forge/cli-<os>-<cpu>`). **No install
+scripts, no install-time network** — so it installs cleanly even with
+`ignore-scripts=true`.
 
 ---
 
@@ -315,7 +317,7 @@ full operator playbook.
 |----------------------------|------------------------------------------------------------------|
 | `Cargo.toml`               | Workspace manifest + release profile.                            |
 | `crates/muninn/`           | The single Rust crate that produces the `runar` binary.          |
-| `packages/cli-wrapper/`    | `@runar-forge/cli` npm shim (postinstall fetches the binary).    |
+| `packages/cli-wrapper/`    | `@runar-forge/cli` npm launcher (binary ships via per-platform optional deps; no install scripts). |
 | `docs/`                    | User guides — installation, upgrade hygiene, usage walkthrough.  |
 | `tools/scripts/`           | Helper SQL (`init-postgres.sql` for the docker-compose service). |
 | `docker-compose.yml`       | Optional Postgres + pgvector backing service.                    |
