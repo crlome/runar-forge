@@ -13,6 +13,9 @@ pub struct MemoryLibrarian {
     embedding: Arc<dyn EmbeddingProvider>,
     default_namespace: String,
     decay_config: DecayConfig,
+    /// Captured at construction (RUNAR_DEBUG) rather than read per call, so
+    /// tests can flip it per instance without process-global env mutation.
+    debug_enabled: bool,
 }
 
 impl MemoryLibrarian {
@@ -27,11 +30,53 @@ impl MemoryLibrarian {
             embedding,
             default_namespace: default_namespace.to_string(),
             decay_config: decay_config.unwrap_or_default(),
+            debug_enabled: crate::debug::enabled(),
         }
+    }
+
+    /// Override the RUNAR_DEBUG gate for this instance (tests, tooling).
+    pub fn with_debug(mut self, on: bool) -> Self {
+        self.debug_enabled = on;
+        self
+    }
+
+    /// Passthroughs for the muninn_debug tool.
+    pub async fn query_debug_log(&self, q: DebugLogQuery) -> StorageResult<Vec<DebugLogEntry>> {
+        self.storage.query_debug_log(q).await
+    }
+
+    pub async fn prune_debug_log(&self, older_than_days: i64) -> StorageResult<i64> {
+        self.storage.prune_debug_log(older_than_days).await
+    }
+
+    /// Best-effort HookTiming event. Callers gate on RUNAR_DEBUG.
+    pub async fn write_hook_timing(&self, hook: &str, budget_exceeded: bool, duration_ms: f64) {
+        crate::debug::log(
+            &self.storage,
+            DebugLogInput {
+                event: DebugEvent::HookTiming,
+                entry_id: None,
+                data: serde_json::json!({
+                    "hook": hook,
+                    "budgetExceeded": budget_exceeded,
+                }),
+                duration_ms: Some(duration_ms),
+            },
+        )
+        .await;
     }
 
     fn ns<'a>(&'a self, namespace: Option<&'a str>) -> &'a str {
         namespace.unwrap_or(&self.default_namespace)
+    }
+
+    /// Resolve the namespace for a read the same way `propose` resolves it
+    /// for a write: an explicit namespace wins, else the project id IS the
+    /// namespace, else the default. Keeping read and write resolution
+    /// symmetric is what makes project-scoped retrieval actually see
+    /// project-scoped entries.
+    fn scope<'a>(&'a self, namespace: Option<&'a str>, project_id: Option<&'a str>) -> &'a str {
+        namespace.or(project_id).unwrap_or(&self.default_namespace)
     }
 
     // ── Write ──────────────────────────────────────────────────
@@ -53,6 +98,28 @@ impl MemoryLibrarian {
         input.content = content_clean;
         if total_redactions > 0 && !input.tags.iter().any(|t| t == "redacted") {
             input.tags.push("redacted".to_string());
+        }
+
+        // Secret-pattern redaction (tokens, passwords, keys) on the same
+        // chokepoint so every entry write path — MCP save, prompt capture,
+        // extraction, huginn crawl — is covered. Tags are redacted too:
+        // they are caller-supplied and FTS-indexed.
+        let (title_scrubbed, title_hits) = crate::redact::redact_secrets(&input.title);
+        let (content_scrubbed, content_hits) = crate::redact::redact_secrets(&input.content);
+        let mut secret_hits: usize =
+            title_hits.iter().chain(content_hits.iter()).map(|h| h.count).sum();
+        input.title = title_scrubbed;
+        input.content = content_scrubbed;
+        for tag in input.tags.iter_mut() {
+            let (clean, hits) = crate::redact::redact_secrets(tag);
+            let n: usize = hits.iter().map(|h| h.count).sum();
+            if n > 0 {
+                *tag = clean;
+                secret_hits += n;
+            }
+        }
+        if secret_hits > 0 && !input.tags.iter().any(|t| t == "redacted:secret") {
+            input.tags.push("redacted:secret".to_string());
         }
 
         // Phase 5.7 — stamp author from `git config user.name` when the
@@ -180,12 +247,41 @@ impl MemoryLibrarian {
         project_id: Option<&str>,
         checkpoint: bool,
     ) -> StorageResult<Session> {
+        // This path persists via storage.save directly (no propose), so it
+        // must redact here: summaries/goals/discoveries are model-supplied
+        // text and end up both in the sessions table and in an FTS-indexed
+        // session entry.
+        let mut summary = summary;
+        let redact_string = |s: &mut String| {
+            let (clean, hits) = crate::redact::redact_secrets(s);
+            if !hits.is_empty() {
+                *s = clean;
+            }
+        };
+        redact_string(&mut summary.summary);
+        if let Some(ref mut g) = summary.goal {
+            redact_string(g);
+        }
+        for item in summary
+            .instructions
+            .iter_mut()
+            .chain(summary.accomplished.iter_mut())
+            .chain(summary.discoveries.iter_mut())
+        {
+            redact_string(item);
+        }
+
+        // Goal and discoveries used to be dropped here (SessionUpdate had no
+        // fields for them) — the reason 3 months of sessions had discoveries
+        // '[]' and boilerplate goals.
         let update = if checkpoint {
             SessionUpdate {
                 status: None,
                 summary: Some(summary.summary.clone()),
                 ended_at: None,
                 files_modified: Some(summary.files_modified.clone()),
+                goal: summary.goal.clone(),
+                discoveries: Some(summary.discoveries.clone()),
             }
         } else {
             SessionUpdate {
@@ -193,6 +289,8 @@ impl MemoryLibrarian {
                 summary: Some(summary.summary.clone()),
                 ended_at: Some(Utc::now()),
                 files_modified: Some(summary.files_modified.clone()),
+                goal: summary.goal.clone(),
+                discoveries: Some(summary.discoveries.clone()),
             }
         };
 
@@ -244,6 +342,10 @@ impl MemoryLibrarian {
         self.storage.update_session(id, update).await
     }
 
+    pub async fn get_session(&self, id: uuid::Uuid) -> StorageResult<Session> {
+        self.storage.get_session(id).await
+    }
+
     // ── Search ─────────────────────────────────────────────────
 
     pub async fn search(
@@ -277,7 +379,9 @@ impl MemoryLibrarian {
         entry_type: Option<EntryType>,
         tags: Option<Vec<String>>,
     ) -> StorageResult<Vec<MemoryEntry>> {
-        let ns = self.ns(namespace);
+        const USER_PROMPT_RANK_MULTIPLIER: f64 = 0.5;
+        let search_started = std::time::Instant::now();
+        let ns = self.scope(namespace, project_id);
         let over_fetch = (limit * 3).min(50);
         let k: f64 = 60.0;
 
@@ -286,13 +390,13 @@ impl MemoryLibrarian {
             limit: Some(over_fetch),
             entry_type,
             project_id: project_id.map(|s| s.to_string()),
-            tags,
+            tags: tags.clone(),
             namespace: Some(ns.to_string()),
         };
 
-        // Run semantic + FTS in parallel
+        // Run semantic + FTS in parallel, both arms identically scoped.
         let (semantic_result, fts_result) = tokio::join!(
-            self.run_semantic_search(query, over_fetch, ns),
+            self.run_semantic_search(query, search_query.clone()),
             self.storage.fts_search(search_query),
         );
 
@@ -360,19 +464,78 @@ impl MemoryLibrarian {
                 rrf_score *= 1.1;
             }
 
+            // User prompts are raw inputs, not curated knowledge — keep them
+            // retrievable but never let them outrank a real decision/pattern
+            // at similar relevance. 0.5 halves the fused score: symmetric
+            // with the worst-case confidence penalty, and strong enough that
+            // the 1.25× verified bonus cannot recover it.
+            if entry.entry_type == EntryType::UserPrompt {
+                rrf_score *= USER_PROMPT_RANK_MULTIPLIER;
+            }
+
             scored.push((rrf_score, entry.clone()));
         }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Tag filter applied here rather than in SQL: tags are stored as a
+        // JSON text column with backend-divergent representations, so a
+        // librarian post-filter keeps semantics identical across backends.
+        // Runs before truncation so `limit` stays honest.
+        if let Some(ref required) = tags {
+            if !required.is_empty() {
+                scored.retain(|(_, e)| required.iter().all(|t| e.tags.contains(t)));
+            }
+        }
+
         scored.truncate(limit);
 
-        // Auto-touch returned entries (fire and forget)
-        for (_, entry) in &scored {
-            let storage = self.storage.clone();
-            let entry_id = entry.id;
-            tokio::spawn(async move {
-                let _ = touch_entry(&*storage, entry_id).await;
-            });
+        // Record retrieval before returning: one atomic UPDATE for all
+        // returned ids. Awaited on purpose — the old fire-and-forget spawn
+        // died with short-lived hook processes and left partial writes.
+        let touched_ids: Vec<Uuid> = scored.iter().map(|(_, e)| e.id).collect();
+        let _ = self.storage.touch_entries(&touched_ids).await;
+
+        if self.debug_enabled {
+            let duration_ms = search_started.elapsed().as_secs_f64() * 1000.0;
+            crate::debug::log(
+                &self.storage,
+                DebugLogInput {
+                    event: DebugEvent::SearchScoring,
+                    entry_id: None,
+                    data: serde_json::json!({
+                        "query": query,
+                        "namespace": ns,
+                        "projectId": project_id,
+                        "semanticCount": semantic_ranks.len(),
+                        "ftsCount": fts_ranks.len(),
+                        "top": scored
+                            .iter()
+                            .map(|(s, e)| serde_json::json!({
+                                "id": e.id.to_string(),
+                                "score": s,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }),
+                    duration_ms: Some(duration_ms),
+                },
+            )
+            .await;
+            if !touched_ids.is_empty() {
+                crate::debug::log(
+                    &self.storage,
+                    DebugLogInput {
+                        event: DebugEvent::TouchPromotion,
+                        entry_id: None,
+                        data: serde_json::json!({
+                            "entryIds": touched_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                            "count": touched_ids.len(),
+                        }),
+                        duration_ms: None,
+                    },
+                )
+                .await;
+            }
         }
 
         Ok(scored.into_iter().map(|(_, e)| e).collect())
@@ -381,18 +544,13 @@ impl MemoryLibrarian {
     async fn run_semantic_search(
         &self,
         query: &str,
-        limit: usize,
-        namespace: &str,
+        filters: SearchQuery,
     ) -> StorageResult<Vec<MemoryEntry>> {
         if !self.embedding.is_available() {
             return Ok(vec![]);
         }
         match self.embedding.embed(query).await {
-            Some(embedding) => {
-                self.storage
-                    .semantic_search(query, &embedding, limit, namespace)
-                    .await
-            }
+            Some(embedding) => self.storage.semantic_search(&embedding, filters).await,
             None => Ok(vec![]),
         }
     }
@@ -406,7 +564,12 @@ impl MemoryLibrarian {
     pub async fn list(&self, filters: ListFilters) -> StorageResult<Vec<MemoryEntry>> {
         let mut f = filters;
         if f.namespace.is_none() {
-            f.namespace = Some(self.default_namespace.clone());
+            // Same read/write symmetry as `scope()`: project entries live in
+            // namespace == project_id.
+            f.namespace = f
+                .project_id
+                .clone()
+                .or_else(|| Some(self.default_namespace.clone()));
         }
         if f.limit.is_none() {
             f.limit = Some(20);
@@ -458,7 +621,8 @@ impl MemoryLibrarian {
         project_id: Option<&str>,
         session_count: usize,
     ) -> StorageResult<ContextPacket> {
-        let ns = self.ns(namespace);
+        let injection_started = std::time::Instant::now();
+        let ns = self.scope(namespace, project_id);
 
         let sessions = self.storage.list_sessions(ns, session_count * 2).await?;
         let recent_sessions: Vec<&Session> = sessions
@@ -480,6 +644,29 @@ impl MemoryLibrarian {
         let stats = self.storage.get_stats(ns).await?;
 
         let formatted = format_context_packet(&recent_sessions, &recent_entries, &stats);
+
+        if self.debug_enabled {
+            crate::debug::log(
+                &self.storage,
+                DebugLogInput {
+                    event: DebugEvent::Injection,
+                    entry_id: None,
+                    data: serde_json::json!({
+                        "projectId": project_id,
+                        "namespace": ns,
+                        "entryIds": recent_entries
+                            .iter()
+                            .map(|e| e.id.to_string())
+                            .collect::<Vec<_>>(),
+                        "entryCount": recent_entries.len(),
+                        "sessionCount": recent_sessions.len(),
+                        "formattedChars": formatted.chars().count(),
+                    }),
+                    duration_ms: Some(injection_started.elapsed().as_secs_f64() * 1000.0),
+                },
+            )
+            .await;
+        }
 
         Ok(ContextPacket {
             formatted,
@@ -589,6 +776,12 @@ impl MemoryLibrarian {
 
     // ── Stats ──────────────────────────────────────────────────
 
+    /// Whole-database aggregate across every namespace. The scoped
+    /// `get_stats` cannot see per-project data (namespace == project_id).
+    pub async fn get_stats_global(&self) -> StorageResult<GlobalStats> {
+        self.storage.get_stats_all().await
+    }
+
     pub async fn get_stats(&self, namespace: Option<&str>) -> StorageResult<MemoryStats> {
         self.storage.get_stats(self.ns(namespace)).await
     }
@@ -679,6 +872,83 @@ impl MemoryLibrarian {
 
     pub async fn import_session(&self, session: Session) -> StorageResult<bool> {
         self.storage.import_session(session).await
+    }
+
+    // ── Two-stage GC + maintenance passthroughs ───────────────
+
+    /// GC stage 1: soft-delete never-accessed crawl bulk older than
+    /// `age_days` in the project's namespace.
+    pub async fn gc_stage1(
+        &self,
+        project_id: Option<&str>,
+        age_days: i64,
+        max: usize,
+        dry_run: bool,
+    ) -> StorageResult<Vec<Uuid>> {
+        let ns = self.ns(project_id);
+        self.storage
+            .soft_delete_stale_crawl(ns, age_days, max, dry_run)
+            .await
+    }
+
+    /// GC stage 2: hard-purge tombstones older than `older_than_days`.
+    pub async fn gc_purge(
+        &self,
+        namespace: Option<&str>,
+        older_than_days: i64,
+        max: usize,
+        dry_run: bool,
+    ) -> StorageResult<Vec<Uuid>> {
+        self.storage
+            .purge_soft_deleted(namespace, older_than_days, max, dry_run)
+            .await
+    }
+
+    pub async fn update_entry(
+        &self,
+        id: Uuid,
+        updates: serde_json::Value,
+    ) -> StorageResult<MemoryEntry> {
+        self.storage.update(id, updates).await
+    }
+
+    pub async fn list_missing_content_hash(
+        &self,
+        limit: usize,
+    ) -> StorageResult<Vec<(Uuid, String, String)>> {
+        self.storage.list_missing_content_hash(limit).await
+    }
+
+    pub async fn set_content_hash(&self, id: Uuid, hash: &str) -> StorageResult<()> {
+        self.storage.set_content_hash(id, hash).await
+    }
+
+    pub async fn redact_entry_row(
+        &self,
+        id: Uuid,
+        title: &str,
+        content: &str,
+        tags: &[String],
+    ) -> StorageResult<()> {
+        self.storage.redact_entry_row(id, title, content, tags).await
+    }
+
+    pub async fn find_duplicate_clusters(
+        &self,
+        namespace: Option<&str>,
+    ) -> StorageResult<Vec<DuplicateCluster>> {
+        self.storage.find_duplicate_clusters(namespace).await
+    }
+
+    pub async fn list_namespaces(&self) -> StorageResult<Vec<String>> {
+        Ok(self
+            .storage
+            .get_stats_all()
+            .await?
+            .by_namespace
+            .into_iter()
+            .map(|n| n.namespace)
+            .collect())
     }
 
     /// Phase 5.4 — soft-delete archival + low-confidence + zero-access
@@ -894,23 +1164,6 @@ pub(crate) fn decide_target_layer(
     None
 }
 
-async fn touch_entry(storage: &dyn MemoryStorage, id: Uuid) -> StorageResult<()> {
-    let entry = storage.get(id).await?;
-    let new_count = entry.access_count + 1;
-    let new_layer = if entry.layer.value() > MemoryLayer::EPISODIC.value() {
-        MemoryLayer::EPISODIC.value()
-    } else {
-        entry.layer.value()
-    };
-
-    let update = serde_json::json!({
-        "access_count": new_count,
-        "last_accessed_at": Utc::now().to_rfc3339(),
-        "layer": new_layer,
-    });
-    let _ = storage.update(id, update).await;
-    Ok(())
-}
 
 async fn auto_link_entry(
     storage: &dyn MemoryStorage,
@@ -932,7 +1185,14 @@ async fn auto_link_entry(
     };
 
     let candidates = storage
-        .semantic_search(search_text, &query_emb, 10, namespace)
+        .semantic_search(
+            &query_emb,
+            SearchQuery {
+                limit: Some(10),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+        )
         .await?;
 
     let existing_edges = storage.get_edges(entry_id, None).await.unwrap_or_default();
@@ -1370,7 +1630,9 @@ Here's a summary of what we did.\n\
             assert_eq!(r.action, SaveAction::Created);
         }
 
-        // Second call with same text upserts via stable topic_key.
+        // Second call with identical text short-circuits on content hash:
+        // no new rows, no topic_key delete-and-reinsert churn, existing ids
+        // are returned.
         let second = lib
             .capture_passive(text, Some("proj-a2"), Some(EntryType::Note), &[])
             .await
@@ -1379,8 +1641,13 @@ Here's a summary of what we did.\n\
         assert!(
             second
                 .iter()
-                .all(|r| matches!(r.action, SaveAction::Updated)),
-            "repeated capture should upsert, not duplicate"
+                .all(|r| matches!(r.action, SaveAction::Duplicate)),
+            "repeated identical capture should be reported as duplicate"
+        );
+        let first_ids: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+        assert!(
+            second.iter().all(|r| first_ids.contains(&r.id)),
+            "duplicates must point at the original rows"
         );
     }
 
@@ -1429,6 +1696,270 @@ Here's a summary of what we did.\n\
         let entry = lib.get(result.id).await.unwrap();
         assert_eq!(entry.content, "Plain content with <code>markup</code>");
         assert!(!entry.tags.iter().any(|t| t == "redacted"));
+    }
+
+    #[tokio::test]
+    async fn end_session_persists_goal_and_discoveries() {
+        let lib = test_librarian().await;
+        let session = lib
+            .propose_session(SessionInput {
+                goal: Some("Auto-started session".into()),
+                project_id: Some("proj_s".into()),
+                tool: Some("test".into()),
+            })
+            .await
+            .unwrap();
+
+        lib.end_session(
+            session.id,
+            SessionSummary {
+                summary: "shipped the retry fix".into(),
+                goal: Some("fix the flaky retry logic".into()),
+                discoveries: vec![
+                    "timeout was 1s too short".into(),
+                    "jitter missing on retries".into(),
+                ],
+                files_modified: vec!["src/retry.rs".into()],
+                ..Default::default()
+            },
+            Some("proj_s"),
+        )
+        .await
+        .unwrap();
+
+        let stored = lib.get_session(session.id).await.unwrap();
+        assert_eq!(stored.goal.as_deref(), Some("fix the flaky retry logic"));
+        assert_eq!(stored.discoveries.len(), 2);
+        assert_eq!(stored.files_modified, vec!["src/retry.rs".to_string()]);
+        assert_eq!(stored.status, SessionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn debug_events_written_only_when_enabled() {
+        // Disabled (default): no rows.
+        let lib = test_librarian().await;
+        lib.propose(MemoryEntryInput {
+            title: "observable entry".into(),
+            content: "observable content".into(),
+            entry_type: EntryType::Note,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        lib.search("observable", 5, None, None, None, None).await.unwrap();
+        let rows = lib.query_debug_log(DebugLogQuery::default()).await.unwrap();
+        assert!(rows.is_empty(), "no telemetry without RUNAR_DEBUG");
+
+        // Enabled: search + context produce events with durations.
+        let lib = test_librarian().await.with_debug(true);
+        lib.propose(MemoryEntryInput {
+            title: "observable entry".into(),
+            content: "observable content".into(),
+            entry_type: EntryType::Note,
+            project_id: Some("proj_dbg".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        lib.search("observable", 5, None, Some("proj_dbg"), None, None)
+            .await
+            .unwrap();
+        lib.get_context(None, Some("proj_dbg"), 3).await.unwrap();
+
+        let scoring = lib
+            .query_debug_log(DebugLogQuery {
+                event: Some(DebugEvent::SearchScoring),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(scoring.len(), 1);
+        assert!(scoring[0].duration_ms.is_some());
+        assert_eq!(scoring[0].data["namespace"], "proj_dbg");
+
+        let touches = lib
+            .query_debug_log(DebugLogQuery {
+                event: Some(DebugEvent::TouchPromotion),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(touches.len(), 1);
+        assert_eq!(touches[0].data["count"], 1);
+
+        let injections = lib
+            .query_debug_log(DebugLogQuery {
+                event: Some(DebugEvent::Injection),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(injections.len(), 1);
+        assert_eq!(injections[0].data["entryCount"], 1);
+        assert!(injections[0].duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_search_scopes_to_project_namespace() {
+        let lib = test_librarian().await;
+
+        lib.propose(MemoryEntryInput {
+            title: "gateway timeout policy for proj_a".into(),
+            content: "retries use exponential backoff with jitter".into(),
+            entry_type: EntryType::Decision,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Project-scoped search finds the entry written to namespace proj_a.
+        let hits = lib
+            .search("gateway timeout backoff", 10, None, Some("proj_a"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "proj_a search should find its own entry");
+
+        // A different project sees nothing.
+        let hits = lib
+            .search("gateway timeout backoff", 10, None, Some("proj_b"), None, None)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "proj_b must not see proj_a entries");
+
+        // An unscoped (default-namespace) search must not leak project rows.
+        let hits = lib
+            .search("gateway timeout backoff", 10, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "default-namespace search must not leak proj_a rows");
+    }
+
+    #[tokio::test]
+    async fn test_list_uses_project_id_as_namespace() {
+        let lib = test_librarian().await;
+
+        lib.propose(MemoryEntryInput {
+            title: "proj_a architecture".into(),
+            content: "modular monolith".into(),
+            entry_type: EntryType::Architecture,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let rows = lib
+            .list(ListFilters {
+                project_id: Some("proj_a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "list with project_id should resolve namespace=proj_a");
+    }
+
+    #[tokio::test]
+    async fn test_get_context_serves_project_entries_and_sessions() {
+        let lib = test_librarian().await;
+
+        lib.propose(MemoryEntryInput {
+            title: "proj_a context entry".into(),
+            content: "important background".into(),
+            entry_type: EntryType::Context,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let session = lib
+            .propose_session(SessionInput {
+                goal: Some("build the thing".into()),
+                project_id: Some("proj_a".into()),
+                tool: Some("test".into()),
+            })
+            .await
+            .unwrap();
+        lib.end_session(
+            session.id,
+            SessionSummary {
+                summary: "did the thing".into(),
+                ..Default::default()
+            },
+            Some("proj_a"),
+        )
+        .await
+        .unwrap();
+
+        let packet = lib.get_context(None, Some("proj_a"), 3).await.unwrap();
+        assert_eq!(packet.recent_entries.len(), 2, "entry + session-end entry expected");
+        assert_eq!(packet.recent_sessions.len(), 1, "completed session should surface");
+        assert!(!packet.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_propose_redacts_secret_patterns() {
+        let lib = test_librarian().await;
+
+        let result = lib
+            .propose(MemoryEntryInput {
+                title: "Deploy config".into(),
+                content: "set TENANT_DB_PASS=Sup3rS3cret99 then push with \
+                          ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+                    .into(),
+                entry_type: EntryType::Note,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry = lib.get(result.id).await.unwrap();
+        assert!(!entry.content.contains("Sup3rS3cret99"), "{}", entry.content);
+        assert!(!entry.content.contains("ghp_abcdef"), "{}", entry.content);
+        assert!(entry.content.contains("[REDACTED:keyed-secret]"));
+        assert!(entry.content.contains("[REDACTED:github-token]"));
+        assert!(
+            entry.tags.iter().any(|t| t == "redacted:secret"),
+            "expected `redacted:secret` tag, got {:?}",
+            entry.tags
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_prompt_downranked_in_search() {
+        let lib = test_librarian().await;
+
+        // Near-identical content, two types (distinct enough to survive the
+        // content-hash dedup) — the curated Note must outrank the raw
+        // UserPrompt at comparable FTS relevance.
+        lib.propose(MemoryEntryInput {
+            title: "checkout flow retries payment gateway".into(),
+            content: "checkout flow retries payment gateway on timeout, prompt variant".into(),
+            entry_type: EntryType::UserPrompt,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        lib.propose(MemoryEntryInput {
+            title: "checkout flow retries payment gateway".into(),
+            content: "checkout flow retries payment gateway on timeout, curated variant".into(),
+            entry_type: EntryType::Note,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let results = lib
+            .search("checkout payment gateway", 10, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(results.len() >= 2, "expected both entries, got {}", results.len());
+        assert_eq!(
+            results[0].entry_type,
+            EntryType::Note,
+            "curated Note should outrank UserPrompt"
+        );
     }
 
     #[tokio::test]

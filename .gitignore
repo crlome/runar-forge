@@ -33,3 +33,5 @@ Thumbs.db
 plans/*
 
 .claude/settings.json
+
+internal_documents/*

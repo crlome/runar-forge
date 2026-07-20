@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 // binary's perspective.
 use runar_muninn::{
     breaker, config_cmd, curator, doctor, embedding, extract, hooks_runtime, huginn, librarian,
-    mcp, protocol, setup, storage, summarizer, sync as sync_cmd, types, update as update_cmd,
-    wizard,
+    maintenance, mcp, protocol, redact, setup, storage, summarizer, sync as sync_cmd, types,
+    update as update_cmd, wizard,
 };
 
 use librarian::MemoryLibrarian;
@@ -39,10 +39,18 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Project to search (auto-detected from git remote / directory
+        /// if omitted; entries live in their project's namespace)
+        #[arg(short, long)]
+        project: Option<String>,
     },
 
-    /// Show memory system stats
-    Stats,
+    /// Show memory system stats (all namespaces by default)
+    Stats {
+        /// Scope stats to one project (its namespace)
+        #[arg(short, long)]
+        project: Option<String>,
+    },
 
     /// Crawl a project directory
     Crawl {
@@ -84,10 +92,14 @@ enum Commands {
         /// Project ID (default: auto-detect from git remote or directory name)
         #[arg(short, long)]
         project: Option<String>,
-        /// Install the auto-capture queue hooks (enqueue + SessionEnd summarize).
-        /// Opt-in until the feature is stable.
-        #[arg(long)]
+        /// Deprecated no-op: auto-capture is now installed by default.
+        #[arg(long, hide = true)]
         with_auto_capture: bool,
+        /// Skip the auto-capture queue hooks (enqueue + SessionEnd
+        /// summarize). Persisted to ~/.runar-forge/.env so later re-runs
+        /// keep the choice.
+        #[arg(long)]
+        no_auto_capture: bool,
         /// Run `runar config wizard` first to (re)configure storage backend.
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
@@ -241,6 +253,32 @@ enum Commands {
     /// soft-deletes archival + low-confidence + zero-access rows older
     /// than `RUNAR_TIER_EVICTION_AGE_DAYS` (default 90d). Verified
     /// entries are never evicted.
+    /// Scan stored entries for secret patterns and redact them in place
+    Scrub {
+        /// Limit to one project namespace (default: all namespaces)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Report what would change without rewriting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Max entries to scan
+        #[arg(long, default_value = "100000")]
+        limit: usize,
+    },
+
+    /// Backfill content hashes and collapse exact-duplicate entries
+    Dedup {
+        /// Limit to one project namespace (default: all namespaces)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Report clusters without soft-deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after the content-hash backfill pass
+        #[arg(long)]
+        backfill_only: bool,
+    },
+
     Gc {
         /// Project namespace to garbage-collect (auto-detected if omitted)
         #[arg(short, long)]
@@ -248,6 +286,21 @@ enum Commands {
         /// Print planned transitions + eviction candidates without mutating
         #[arg(long)]
         dry_run: bool,
+        /// Stage 1: soft-delete never-accessed crawl entries older than
+        /// --stage1-age-days (reversible until --hard purges them)
+        #[arg(long)]
+        stage1: bool,
+        #[arg(long, default_value = "60")]
+        stage1_age_days: i64,
+        /// Stage 2: PERMANENTLY purge rows soft-deleted more than
+        /// --hard-age-days ago (entries + FTS + edges + embeddings)
+        #[arg(long)]
+        hard: bool,
+        #[arg(long, default_value = "30")]
+        hard_age_days: i64,
+        /// Required confirmation for --hard (no interactive prompt)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Phase 5.5 — manage `~/.runar-forge/.env` (storage backend, DB URL).
@@ -639,9 +692,29 @@ async fn rotate_or_create_session(lib: &librarian::MemoryLibrarian, project_id: 
             }
 
             let minutes = elapsed / 60_000;
+            let files = &ping.files_modified;
+            let summary_text = if files.is_empty() {
+                format!(
+                    "Auto-expired after {minutes} minutes of inactivity. \
+                     No file changes were tracked."
+                )
+            } else {
+                format!(
+                    "Auto-expired after {minutes} minutes of inactivity. \
+                     {} file(s) modified: {}.",
+                    files.len(),
+                    files.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
             let summary = types::SessionSummary {
-                summary: format!("Auto-expired after {minutes} minutes of inactivity."),
-                files_modified: ping.files_modified.clone(),
+                summary: summary_text,
+                // Preserve a real goal captured from the user's first prompt;
+                // never persist the auto-start placeholder as the outcome.
+                goal: session
+                    .goal
+                    .clone()
+                    .filter(|g| g != "Auto-started session"),
+                files_modified: files.clone(),
                 ..Default::default()
             };
             let _ = lib.end_session(session.id, summary, Some(project_id)).await;
@@ -701,7 +774,15 @@ async fn run_extract(project: Option<String>, silent: bool) {
 
     let pid_owned = resolve_project_id(project.clone());
     let pid = pid_owned.as_str();
-    let state = extract::read_extract_state(pid);
+    let mut state = extract::read_extract_state(pid);
+    // New Claude Code session → fresh counters, so the per-session save cap
+    // stops behaving like a lifetime cap.
+    if state.session_id != payload.session_id {
+        state = extract::ExtractState {
+            session_id: payload.session_id.clone(),
+            ..Default::default()
+        };
+    }
     let now = protocol::now_ms();
     let filtered = extract::dedup_insights(insights, &state, now);
     if filtered.is_empty() {
@@ -717,7 +798,9 @@ async fn run_extract(project: Option<String>, silent: bool) {
                 entry_type: insight.entry_type,
                 source: Some(types::MemorySource::Agent),
                 tags: insight.tags.clone(),
-                project_id: project.clone(),
+                // The RESOLVED id — the raw CLI arg is None on manual runs,
+                // which would silently strand insights in 'default'.
+                project_id: Some(pid.to_string()),
                 topic_key: insight.topic_key.clone(),
                 importance: Some(insight.confidence * 0.6),
                 // Auto-extracted insights are agent inferences — down-rank vs.
@@ -772,12 +855,20 @@ async fn run_enqueue(project: Option<String>, silent: bool) {
     let pid_owned = resolve_project_id(project.clone());
     let pid = pid_owned.as_str();
 
+    // Redact secrets from the raw payloads BEFORE hashing and storing, so
+    // credentials never reach the database and identical post-redaction
+    // payloads still dedup.
+    let mut tool_input = payload.tool_input.clone();
+    let mut tool_response = payload.tool_response.clone();
+    redact::redact_secrets_value(&mut tool_input);
+    redact::redact_secrets_value(&mut tool_response);
+
     // Stable hash over tool_name + inputs + response so rapid retries dedup.
     let hash_payload = format!(
         "{}|{}|{}",
         payload.tool_name,
-        serde_json::to_string(&payload.tool_input).unwrap_or_default(),
-        serde_json::to_string(&payload.tool_response).unwrap_or_default()
+        serde_json::to_string(&tool_input).unwrap_or_default(),
+        serde_json::to_string(&tool_response).unwrap_or_default()
     );
     let content_hash = extract::short_hash_public(&hash_payload);
 
@@ -804,8 +895,8 @@ async fn run_enqueue(project: Option<String>, silent: bool) {
         session_id: None,
         project_id: Some(pid.to_string()),
         tool_name: payload.tool_name.clone(),
-        tool_input: payload.tool_input.clone(),
-        tool_response: payload.tool_response.clone(),
+        tool_input,
+        tool_response,
         content_hash,
     };
 
@@ -933,22 +1024,19 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
     );
 
     if let Some(session) = active {
-        let session_summary = types::SessionSummary {
-            summary: summary_body,
-            goal: Some(summary.request.clone()),
-            instructions: Vec::new(),
-            accomplished: summary.completed.clone(),
-            discoveries: summary.learned.clone(),
-            files_modified: summary
-                .completed
-                .iter()
-                .filter(|s| s.contains('/') || s.contains('.'))
-                .cloned()
-                .collect(),
-        };
+        let ping = protocol::read_ping(pid);
+        let session_summary = build_session_summary(&summary, summary_body, &ping);
         let _ = lib
             .end_session(session.id, session_summary, Some(pid))
             .await;
+
+        // Clear the ping file so the next session starts with clean file
+        // tracking and nudge timing.
+        let mut reset = ping;
+        reset.files_modified.clear();
+        reset.session_started_at = None;
+        reset.last_ping = None;
+        let _ = protocol::write_ping(pid, &reset);
     } else {
         let input = types::MemoryEntryInput {
             title: format!("Session summary — {pid}"),
@@ -993,6 +1081,34 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
     }
 }
 
+/// Compose the structured session summary. Ping-file `files_modified`
+/// (real git-diff data) beats the completed-items heuristic; the heuristic
+/// stays as a fallback for sessions with no ping data.
+fn build_session_summary(
+    summary: &summarizer::SynthesizedSummary,
+    summary_body: String,
+    ping: &protocol::PingData,
+) -> types::SessionSummary {
+    let files_modified = if ping.files_modified.is_empty() {
+        summary
+            .completed
+            .iter()
+            .filter(|s| s.contains('/') || s.contains('.'))
+            .cloned()
+            .collect()
+    } else {
+        ping.files_modified.clone()
+    };
+    types::SessionSummary {
+        summary: summary_body,
+        goal: Some(summary.request.clone()),
+        instructions: Vec::new(),
+        accomplished: summary.completed.clone(),
+        discoveries: summary.learned.clone(),
+        files_modified,
+    }
+}
+
 // ── Export / Import (A6) ──────────────────────────────────────────
 
 /// Tagged envelope for JSONL export lines so one file can carry entries,
@@ -1019,16 +1135,39 @@ async fn run_export(
     let et: Option<types::EntryType> =
         entry_type.and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok());
 
-    let filters = types::ListFilters {
-        entry_type: et,
-        project_id: project.clone(),
-        tags: None,
-        namespace: project.clone(),
-        limit: Some(limit),
-        offset: None,
+    // No --project → export EVERY namespace. list() is namespace-scoped
+    // (namespace == project_id by write invariant), so a flag-less export
+    // must iterate namespaces or it would capture only 'default'.
+    let entries: Vec<types::MemoryEntry> = match project.as_deref() {
+        Some(pid) => {
+            lib.list(types::ListFilters {
+                entry_type: et,
+                project_id: Some(pid.to_string()),
+                namespace: Some(pid.to_string()),
+                limit: Some(limit),
+                ..Default::default()
+            })
+            .await?
+        }
+        None => {
+            let mut all = Vec::new();
+            for ns in lib.list_namespaces().await? {
+                if all.len() >= limit {
+                    break;
+                }
+                let batch = lib
+                    .list(types::ListFilters {
+                        entry_type: et,
+                        namespace: Some(ns),
+                        limit: Some(limit - all.len()),
+                        ..Default::default()
+                    })
+                    .await?;
+                all.extend(batch);
+            }
+            all
+        }
     };
-
-    let entries = lib.list(filters).await?;
 
     // Edges + sessions are dumped unconditionally alongside entries.
     // Roundtrip needs them for supersession graphs + session summaries to
@@ -1042,14 +1181,27 @@ async fn run_export(
         .filter(|e| entry_ids.contains(&e.from_id) && entry_ids.contains(&e.to_id))
         .collect();
 
-    // Sessions scoped by project (or namespace) only when a project filter
-    // is in play — full export otherwise.
+    // Sessions: scoped when a project is given; otherwise every namespace
+    // (sessions live in namespace == project_id, same as entries).
     let sessions: Vec<types::Session> = match project.as_deref() {
         Some(pid) => lib
             .list_sessions(Some(pid), limit)
             .await
             .unwrap_or_default(),
-        None => lib.list_sessions(None, limit).await.unwrap_or_default(),
+        None => {
+            let mut all = Vec::new();
+            for ns in lib.list_namespaces().await.unwrap_or_default() {
+                if all.len() >= limit {
+                    break;
+                }
+                let batch = lib
+                    .list_sessions(Some(&ns), limit - all.len())
+                    .await
+                    .unwrap_or_default();
+                all.extend(batch);
+            }
+            all
+        }
     };
 
     if entries.is_empty() {
@@ -1096,11 +1248,75 @@ async fn run_export(
     Ok(())
 }
 
-async fn run_gc(project: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn run_gc(
+    project: Option<String>,
+    dry_run: bool,
+    stage1: bool,
+    stage1_age_days: i64,
+    hard: bool,
+    hard_age_days: i64,
+    yes: bool,
+) -> anyhow::Result<()> {
+    const GC_BATCH_MAX: usize = 100_000;
+
     let lib = create_librarian().await?;
     let pid_owned = resolve_project_id(project.clone());
     let pid = pid_owned.as_str();
 
+    // Stage 1 — soft-delete never-accessed crawl bulk (reversible).
+    if stage1 {
+        let ids = lib
+            .gc_stage1(Some(pid), stage1_age_days, GC_BATCH_MAX, dry_run)
+            .await?;
+        if dry_run {
+            println!(
+                "Stage 1 dry-run ('{pid}'): {} never-accessed scout entries older than {stage1_age_days}d would be soft-deleted.",
+                ids.len()
+            );
+        } else {
+            println!(
+                "Stage 1 ('{pid}'): soft-deleted {} never-accessed scout entries older than {stage1_age_days}d. \
+                 Recoverable until `runar gc --hard` purges them.",
+                ids.len()
+            );
+        }
+    }
+
+    // Stage 2 — permanent purge of old tombstones.
+    if hard {
+        if !dry_run && !yes {
+            let candidates = lib.gc_purge(None, hard_age_days, GC_BATCH_MAX, true).await?;
+            println!(
+                "--hard would PERMANENTLY delete {} rows soft-deleted more than {hard_age_days} days ago \
+                 (entries + FTS + edges + embeddings, all namespaces).",
+                candidates.len()
+            );
+            println!(
+                "This is irreversible. Back up first (copy the sqlite file / pg_dump), then re-run with --yes."
+            );
+            return Ok(());
+        }
+        let ids = lib.gc_purge(None, hard_age_days, GC_BATCH_MAX, dry_run).await?;
+        if dry_run {
+            println!(
+                "Stage 2 dry-run: {} tombstones older than {hard_age_days}d would be purged permanently.",
+                ids.len()
+            );
+        } else {
+            println!(
+                "Stage 2: permanently purged {} tombstones older than {hard_age_days}d. \
+                 (On hybrid-sync setups, run this on each replica — purges do not propagate.)",
+                ids.len()
+            );
+        }
+    }
+
+    if stage1 || hard {
+        return Ok(());
+    }
+
+    // Default behavior unchanged: graduation + eviction.
     if dry_run {
         println!("Dry-run for project '{pid}'. No rows will change.\n");
         let planned = lib.graduate_layers_inner(Some(pid), true).await?;
@@ -1261,7 +1477,7 @@ async fn run_session_ping(project: Option<String>, silent: bool) {
 
     // Best-effort DB mirror — never block or fail the hook.
     if let Ok(lib) = create_librarian_for_hook(pid).await {
-        if let Ok(Some(session)) = lib.get_active_session(None).await {
+        if let Ok(Some(session)) = lib.get_active_session(Some(pid)).await {
             let _ = lib
                 .update_session(
                     session.id,
@@ -1292,9 +1508,14 @@ async fn run_nudge(project: Option<String>, silent: bool) {
     let pid_owned = resolve_project_id(project);
     let pid = pid_owned.as_str();
 
-    // Step 1: Persist non-trivial prompts (best-effort, never blocks nudge)
+    // Step 1: Persist non-trivial prompts (best-effort, never blocks nudge).
+    // Machine-generated payloads (IDE selections, notifications, log pastes)
+    // are skipped — only genuinely typed prompts are worth remembering.
     if let Some(prompt) = &user_prompt {
-        if prompt.len() >= protocol::MIN_PROMPT_LENGTH && !protocol::is_trivial_prompt(prompt) {
+        if prompt.len() >= protocol::MIN_PROMPT_LENGTH
+            && !protocol::is_trivial_prompt(prompt)
+            && !protocol::is_machine_generated_prompt(prompt)
+        {
             let should_save = std::env::var("RUNAR_SAVE_PROMPTS")
                 .map(|v| v != "false")
                 .unwrap_or(true);
@@ -1355,11 +1576,28 @@ async fn read_stdin_with_timeout(timeout: std::time::Duration) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
+/// Longest prompt body we persist; genuine prompts stay whole, residual
+/// bulk pastes stop bloating rows.
+const MAX_PROMPT_CONTENT_CHARS: usize = 2_000;
+
+/// Char-boundary-safe prefix (byte slicing panics on multibyte input).
+fn char_prefix(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::Result<()> {
     let pid = project_id.unwrap_or("default");
     let librarian = create_librarian_for_hook(pid).await?;
-    let title = if prompt.len() > 100 {
-        format!("{}...", &prompt[..97])
+    let title = if prompt.chars().count() > 100 {
+        format!("{}...", char_prefix(prompt, 97))
+    } else {
+        prompt.to_string()
+    };
+    let content = if prompt.chars().count() > MAX_PROMPT_CONTENT_CHARS {
+        format!("{}…[truncated]", char_prefix(prompt, MAX_PROMPT_CONTENT_CHARS))
     } else {
         prompt.to_string()
     };
@@ -1372,7 +1610,7 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
     }
     let input = types::MemoryEntryInput {
         title,
-        content: prompt.to_string(),
+        content,
         entry_type: types::EntryType::UserPrompt,
         source: Some(types::MemorySource::Human),
         tags,
@@ -1380,6 +1618,29 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
         ..Default::default()
     };
     let _ = librarian.propose(input).await?;
+
+    // First genuine prompt of a session becomes its goal, replacing the
+    // auto-start placeholder. Best-effort — never fails the hook.
+    if let Ok(Some(session)) = librarian.get_active_session(project_id).await {
+        let placeholder = session
+            .goal
+            .as_deref()
+            .is_none_or(|g| g == "Auto-started session");
+        if placeholder {
+            // Redact before storing: the goal column bypasses propose().
+            let (clean_prompt, _) = redact::redact_secrets(prompt);
+            let goal: String = char_prefix(&clean_prompt, 120).to_string();
+            let _ = librarian
+                .update_session(
+                    session.id,
+                    types::SessionUpdate {
+                        goal: Some(goal),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+    }
     Ok(())
 }
 
@@ -1435,14 +1696,19 @@ async fn main() -> anyhow::Result<()> {
                 mcp::run_degraded_stdio_server(e.to_string()).await?;
             }
         },
-        Commands::Search { query, limit } => {
+        Commands::Search {
+            query,
+            limit,
+            project,
+        } => {
             let librarian = create_librarian().await?;
+            let pid = resolve_project_id(project);
             let results = librarian
-                .search(&query, limit, None, None, None, None)
+                .search(&query, limit, None, Some(&pid), None, None)
                 .await?;
 
             if results.is_empty() {
-                println!("No results found.");
+                println!("No results found in project '{pid}'. (Use --project to search another.)");
             } else {
                 for entry in &results {
                     println!("─── {} [{}]", entry.title, entry.entry_type.as_str());
@@ -1457,20 +1723,38 @@ async fn main() -> anyhow::Result<()> {
                 println!("{} result(s)", results.len());
             }
         }
-        Commands::Stats => {
+        Commands::Stats { project } => {
             let librarian = create_librarian().await?;
-            let stats = librarian.get_stats(None).await?;
-
-            println!("Memory entries: {}", stats.total_entries);
-            println!("Sessions:       {}", stats.total_sessions);
-            if !stats.entries_by_type.is_empty() {
-                println!("\nBy type:");
-                for (t, count) in &stats.entries_by_type {
-                    println!("  {t}: {count}");
+            match project {
+                Some(pid) => {
+                    let stats = librarian.get_stats(Some(&pid)).await?;
+                    println!("Project:        {pid}");
+                    println!("Memory entries: {}", stats.total_entries);
+                    println!("Sessions:       {}", stats.total_sessions);
+                    if !stats.entries_by_type.is_empty() {
+                        println!("\nBy type:");
+                        for (t, count) in &stats.entries_by_type {
+                            println!("  {t}: {count}");
+                        }
+                    }
                 }
-            }
-            if !stats.namespaces.is_empty() {
-                println!("\nNamespaces: {}", stats.namespaces.join(", "));
+                None => {
+                    let stats = librarian.get_stats_global().await?;
+                    println!("Memory entries: {} (all namespaces)", stats.total_entries);
+                    println!("Sessions:       {}", stats.total_sessions);
+                    if !stats.entries_by_type.is_empty() {
+                        println!("\nBy type:");
+                        for (t, count) in &stats.entries_by_type {
+                            println!("  {t}: {count}");
+                        }
+                    }
+                    if !stats.by_namespace.is_empty() {
+                        println!("\nPer namespace (entries / sessions):");
+                        for ns in &stats.by_namespace {
+                            println!("  {}: {} / {}", ns.namespace, ns.entries, ns.sessions);
+                        }
+                    }
+                }
             }
         }
         Commands::Crawl {
@@ -1589,8 +1873,30 @@ async fn main() -> anyhow::Result<()> {
             tool,
             project,
             with_auto_capture,
+            no_auto_capture,
             configure,
         } => {
+            let _ = with_auto_capture; // deprecated no-op, kept for old scripts
+            // Default ON with a persisted opt-out: re-running setup without
+            // flags used to silently delete the enqueue/summarize hooks —
+            // the reason auto-capture died on 2026-05-04.
+            let auto_capture = if no_auto_capture {
+                false
+            } else {
+                std::env::var("RUNAR_AUTO_CAPTURE")
+                    .map(|v| v != "false")
+                    .unwrap_or(true)
+            };
+            {
+                let path = config_cmd::EnvFile::default_path();
+                if let Ok(mut env_file) = config_cmd::EnvFile::load(&path) {
+                    env_file.upsert(
+                        "RUNAR_AUTO_CAPTURE",
+                        if auto_capture { "true" } else { "false" },
+                    );
+                    let _ = env_file.save_atomic();
+                }
+            }
             let key = tool.to_lowercase();
             match key.as_str() {
                 "claude-code" => {
@@ -1599,7 +1905,7 @@ async fn main() -> anyhow::Result<()> {
                         println!();
                     }
                     let project_id = project.unwrap_or_else(setup::detect_project_id);
-                    let result = setup::setup_claude_code(&project_id, with_auto_capture)?;
+                    let result = setup::setup_claude_code(&project_id, auto_capture)?;
                     println!("\nRunarForge — Claude Code Setup\n");
                     println!(
                         "  MCP server configured in {}:",
@@ -1614,7 +1920,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("     PostToolUse:       session ping on file writes");
                     println!("     PostToolUse:       save-ack on muninn_save");
                     println!("     PostToolUse:       rule-based extract (passive learning)");
-                    if with_auto_capture {
+                    if auto_capture {
                         println!("     PostToolUse:       enqueue (auto-capture queue)");
                         println!("     SessionEnd:        summarize (drain queue → summary)");
                     }
@@ -1625,8 +1931,8 @@ async fn main() -> anyhow::Result<()> {
                         result.claude_md_path.display()
                     );
                     println!("  Project: {}\n", result.project_id);
-                    if with_auto_capture {
-                        println!("  Auto-capture: ENABLED");
+                    if auto_capture {
+                        println!("  Auto-capture: ENABLED (default; --no-auto-capture to disable)");
                         if std::env::var("ANTHROPIC_API_KEY")
                             .map(|k| !k.trim().is_empty())
                             .unwrap_or(false)
@@ -1637,7 +1943,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         println!();
                     } else {
-                        println!("  Auto-capture: disabled (re-run with --with-auto-capture to enable)\n");
+                        println!("  Auto-capture: disabled (persisted; re-run after RUNAR_AUTO_CAPTURE=true or without --no-auto-capture to enable)\n");
                     }
                     println!("Restart Claude Code to activate.\n");
                 }
@@ -1686,20 +1992,44 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             let resolved = Some(resolve_project_id(project));
+            let hook_started = std::time::Instant::now();
             let work = build_context(&resolved);
-            let full = match tokio::time::timeout(hooks_runtime::hook_budget(), work).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    if !silent {
-                        eprintln!("context error: {e}");
+            let (full, budget_exceeded) =
+                match tokio::time::timeout(hooks_runtime::hook_budget(), work).await {
+                    Ok(Ok(s)) => (s, false),
+                    Ok(Err(e)) => {
+                        if !silent {
+                            eprintln!("context error: {e}");
+                        }
+                        (String::new(), false)
                     }
-                    String::new()
+                    Err(_) => {
+                        hooks_runtime::append_hook_log("context", "budget exceeded");
+                        (String::new(), true)
+                    }
+                };
+            // Best-effort hook-timing telemetry (RUNAR_DEBUG only). Runs
+            // after the payload work but before printing, so it gets its
+            // own hard 150ms cap to never visibly delay the hook.
+            if runar_muninn::debug::enabled() {
+                if let Some(pid) = resolved.as_deref() {
+                    let telemetry = async {
+                        if let Ok(lib) = create_librarian_for_hook(pid).await {
+                            lib.write_hook_timing(
+                                "context",
+                                budget_exceeded,
+                                hook_started.elapsed().as_secs_f64() * 1000.0,
+                            )
+                            .await;
+                        }
+                    };
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(150),
+                        telemetry,
+                    )
+                    .await;
                 }
-                Err(_) => {
-                    hooks_runtime::append_hook_log("context", "budget exceeded");
-                    String::new()
-                }
-            };
+            }
             if silent {
                 let payload = serde_json::json!({ "additionalContext": full });
                 print!("{payload}");
@@ -1942,8 +2272,89 @@ async fn main() -> anyhow::Result<()> {
             run_import(&input).await?;
         }
 
-        Commands::Gc { project, dry_run } => {
-            run_gc(project, dry_run).await?;
+        Commands::Scrub {
+            project,
+            dry_run,
+            limit,
+        } => {
+            let lib = create_librarian().await?;
+            let report =
+                maintenance::run_scrub(&lib, project.as_deref(), dry_run, limit).await?;
+            let mode = if dry_run { "dry-run" } else { "rewrite" };
+            println!("Scrub ({mode}): scanned {} entries.", report.scanned);
+            if report.hits_by_kind.is_empty() {
+                println!("No secret patterns found.");
+            } else {
+                println!("Secret hits by kind:");
+                for (kind, count) in &report.hits_by_kind {
+                    println!("  {kind}: {count}");
+                }
+                if dry_run {
+                    println!("\nRe-run without --dry-run to rewrite these entries in place.");
+                } else {
+                    println!("\nRewrote {} entries (FTS reindexed, hashes refreshed).", report.rewritten);
+                    println!("Rotate any credentials that appeared here — redaction does not un-leak them.");
+                }
+            }
+            if !report.heavy_hit_ids.is_empty() {
+                println!(
+                    "\n{} entries are mostly redacted content (likely pure-credential rows):",
+                    report.heavy_hit_ids.len()
+                );
+                for (id, title) in report.heavy_hit_ids.iter().take(20) {
+                    println!("  {id}  {title:.60}");
+                }
+                println!("Consider soft-deleting these, then purging with `runar gc --hard --yes` after the grace period.");
+            }
+        }
+
+        Commands::Dedup {
+            project,
+            dry_run,
+            backfill_only,
+        } => {
+            let lib = create_librarian().await?;
+            let report =
+                maintenance::run_dedup(&lib, project.as_deref(), dry_run, backfill_only).await?;
+            println!("Dedup: backfilled content_hash on {} rows.", report.backfilled);
+            if backfill_only {
+                println!("Backfill-only mode: no clusters were evaluated.");
+            } else {
+                println!(
+                    "Duplicate clusters: {} ({} redundant rows).",
+                    report.clusters, report.redundant
+                );
+                if dry_run {
+                    println!("Dry-run: nothing was deleted. Re-run without --dry-run to soft-delete the redundant rows.");
+                } else {
+                    println!(
+                        "Soft-deleted {} redundant rows (keeper = most-accessed/verified/newest). \
+                         Recoverable until `runar gc --hard` purges them.",
+                        report.soft_deleted
+                    );
+                }
+            }
+        }
+
+        Commands::Gc {
+            project,
+            dry_run,
+            stage1,
+            stage1_age_days,
+            hard,
+            hard_age_days,
+            yes,
+        } => {
+            run_gc(
+                project,
+                dry_run,
+                stage1,
+                stage1_age_days,
+                hard,
+                hard_age_days,
+                yes,
+            )
+            .await?;
         }
 
         Commands::Config { action } => match action {

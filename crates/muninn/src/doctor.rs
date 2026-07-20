@@ -815,6 +815,31 @@ fn run_sqlite_checks(report: &mut Report) {
         "row counts",
         format!("entries={entries} sessions={sessions} pending={pending}"),
     ));
+
+    // FTS parity: after migration 013 the index must contain exactly the
+    // live rows. Divergence means trigger damage or a pre-013 residue.
+    // NOTE: count(*) on an external-content FTS5 table reads the CONTENT
+    // table (including tombstones) — the docsize shadow table is the
+    // actual per-document index state.
+    let fts_rows: i64 = conn
+        .query_row("SELECT count(*) FROM memory_fts_docsize", [], |r| r.get(0))
+        .unwrap_or(-1);
+    if fts_rows < 0 || entries < 0 {
+        report
+            .checks
+            .push(Check::skip("fts parity", "counts unavailable"));
+    } else if fts_rows == entries {
+        report.checks.push(Check::pass_with(
+            "fts parity",
+            format!("{fts_rows} indexed rows == live entries"),
+        ));
+    } else {
+        report.checks.push(Check::fail_hint(
+            "fts parity",
+            format!("memory_fts has {fts_rows} rows, live entries {entries}"),
+            "apply migration 013 (any non-doctor command) or report a trigger bug",
+        ));
+    }
 }
 
 // ── breaker + local env ────────────────────────────────────────────

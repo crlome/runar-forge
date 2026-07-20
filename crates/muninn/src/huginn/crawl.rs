@@ -226,7 +226,8 @@ impl<'a> CrawlOrchestrator<'a> {
             }
         }
 
-        // Architecture summary entry (overwrites previous via dedup on title)
+        // Architecture summary entry — the stable topic_key makes each crawl
+        // supersede the previous summary instead of accumulating copies.
         let arch_input = MemoryEntryInput {
             title: format!("Architecture summary: {}", self.project_id),
             content: summary.formatted.clone(),
@@ -238,6 +239,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 "architecture-summary".into(),
             ],
             project_id: Some(self.project_id.clone()),
+            topic_key: Some(format!("scout:arch:{}", self.project_id)),
             ..Default::default()
         };
         if self.librarian.propose(arch_input).await.is_ok() {

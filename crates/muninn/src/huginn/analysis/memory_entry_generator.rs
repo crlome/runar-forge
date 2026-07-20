@@ -68,6 +68,9 @@ pub fn file_entry(result: &FileAnalysisResult, project_id: &str) -> Option<Memor
         source: Some(MemorySource::Scout),
         tags,
         project_id: Some(project_id.to_string()),
+        // Deterministic per-file key: a recrawl of the same file supersedes
+        // its previous entry instead of accumulating duplicates.
+        topic_key: Some(format!("scout:file:{}:{}", project_id, result.file_path)),
         ..Default::default()
     })
 }
@@ -95,8 +98,18 @@ pub fn pattern_entry(pattern: &CrossFilePattern, project_id: &str) -> MemoryEntr
             pattern.name.clone(),
         ],
         project_id: Some(project_id.into()),
+        topic_key: Some(format!("scout:pattern:{}:{}", project_id, slug(&pattern.name))),
         ..Default::default()
     }
+}
+
+/// Lowercase, non-alphanumeric → '-'. Keeps topic keys stable across
+/// cosmetic pattern-name changes (case, spacing).
+fn slug(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// Convert a tech-debt marker batch (grouped per file) into TechDebt entries.
@@ -143,6 +156,7 @@ pub fn techdebt_entries(markers: &[TechDebtMarker], project_id: &str) -> Vec<Mem
                 tags
             },
             project_id: Some(project_id.into()),
+            topic_key: Some(format!("scout:techdebt:{project_id}:{file}")),
             ..Default::default()
         });
     }
@@ -268,6 +282,7 @@ fn sql_entries_for_file(
         source: Some(MemorySource::Scout),
         tags: base_tags(),
         project_id: Some(project_id.to_string()),
+        topic_key: Some(format!("scout:file:{}:{}", project_id, result.file_path)),
         ..Default::default()
     });
 
@@ -286,6 +301,7 @@ fn sql_entries_for_file(
             source: Some(MemorySource::Scout),
             tags,
             project_id: Some(project_id.to_string()),
+            topic_key: Some(format!("scout:table:{project_id}:{qualified}")),
             ..Default::default()
         });
     }
