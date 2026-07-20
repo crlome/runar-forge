@@ -1259,7 +1259,7 @@ impl MemoryStorage for SqliteAdapter {
         }
 
         let mut by_namespace: Vec<NamespaceStats> = by_ns.into_values().collect();
-        by_namespace.sort_by(|a, b| b.entries.cmp(&a.entries));
+        by_namespace.sort_by_key(|n| std::cmp::Reverse(n.entries));
 
         Ok(GlobalStats {
             total_entries,
