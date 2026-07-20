@@ -59,6 +59,14 @@ pub const PG_MIGRATIONS: &[(&str, &str)] = &[
         include_str!("pg_sql/010_add_sync_outbox.sql"),
     ),
     ("011_add_author", include_str!("pg_sql/011_add_author.sql")),
+    (
+        "012_scope_project_namespaces",
+        include_str!("pg_sql/012_scope_project_namespaces.sql"),
+    ),
+    (
+        "013_content_hash",
+        include_str!("pg_sql/013_content_hash.sql"),
+    ),
 ];
 
 pub struct PostgresAdapter {
@@ -238,6 +246,8 @@ fn row_to_session(row: &tokio_postgres::Row) -> Session {
         tool: row.get("tool"),
         goal: row.get("goal"),
         summary: row.get("summary"),
+        discoveries: row.get("discoveries"),
+        files_modified: row.get("files_modified"),
         status,
         started_at: row.get("started_at"),
         ended_at: row.get("ended_at"),
@@ -306,6 +316,35 @@ impl MemoryStorage for PostgresAdapter {
             .unwrap_or(DEFAULT_CONFIDENCE)
             .clamp(0.0, 1.0);
 
+        // Exact-duplicate guard: identical content in the same namespace
+        // short-circuits before the topic_key branch, so an unchanged
+        // recrawl never soft-deletes-and-reinserts its own predecessor.
+        let hash = crate::storage::content_hash(&input.title, &input.content);
+        let dup_row = client
+            .query_opt(
+                "SELECT id FROM muninn.memory_entries
+                 WHERE namespace = $1 AND content_hash = $2 AND deleted_at IS NULL
+                 LIMIT 1",
+                &[&ns, &hash],
+            )
+            .await
+            .map_err(db_err)?;
+        if let Some(row) = dup_row {
+            let dup_id: &str = row.get("id");
+            client
+                .execute(
+                    "UPDATE muninn.memory_entries SET updated_at = NOW() WHERE id = $1",
+                    &[&dup_id.to_string()],
+                )
+                .await
+                .map_err(db_err)?;
+            return Ok(SaveResult {
+                id: dup_id.parse().unwrap_or_default(),
+                action: SaveAction::Duplicate,
+                superseded: None,
+            });
+        }
+
         // Phase 5.1.2 — topicKey upsert: soft-delete prior live entry with
         // the same (namespace, topic_key) and capture its metadata for the
         // supersession response.
@@ -350,8 +389,8 @@ impl MemoryStorage for PostgresAdapter {
         client
             .execute(
                 "INSERT INTO muninn.memory_entries
-                    (id, namespace, title, content, type, tags, project_id, source, layer, confidence, topic_key, author)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    (id, namespace, title, content, type, tags, project_id, source, layer, confidence, topic_key, author, content_hash)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                 &[
                     &id.to_string(),
                     &ns,
@@ -365,6 +404,7 @@ impl MemoryStorage for PostgresAdapter {
                     &confidence,
                     &input.topic_key,
                     &input.author,
+                    &hash,
                 ],
             )
             .await
@@ -401,60 +441,88 @@ impl MemoryStorage for PostgresAdapter {
         let client = self.get_client().await?;
 
         if let Some(obj) = updates.as_object() {
-            // Apply each field update individually to avoid dynamic dispatch issues
+            // One dynamic UPDATE for all recognized fields. The old
+            // per-field autocommit statements could be interrupted between
+            // statements, leaving partial writes (access_count bumped,
+            // last_accessed_at still NULL).
+            let mut sets: Vec<String> = vec!["updated_at = NOW()".to_string()];
+            let mut str_vals: Vec<(String, String)> = Vec::new();
+            let mut int_vals: Vec<(String, i32)> = Vec::new();
+            // tags is TEXT[] in postgres — accept either a JSON-encoded
+            // array string or a JSON array value, and bind a real array.
+            let mut tags_val: Option<Vec<String>> = None;
+
             for (key, value) in obj {
                 match key.as_str() {
-                    "title" => {
-                        let v = value.as_str().unwrap_or("");
-                        client
-                            .execute(
-                                "UPDATE muninn.memory_entries SET title = $1 WHERE id = $2 AND deleted_at IS NULL",
-                                &[&v, &id.to_string()],
-                            )
-                            .await
-                            .map_err(db_err)?;
+                    "title" | "content" => {
+                        str_vals.push((key.clone(), value.as_str().unwrap_or("").to_string()));
                     }
-                    "content" => {
-                        let v = value.as_str().unwrap_or("");
-                        client
-                            .execute(
-                                "UPDATE muninn.memory_entries SET content = $1 WHERE id = $2 AND deleted_at IS NULL",
-                                &[&v, &id.to_string()],
-                            )
-                            .await
-                            .map_err(db_err)?;
+                    "tags" => {
+                        tags_val = match value {
+                            serde_json::Value::String(s) => {
+                                serde_json::from_str::<Vec<String>>(s).ok()
+                            }
+                            other => serde_json::from_value(other.clone()).ok(),
+                        };
                     }
                     "last_accessed_at" => {
-                        let v = value.as_str().unwrap_or("");
-                        client
-                            .execute(
-                                "UPDATE muninn.memory_entries SET last_accessed_at = $1::timestamptz WHERE id = $2 AND deleted_at IS NULL",
-                                &[&v, &id.to_string()],
-                            )
-                            .await
-                            .map_err(db_err)?;
+                        str_vals.push((key.clone(), value.as_str().unwrap_or("").to_string()));
                     }
-                    "layer" => {
-                        let v = value.as_i64().unwrap_or(3) as i32;
-                        client
-                            .execute(
-                                "UPDATE muninn.memory_entries SET layer = $1 WHERE id = $2 AND deleted_at IS NULL",
-                                &[&v, &id.to_string()],
-                            )
-                            .await
-                            .map_err(db_err)?;
-                    }
+                    "layer" => int_vals.push((key.clone(), value.as_i64().unwrap_or(3) as i32)),
                     "access_count" => {
-                        let v = value.as_i64().unwrap_or(0) as i32;
-                        client
-                            .execute(
-                                "UPDATE muninn.memory_entries SET access_count = $1 WHERE id = $2 AND deleted_at IS NULL",
-                                &[&v, &id.to_string()],
-                            )
-                            .await
-                            .map_err(db_err)?;
+                        int_vals.push((key.clone(), value.as_i64().unwrap_or(0) as i32))
                     }
                     _ => {}
+                }
+            }
+
+            let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+            for (key, val) in &str_vals {
+                args.push(val);
+                if key == "last_accessed_at" {
+                    sets.push(format!("{key} = ${}::timestamptz", args.len()));
+                } else {
+                    sets.push(format!("{key} = ${}", args.len()));
+                }
+            }
+            for (key, val) in &int_vals {
+                args.push(val);
+                sets.push(format!("{key} = ${}", args.len()));
+            }
+            if let Some(ref tags) = tags_val {
+                args.push(tags);
+                sets.push(format!("tags = ${}", args.len()));
+            }
+
+            let id_str = id.to_string();
+            args.push(&id_str);
+            let sql = format!(
+                "UPDATE muninn.memory_entries SET {} WHERE id = ${} AND deleted_at IS NULL",
+                sets.join(", "),
+                args.len()
+            );
+            client.execute(&sql, &args).await.map_err(db_err)?;
+
+            // Content changed → keep the dedup hash in sync.
+            if obj.contains_key("title") || obj.contains_key("content") {
+                if let Some(row) = client
+                    .query_opt(
+                        "SELECT title, content FROM muninn.memory_entries WHERE id = $1",
+                        &[&id_str],
+                    )
+                    .await
+                    .map_err(db_err)?
+                {
+                    let t: String = row.get("title");
+                    let c: String = row.get("content");
+                    let hash = crate::storage::content_hash(&t, &c);
+                    client
+                        .execute(
+                            "UPDATE muninn.memory_entries SET content_hash = $1 WHERE id = $2",
+                            &[&hash, &id_str],
+                        )
+                        .await
+                        .map_err(db_err)?;
                 }
             }
         }
@@ -486,49 +554,25 @@ impl MemoryStorage for PostgresAdapter {
         let type_filter = filters.entry_type.map(|t| t.as_str().to_string());
         let project_filter = filters.project_id.clone();
 
-        let rows = match (&type_filter, &project_filter) {
-            (Some(t), Some(p)) => {
-                client
-                    .query(
-                        "SELECT * FROM muninn.memory_entries
-                     WHERE namespace = $1 AND deleted_at IS NULL AND type = $2 AND project_id = $3
-                     ORDER BY created_at DESC LIMIT $4 OFFSET $5",
-                        &[&ns, t, p, &limit, &offset],
-                    )
-                    .await
-            }
-            (Some(t), None) => {
-                client
-                    .query(
-                        "SELECT * FROM muninn.memory_entries
-                     WHERE namespace = $1 AND deleted_at IS NULL AND type = $2
-                     ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-                        &[&ns, t, &limit, &offset],
-                    )
-                    .await
-            }
-            (None, Some(p)) => {
-                client
-                    .query(
-                        "SELECT * FROM muninn.memory_entries
-                     WHERE namespace = $1 AND deleted_at IS NULL AND project_id = $2
-                     ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-                        &[&ns, p, &limit, &offset],
-                    )
-                    .await
-            }
-            (None, None) => {
-                client
-                    .query(
-                        "SELECT * FROM muninn.memory_entries
-                     WHERE namespace = $1 AND deleted_at IS NULL
-                     ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-                        &[&ns, &limit, &offset],
-                    )
-                    .await
-            }
+        let mut sql = String::from("SELECT * FROM muninn.memory_entries WHERE namespace = $1");
+        if !filters.include_deleted {
+            sql.push_str(" AND deleted_at IS NULL");
         }
-        .map_err(db_err)?;
+        let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&ns];
+        if let Some(ref t) = type_filter {
+            args.push(t);
+            sql.push_str(&format!(" AND type = ${}", args.len()));
+        }
+        if let Some(ref p) = project_filter {
+            args.push(p);
+            sql.push_str(&format!(" AND project_id = ${}", args.len()));
+        }
+        args.push(&limit);
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", args.len()));
+        args.push(&offset);
+        sql.push_str(&format!(" OFFSET ${}", args.len()));
+
+        let rows = client.query(&sql, &args).await.map_err(db_err)?;
 
         Ok(rows.iter().map(row_to_entry).collect())
     }
@@ -553,33 +597,41 @@ impl MemoryStorage for PostgresAdapter {
 
     async fn semantic_search(
         &self,
-        _query: &str,
         query_embedding: &[f32],
-        limit: usize,
-        namespace: &str,
+        filters: SearchQuery,
     ) -> StorageResult<Vec<MemoryEntry>> {
         let client = self.get_client().await?;
-        let ns = if namespace.is_empty() {
-            &self.default_namespace
-        } else {
-            namespace
+        let ns = match filters.namespace.as_deref() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => self.default_namespace.clone(),
         };
+        let limit = filters.limit.unwrap_or(10) as i64;
         let vec = Vector::from(query_embedding.to_vec());
+        let type_str = filters.entry_type.as_ref().map(|t| t.as_str().to_string());
 
-        let rows = client
-            .query(
-                "SELECT *, 1 - (embedding <=> $1) AS similarity
-                 FROM muninn.memory_entries
-                 WHERE namespace = $2
-                   AND deleted_at IS NULL
-                   AND embedding IS NOT NULL
-                   AND 1 - (embedding <=> $1) >= 0.65
-                 ORDER BY embedding <=> $1
-                 LIMIT $3",
-                &[&vec, &ns, &(limit as i64)],
-            )
-            .await
-            .map_err(db_err)?;
+        // Same predicates as fts_search so both fused-search arms see an
+        // identically scoped corpus.
+        let mut sql = String::from(
+            "SELECT *, 1 - (embedding <=> $1) AS similarity
+             FROM muninn.memory_entries
+             WHERE namespace = $2
+               AND deleted_at IS NULL
+               AND embedding IS NOT NULL
+               AND 1 - (embedding <=> $1) >= 0.65",
+        );
+        let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&vec, &ns];
+        if let Some(ref t) = type_str {
+            args.push(t);
+            sql.push_str(&format!(" AND type = ${}", args.len()));
+        }
+        if let Some(ref pid) = filters.project_id {
+            args.push(pid);
+            sql.push_str(&format!(" AND project_id = ${}", args.len()));
+        }
+        args.push(&limit);
+        sql.push_str(&format!(" ORDER BY embedding <=> $1 LIMIT ${}", args.len()));
+
+        let rows = client.query(&sql, &args).await.map_err(db_err)?;
 
         Ok(rows.iter().map(row_to_entry).collect())
     }
@@ -589,22 +641,31 @@ impl MemoryStorage for PostgresAdapter {
         let ns = query
             .namespace
             .as_deref()
-            .unwrap_or(&self.default_namespace);
+            .unwrap_or(&self.default_namespace)
+            .to_string();
         let limit = query.limit.unwrap_or(10) as i64;
+        let type_str = query.entry_type.as_ref().map(|t| t.as_str().to_string());
 
-        let rows = client
-            .query(
-                "SELECT *, ts_rank(fts_vector, plainto_tsquery('english', $1)) AS rank
-                 FROM muninn.memory_entries
-                 WHERE namespace = $2
-                   AND deleted_at IS NULL
-                   AND fts_vector @@ plainto_tsquery('english', $1)
-                 ORDER BY rank DESC
-                 LIMIT $3",
-                &[&query.query, &ns, &limit],
-            )
-            .await
-            .map_err(db_err)?;
+        let mut sql = String::from(
+            "SELECT *, ts_rank(fts_vector, plainto_tsquery('english', $1)) AS rank
+             FROM muninn.memory_entries
+             WHERE namespace = $2
+               AND deleted_at IS NULL
+               AND fts_vector @@ plainto_tsquery('english', $1)",
+        );
+        let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&query.query, &ns];
+        if let Some(ref t) = type_str {
+            args.push(t);
+            sql.push_str(&format!(" AND type = ${}", args.len()));
+        }
+        if let Some(ref pid) = query.project_id {
+            args.push(pid);
+            sql.push_str(&format!(" AND project_id = ${}", args.len()));
+        }
+        args.push(&limit);
+        sql.push_str(&format!(" ORDER BY rank DESC LIMIT ${}", args.len()));
+
+        let rows = client.query(&sql, &args).await.map_err(db_err)?;
 
         Ok(rows.iter().map(row_to_entry).collect())
     }
@@ -692,6 +753,24 @@ impl MemoryStorage for PostgresAdapter {
                 .execute(
                     "UPDATE muninn.sessions SET files_modified = $1 WHERE id = $2",
                     &[files, &id.to_string()],
+                )
+                .await
+                .map_err(db_err)?;
+        }
+        if let Some(ref goal) = update.goal {
+            client
+                .execute(
+                    "UPDATE muninn.sessions SET goal = $1 WHERE id = $2",
+                    &[goal, &id.to_string()],
+                )
+                .await
+                .map_err(db_err)?;
+        }
+        if let Some(ref discoveries) = update.discoveries {
+            client
+                .execute(
+                    "UPDATE muninn.sessions SET discoveries = $1 WHERE id = $2",
+                    &[discoveries, &id.to_string()],
                 )
                 .await
                 .map_err(db_err)?;
@@ -821,13 +900,15 @@ impl MemoryStorage for PostgresAdapter {
 
         client
             .execute(
-                "INSERT INTO muninn.debug_log (id, event, entry_id, data)
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO muninn.debug_log (id, event, entry_id, data, duration_ms)
+                 VALUES ($1, $2, $3, $4, $5)",
                 &[
                     &id.to_string(),
                     &event_str,
                     &input.entry_id.map(|id| id.to_string()),
                     &input.data,
+                    // Column is REAL (float4); f64 would mismatch the wire type.
+                    &input.duration_ms.map(|v| v as f32),
                 ],
             )
             .await
@@ -839,14 +920,36 @@ impl MemoryStorage for PostgresAdapter {
         let client = self.get_client().await?;
         let limit = query.limit.unwrap_or(20) as i64;
 
-        // Use a simple query without dynamic params to satisfy Send bounds
-        let rows = client
-            .query(
-                "SELECT * FROM muninn.debug_log ORDER BY created_at DESC LIMIT $1",
-                &[&limit],
-            )
-            .await
-            .map_err(db_err)?;
+        // Apply the same predicates as the sqlite twin — muninn_debug
+        // forwards event/entryId/since filters.
+        let event_str = query.event.as_ref().map(|e| {
+            serde_json::to_value(e)
+                .unwrap()
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        });
+        let entry_id_str = query.entry_id.map(|u| u.to_string());
+        let since = query.since;
+
+        let mut sql = String::from("SELECT * FROM muninn.debug_log WHERE TRUE");
+        let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        if let Some(ref e) = event_str {
+            args.push(e);
+            sql.push_str(&format!(" AND event = ${}", args.len()));
+        }
+        if let Some(ref id) = entry_id_str {
+            args.push(id);
+            sql.push_str(&format!(" AND entry_id = ${}", args.len()));
+        }
+        if let Some(ref s) = since {
+            args.push(s);
+            sql.push_str(&format!(" AND created_at >= ${}", args.len()));
+        }
+        args.push(&limit);
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", args.len()));
+
+        let rows = client.query(&sql, &args).await.map_err(db_err)?;
 
         Ok(rows
             .iter()
@@ -863,6 +966,7 @@ impl MemoryStorage for PostgresAdapter {
                     event,
                     entry_id: entry_id_opt.and_then(|s| s.parse().ok()),
                     data: row.get("data"),
+                    duration_ms: row.get::<_, Option<f32>>("duration_ms").map(|v| v as f64),
                     created_at: row.get("created_at"),
                 }
             })
@@ -957,6 +1061,97 @@ impl MemoryStorage for PostgresAdapter {
             entries_by_type,
             entries_by_layer,
             namespaces,
+        })
+    }
+
+    async fn get_stats_all(&self) -> StorageResult<GlobalStats> {
+        let client = self.get_client().await?;
+
+        let total_entries: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM muninn.memory_entries WHERE deleted_at IS NULL",
+                &[],
+            )
+            .await
+            .map_err(db_err)?
+            .get(0);
+        let total_sessions: i64 = client
+            .query_one("SELECT COUNT(*) FROM muninn.sessions", &[])
+            .await
+            .map_err(db_err)?
+            .get(0);
+
+        let entries_by_type: Vec<(String, i64)> = client
+            .query(
+                "SELECT type, COUNT(*) FROM muninn.memory_entries
+                 WHERE deleted_at IS NULL GROUP BY type ORDER BY COUNT(*) DESC",
+                &[],
+            )
+            .await
+            .map_err(db_err)?
+            .iter()
+            .map(|r| (r.get::<_, &str>(0).to_string(), r.get::<_, i64>(1)))
+            .collect();
+
+        let entries_by_layer: Vec<(u8, i64)> = client
+            .query(
+                "SELECT layer, COUNT(*) FROM muninn.memory_entries
+                 WHERE deleted_at IS NULL GROUP BY layer ORDER BY layer",
+                &[],
+            )
+            .await
+            .map_err(db_err)?
+            .iter()
+            .map(|r| (r.get::<_, i32>(0) as u8, r.get::<_, i64>(1)))
+            .collect();
+
+        let mut by_ns: std::collections::BTreeMap<String, NamespaceStats> = Default::default();
+        for row in client
+            .query(
+                "SELECT namespace, COUNT(*) FROM muninn.memory_entries
+                 WHERE deleted_at IS NULL GROUP BY namespace",
+                &[],
+            )
+            .await
+            .map_err(db_err)?
+        {
+            let ns: String = row.get::<_, &str>(0).to_string();
+            by_ns
+                .entry(ns.clone())
+                .or_insert(NamespaceStats {
+                    namespace: ns,
+                    entries: 0,
+                    sessions: 0,
+                })
+                .entries = row.get::<_, i64>(1);
+        }
+        for row in client
+            .query(
+                "SELECT namespace, COUNT(*) FROM muninn.sessions GROUP BY namespace",
+                &[],
+            )
+            .await
+            .map_err(db_err)?
+        {
+            let ns: String = row.get::<_, &str>(0).to_string();
+            by_ns
+                .entry(ns.clone())
+                .or_insert(NamespaceStats {
+                    namespace: ns,
+                    entries: 0,
+                    sessions: 0,
+                })
+                .sessions = row.get::<_, i64>(1);
+        }
+        let mut by_namespace: Vec<NamespaceStats> = by_ns.into_values().collect();
+        by_namespace.sort_by_key(|n| std::cmp::Reverse(n.entries));
+
+        Ok(GlobalStats {
+            total_entries,
+            total_sessions,
+            entries_by_type,
+            entries_by_layer,
+            by_namespace,
         })
     }
 
@@ -1173,6 +1368,266 @@ impl MemoryStorage for PostgresAdapter {
         Ok(row.is_some())
     }
 
+    async fn touch_entries(&self, ids: &[Uuid]) -> StorageResult<i64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let client = self.get_client().await?;
+        let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let touched = client
+            .execute(
+                &format!(
+                    "UPDATE muninn.memory_entries
+                     SET access_count = access_count + 1,
+                         last_accessed_at = NOW(),
+                         updated_at = NOW(),
+                         layer = CASE WHEN layer > {episodic} THEN {episodic} ELSE layer END
+                     WHERE id = ANY($1) AND deleted_at IS NULL",
+                    episodic = MemoryLayer::EPISODIC.value(),
+                ),
+                &[&id_strs],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(touched as i64)
+    }
+
+    // ── Two-stage GC ──────────────────────────────────────────
+
+    async fn soft_delete_stale_crawl(
+        &self,
+        namespace: &str,
+        age_days: i64,
+        max: usize,
+        dry_run: bool,
+    ) -> StorageResult<Vec<Uuid>> {
+        let client = self.get_client().await?;
+
+        if dry_run {
+            let rows = client
+                .query(
+                    "SELECT id FROM muninn.memory_entries
+                     WHERE namespace = $1
+                       AND deleted_at IS NULL
+                       AND source = 'scout'
+                       AND verified = FALSE
+                       AND access_count = 0
+                       AND last_accessed_at IS NULL
+                       AND created_at < NOW() - ($2 || ' days')::interval
+                     ORDER BY created_at
+                     LIMIT $3",
+                    &[&namespace, &age_days.to_string(), &(max as i64)],
+                )
+                .await
+                .map_err(db_err)?;
+            return Ok(rows
+                .iter()
+                .filter_map(|r| r.get::<_, &str>("id").parse().ok())
+                .collect());
+        }
+
+        let rows = client
+            .query(
+                "UPDATE muninn.memory_entries
+                 SET deleted_at = NOW(), updated_at = NOW()
+                 WHERE id IN (
+                     SELECT id FROM muninn.memory_entries
+                     WHERE namespace = $1
+                       AND deleted_at IS NULL
+                       AND source = 'scout'
+                       AND verified = FALSE
+                       AND access_count = 0
+                       AND last_accessed_at IS NULL
+                       AND created_at < NOW() - ($2 || ' days')::interval
+                     ORDER BY created_at
+                     LIMIT $3
+                 )
+                 RETURNING id",
+                &[&namespace, &age_days.to_string(), &(max as i64)],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get::<_, &str>("id").parse().ok())
+            .collect())
+    }
+
+    async fn purge_soft_deleted(
+        &self,
+        namespace: Option<&str>,
+        older_than_days: i64,
+        max: usize,
+        dry_run: bool,
+    ) -> StorageResult<Vec<Uuid>> {
+        let client = self.get_client().await?;
+        let ns_owned = namespace.map(|s| s.to_string());
+        let days = older_than_days.to_string();
+        let limit = max as i64;
+
+        let ns_clause = if ns_owned.is_some() {
+            " AND namespace = $2"
+        } else {
+            ""
+        };
+        let inner = format!(
+            "SELECT id FROM muninn.memory_entries
+             WHERE deleted_at IS NOT NULL
+               AND deleted_at < NOW() - ($1 || ' days')::interval{ns_clause}
+             ORDER BY deleted_at
+             LIMIT {limit}"
+        );
+
+        let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&days];
+        if let Some(ref ns) = ns_owned {
+            args.push(ns);
+        }
+
+        if dry_run {
+            let rows = client.query(&inner, &args).await.map_err(db_err)?;
+            return Ok(rows
+                .iter()
+                .filter_map(|r| r.get::<_, &str>("id").parse().ok())
+                .collect());
+        }
+
+        let sql = format!("DELETE FROM muninn.memory_entries WHERE id IN ({inner}) RETURNING id");
+        let rows = client.query(&sql, &args).await.map_err(db_err)?;
+
+        // Queue hygiene rides along: confirmed observations are fully
+        // processed and may predate enqueue-side redaction.
+        let _ = client
+            .execute(
+                "DELETE FROM muninn.pending_observations
+                 WHERE status = 'confirmed'
+                   AND created_at < NOW() - ($1 || ' days')::interval",
+                &[&days],
+            )
+            .await;
+
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get::<_, &str>("id").parse().ok())
+            .collect())
+    }
+
+    // ── Content-hash maintenance ──────────────────────────────
+
+    async fn list_missing_content_hash(
+        &self,
+        limit: usize,
+    ) -> StorageResult<Vec<(Uuid, String, String)>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT id, title, content FROM muninn.memory_entries
+                 WHERE content_hash IS NULL
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let id: &str = row.get("id");
+                let title: String = row.get("title");
+                let content: String = row.get("content");
+                id.parse().ok().map(|u| (u, title, content))
+            })
+            .collect())
+    }
+
+    async fn redact_entry_row(
+        &self,
+        id: Uuid,
+        title: &str,
+        content: &str,
+        tags: &[String],
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        let tags_vec: Vec<String> = tags.to_vec();
+        let hash = crate::storage::content_hash(title, content);
+        client
+            .execute(
+                "UPDATE muninn.memory_entries
+                 SET title = $1, content = $2, tags = $3, content_hash = $4, updated_at = NOW()
+                 WHERE id = $5",
+                &[&title, &content, &tags_vec, &hash, &id.to_string()],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn set_content_hash(&self, id: Uuid, hash: &str) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE muninn.memory_entries SET content_hash = $1 WHERE id = $2",
+                &[&hash, &id.to_string()],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn find_duplicate_clusters(
+        &self,
+        namespace: Option<&str>,
+    ) -> StorageResult<Vec<DuplicateCluster>> {
+        let client = self.get_client().await?;
+        let ns_owned = namespace.map(|s| s.to_string());
+        let ns_clause = if ns_owned.is_some() {
+            " AND namespace = $1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT e.content_hash, e.id, e.namespace, e.title, e.access_count, e.verified, e.created_at
+             FROM muninn.memory_entries e
+             JOIN (SELECT namespace, content_hash FROM muninn.memory_entries
+                   WHERE deleted_at IS NULL AND content_hash IS NOT NULL{ns_clause}
+                   GROUP BY namespace, content_hash HAVING COUNT(*) > 1) d
+               ON e.namespace = d.namespace AND e.content_hash = d.content_hash
+             WHERE e.deleted_at IS NULL
+             ORDER BY e.namespace, e.content_hash, e.access_count DESC, e.created_at DESC"
+        );
+        let rows = if let Some(ref ns) = ns_owned {
+            client.query(&sql, &[ns]).await.map_err(db_err)?
+        } else {
+            client.query(&sql, &[]).await.map_err(db_err)?
+        };
+
+        let mut clusters: Vec<DuplicateCluster> = Vec::new();
+        for row in &rows {
+            let hash: String = row.get("content_hash");
+            let id: &str = row.get("id");
+            let member = DupMember {
+                id: id.parse().unwrap_or_default(),
+                namespace: row.get("namespace"),
+                title: row.get("title"),
+                access_count: row.get::<_, i32>("access_count") as i64,
+                verified: row.get("verified"),
+                created_at: row.get("created_at"),
+            };
+            match clusters.last_mut() {
+                Some(c)
+                    if c.content_hash == hash
+                        && c.entries.first().map(|e| e.namespace.as_str())
+                            == Some(member.namespace.as_str()) =>
+                {
+                    c.entries.push(member);
+                }
+                _ => clusters.push(DuplicateCluster {
+                    content_hash: hash,
+                    entries: vec![member],
+                }),
+            }
+        }
+        Ok(clusters)
+    }
+
     // ── Verify ────────────────────────────────────────────────
 
     async fn mark_verified(
@@ -1227,9 +1682,8 @@ impl MemoryStorage for PostgresAdapter {
                        AND verified = FALSE
                        AND access_count = 0
                        AND confidence < $3
-                       AND last_accessed_at IS NOT NULL
-                       AND last_accessed_at < NOW() - ($4 || ' days')::interval
-                     ORDER BY last_accessed_at
+                       AND COALESCE(last_accessed_at, created_at) < NOW() - ($4 || ' days')::interval
+                     ORDER BY COALESCE(last_accessed_at, created_at)
                      LIMIT $5
                  )
                  RETURNING id",
@@ -1315,6 +1769,13 @@ impl MemoryStorage for PostgresAdapter {
     }
 
     async fn import_session(&self, session: Session) -> StorageResult<bool> {
+        // Same invariant repair as import_entry (see sqlite twin).
+        let mut session = session;
+        if let Some(ref pid) = session.project_id {
+            if !pid.is_empty() && session.namespace != *pid {
+                session.namespace = pid.clone();
+            }
+        }
         let client = self.get_client().await?;
         let status_str = serde_json::to_value(session.status)
             .unwrap()
@@ -1324,8 +1785,9 @@ impl MemoryStorage for PostgresAdapter {
         let affected = client
             .execute(
                 "INSERT INTO muninn.sessions
-                    (id, namespace, project_id, tool, goal, summary, status, started_at, ended_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    (id, namespace, project_id, tool, goal, summary, discoveries, files_modified,
+                     status, started_at, ended_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (id) DO NOTHING",
                 &[
                     &session.id.to_string(),
@@ -1334,6 +1796,8 @@ impl MemoryStorage for PostgresAdapter {
                     &session.tool,
                     &session.goal,
                     &session.summary,
+                    &session.discoveries,
+                    &session.files_modified,
                     &status_str,
                     &session.started_at,
                     &session.ended_at,
@@ -1732,6 +2196,13 @@ impl MemoryStorage for PostgresAdapter {
     }
 
     async fn import_entry(&self, entry: MemoryEntry) -> StorageResult<bool> {
+        // Re-apply the migration-012 invariant on import (see sqlite twin).
+        let mut entry = entry;
+        if let Some(ref pid) = entry.project_id {
+            if !pid.is_empty() && entry.namespace != *pid {
+                entry.namespace = pid.clone();
+            }
+        }
         let client = self.get_client().await?;
         let source_str = serde_json::to_value(entry.source)
             .unwrap()

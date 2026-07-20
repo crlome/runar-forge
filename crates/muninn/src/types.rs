@@ -110,6 +110,9 @@ pub enum DebugEvent {
     DedupDecision,
     TouchPromotion,
     HookTiming,
+    /// A context packet was served (PreToolUse hook or muninn_context):
+    /// which entries were injected, how many, how large, how long it took.
+    Injection,
 }
 
 // ── Core Data Structures ───────────────────────────────────────────
@@ -239,6 +242,10 @@ pub struct ListFilters {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Include soft-deleted rows. Maintenance-only (scrub must be able to
+    /// redact tombstones); every normal read leaves this false.
+    #[serde(default)]
+    pub include_deleted: bool,
 }
 
 // ── Sessions ───────────────────────────────────────────────────────
@@ -252,6 +259,10 @@ pub struct Session {
     pub tool: Option<String>,
     pub goal: Option<String>,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub discoveries: Vec<String>,
+    #[serde(default)]
+    pub files_modified: Vec<String>,
     pub status: SessionStatus,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -329,6 +340,10 @@ pub struct SessionUpdate {
     pub ended_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub files_modified: Option<Vec<String>>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub discoveries: Option<Vec<String>>,
 }
 
 // ── Edges / Relationships ──────────────────────────────────────────
@@ -367,6 +382,8 @@ pub struct DebugLogEntry {
     pub event: DebugEvent,
     pub entry_id: Option<Uuid>,
     pub data: serde_json::Value,
+    #[serde(default)]
+    pub duration_ms: Option<f64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -377,6 +394,8 @@ pub struct DebugLogInput {
     #[serde(default)]
     pub entry_id: Option<Uuid>,
     pub data: serde_json::Value,
+    #[serde(default)]
+    pub duration_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -404,6 +423,27 @@ pub struct MemoryStats {
     pub namespaces: Vec<String>,
 }
 
+/// Per-namespace slice of the cross-namespace aggregate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamespaceStats {
+    pub namespace: String,
+    pub entries: i64,
+    pub sessions: i64,
+}
+
+/// Whole-database stats: totals across every namespace, plus the
+/// per-namespace breakdown. `muninn_stats` without arguments returns this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalStats {
+    pub total_entries: i64,
+    pub total_sessions: i64,
+    pub entries_by_type: Vec<(String, i64)>,
+    pub entries_by_layer: Vec<(u8, i64)>,
+    pub by_namespace: Vec<NamespaceStats>,
+}
+
 // ── Save Result ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +469,9 @@ pub enum SaveAction {
     Created,
     Updated,
     Rejected,
+    /// An identical live entry (same namespace + content hash) already
+    /// exists; nothing was inserted. `SaveResult.id` is the existing row.
+    Duplicate,
 }
 
 // ── Merge Counts ───────────────────────────────────────────────────
@@ -438,6 +481,26 @@ pub enum SaveAction {
 pub struct MergeCounts {
     pub entries: i64,
     pub sessions: i64,
+}
+
+/// One member of a duplicate-content cluster (see `find_duplicate_clusters`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DupMember {
+    pub id: Uuid,
+    pub namespace: String,
+    pub title: String,
+    pub access_count: i64,
+    pub verified: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Live rows sharing `(namespace, content_hash)`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateCluster {
+    pub content_hash: String,
+    pub entries: Vec<DupMember>,
 }
 
 // ── Decay Configuration ────────────────────────────────────────────

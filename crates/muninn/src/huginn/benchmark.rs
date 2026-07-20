@@ -524,6 +524,72 @@ fn summarize(results: &[QuestionResult]) -> BenchmarkSummary {
 mod tests {
     use super::*;
 
+    /// Regression guard for the namespace-scoping bug family: before the
+    /// fix, every project benchmarked against the 'default' namespace and
+    /// produced byte-identical results. Two projects seeded with disjoint
+    /// content must now produce different answers.
+    #[tokio::test]
+    async fn benchmark_differentiates_projects() {
+        use crate::embedding::DisabledEmbeddingProvider;
+        use crate::librarian::MemoryLibrarian;
+        use crate::storage::sqlite::SqliteAdapter;
+        use crate::storage::MemoryStorage;
+        use crate::types::{EntryType, MemoryEntryInput};
+
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let lib = Arc::new(MemoryLibrarian::new(
+            storage,
+            Arc::new(DisabledEmbeddingProvider),
+            "test",
+            None,
+        ));
+
+        for (pid, title, content) in [
+            (
+                "proj_a",
+                "proj_a architecture overview",
+                "proj_a is a layered monorepo with core, api and web packages. \
+                 Tests use the vitest framework. Storage is postgres.",
+            ),
+            (
+                "proj_b",
+                "proj_b architecture overview",
+                "proj_b is an event-driven set of microservices on kafka. \
+                 Tests use pytest. Storage is dynamodb.",
+            ),
+        ] {
+            lib.propose(MemoryEntryInput {
+                title: title.into(),
+                content: content.into(),
+                entry_type: EntryType::Architecture,
+                project_id: Some(pid.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+
+        let curator = Arc::new(CuratorOracle::new(lib));
+        let a = run(&curator, "proj_a", true).await.unwrap();
+        let b = run(&curator, "proj_b", true).await.unwrap();
+
+        let answers_a: Vec<&str> = a
+            .question_results
+            .iter()
+            .map(|r| r.answer.as_str())
+            .collect();
+        let answers_b: Vec<&str> = b
+            .question_results
+            .iter()
+            .map(|r| r.answer.as_str())
+            .collect();
+        assert_ne!(
+            answers_a, answers_b,
+            "benchmark must reflect per-project memory, not a shared namespace"
+        );
+    }
+
     fn answer(s: &str, conf: f64, cites: usize, has: bool) -> CuratorAnswer {
         CuratorAnswer {
             question: "q".into(),

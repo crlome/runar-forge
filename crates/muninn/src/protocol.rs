@@ -162,6 +162,57 @@ pub fn is_trivial_prompt(s: &str) -> bool {
     )
 }
 
+/// True when a UserPromptSubmit payload is machine-generated (IDE selection
+/// dumps, slash-command expansions, task notifications) or a bulk log paste
+/// rather than a genuinely typed user prompt. Claude Code sends everything
+/// through the same flat `prompt` field, so detection is textual.
+pub fn is_machine_generated_prompt(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "<system-reminder>",
+        "<task-notification>",
+        "<task_notification>",
+        "<command-name>",
+        "<command-message>",
+        "<local-command-stdout>",
+        "<ide_selection>",
+        "the user selected the following lines",
+        "the user opened the file",
+        "[pasted text #",
+    ];
+    if MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+
+    // Bulk log-paste heuristic: mostly log-shaped lines. A typed question
+    // with a pasted error stays under the ratio bar.
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() > 30 {
+        let log_like = lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.len() >= 10
+                    && (t.starts_with("at ")
+                        || t.starts_with('[')
+                        || t.chars()
+                            .take(10)
+                            .collect::<String>()
+                            .matches(|c: char| c.is_ascii_digit())
+                            .count()
+                            >= 6
+                        || ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
+                            .iter()
+                            .any(|lvl| t.starts_with(lvl) || t.get(1..1 + lvl.len()) == Some(lvl)))
+            })
+            .count();
+        if log_like * 100 > lines.len() * 80 {
+            return true;
+        }
+    }
+    false
+}
+
 /// First-message payload when no ping file exists (Claude's first prompt).
 pub fn first_message_reminder() -> String {
     "CRITICAL FIRST ACTION: Before responding to the user, \
@@ -208,6 +259,43 @@ pub fn parse_user_prompt(stdin_payload: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_generated_markers_detected() {
+        let cases = [
+            "<system-reminder>recalled memory blah</system-reminder> plus text",
+            "context: <task-notification>done</task-notification>",
+            "<command-name>/model</command-name><command-message>model</command-message>",
+            "<local-command-stdout>Set model</local-command-stdout>",
+            "The user selected the following lines from src/app.ts: 10-20",
+            "notes [Pasted text #1 +422 lines]",
+            "<ide_selection>fn main() {}</ide_selection>",
+        ];
+        for case in cases {
+            assert!(is_machine_generated_prompt(case), "should detect: {case}");
+        }
+    }
+
+    #[test]
+    fn genuine_prompts_pass_machine_filter() {
+        assert!(!is_machine_generated_prompt(
+            "can you refactor the auth middleware to use the new token validator?"
+        ));
+        // Typed question with a short pasted error stays under the ratio bar.
+        let mixed = "why does the build fail with this?\n\nERROR in ./src/index.ts\nModule not found: ./missing";
+        assert!(!is_machine_generated_prompt(mixed));
+    }
+
+    #[test]
+    fn bulk_log_paste_detected() {
+        let mut paste = String::new();
+        for i in 0..50 {
+            paste.push_str(&format!(
+                "2026-07-19T10:00:{i:02}Z ERROR service failed to connect attempt {i}\n"
+            ));
+        }
+        assert!(is_machine_generated_prompt(&paste));
+    }
 
     #[test]
     fn protocol_includes_project_id() {

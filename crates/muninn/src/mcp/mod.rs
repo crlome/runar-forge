@@ -145,6 +145,15 @@ pub async fn run_stdio_server(
     librarian: Arc<MemoryLibrarian>,
     curator: Arc<CuratorOracle>,
 ) -> anyhow::Result<()> {
+    // Bound debug-log growth without a scheduler: best-effort 7-day prune
+    // at every server start.
+    {
+        let lib = librarian.clone();
+        tokio::spawn(async move {
+            let _ = lib.prune_debug_log(7).await;
+        });
+    }
+
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
@@ -284,7 +293,7 @@ async fn handle_tool_call(
         "muninn_session_start" => tool_session_start(args, librarian, last_session_id).await,
         "muninn_session_end" => tool_session_end(args, librarian, last_session_id).await,
         "muninn_related" => tool_related(args, librarian).await,
-        "muninn_stats" => tool_stats(librarian).await,
+        "muninn_stats" => tool_stats(args, librarian).await,
         "muninn_merge_projects" => tool_merge_projects(args, librarian).await,
         "muninn_debug" => tool_debug(args, librarian).await,
         "curator_ask" => tool_curator_ask(args, curator).await,
@@ -417,6 +426,7 @@ async fn tool_capture_passive(args: &Value, lib: &MemoryLibrarian) -> Result<Str
                 SaveAction::Created => "saved",
                 SaveAction::Updated => "updated",
                 SaveAction::Rejected => "rejected",
+                SaveAction::Duplicate => "duplicate",
             };
             serde_json::json!({
                 "id": r.id.to_string(),
@@ -468,8 +478,13 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let effective_topic_key =
-        topic_key.unwrap_or_else(|| suggest_topic_key(entry_type.as_str(), &title));
+    // Derive the fallback key from the REDACTED title, or a secret pasted
+    // into the title survives inside topic_key after propose scrubs the
+    // title itself.
+    let effective_topic_key = topic_key.unwrap_or_else(|| {
+        let (clean_title, _) = crate::redact::redact_secrets(&title);
+        suggest_topic_key(entry_type.as_str(), &clean_title)
+    });
 
     let confidence = resolve_confidence(args.get("confidence"));
 
@@ -492,6 +507,7 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         SaveAction::Updated => "updated",
         SaveAction::Rejected => "rejected",
         SaveAction::Created => "saved",
+        SaveAction::Duplicate => "duplicate",
     };
 
     let mut response = serde_json::json!({
@@ -920,25 +936,85 @@ async fn tool_related(args: &Value, lib: &MemoryLibrarian) -> Result<String, Str
     .to_string())
 }
 
-async fn tool_stats(lib: &MemoryLibrarian) -> Result<String, String> {
-    let stats = lib.get_stats(None).await.map_err(|e| e.to_string())?;
+async fn tool_stats(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let project_id = args.get("projectId").and_then(|v| v.as_str());
+    let namespace = args.get("namespace").and_then(|v| v.as_str());
 
+    // Explicit scope (projectId acts as the namespace, matching the write
+    // invariant) → single-namespace stats. No scope → global aggregate.
+    if let Some(scope) = namespace.or(project_id) {
+        let stats = lib
+            .get_stats(Some(scope))
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({
+            "scope": scope,
+            "totalEntries": stats.total_entries,
+            "totalSessions": stats.total_sessions,
+            "entriesByType": stats.entries_by_type,
+            "entriesByLayer": stats.entries_by_layer,
+            "namespaces": stats.namespaces,
+        })
+        .to_string());
+    }
+
+    let stats = lib.get_stats_global().await.map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
+        "scope": "all",
         "totalEntries": stats.total_entries,
         "totalSessions": stats.total_sessions,
         "entriesByType": stats.entries_by_type,
         "entriesByLayer": stats.entries_by_layer,
-        "namespaces": stats.namespaces,
+        "byNamespace": stats.by_namespace,
     })
     .to_string())
 }
 
 async fn tool_debug(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
-    // For now, return a simple message
-    let _ = args;
-    let _ = lib;
+    if args.get("prune").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let pruned = lib.prune_debug_log(7).await.map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({ "pruned": pruned }).to_string());
+    }
+
+    let event = match args.get("event").and_then(|v| v.as_str()) {
+        Some(s) => Some(
+            serde_json::from_value::<DebugEvent>(serde_json::Value::String(s.to_string()))
+                .map_err(|_| format!("unknown event type: {s}"))?,
+        ),
+        None => None,
+    };
+    let entry_id = args
+        .get("entryId")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let since = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    let entries = lib
+        .query_debug_log(DebugLogQuery {
+            event,
+            entry_id,
+            since,
+            limit,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let logging_active = crate::debug::enabled();
     Ok(serde_json::json!({
-        "message": "debug log not yet fully implemented in Rust binary"
+        "loggingEnabled": logging_active,
+        "note": if logging_active { serde_json::Value::Null } else {
+            serde_json::json!("logging disabled — set RUNAR_DEBUG=true (and restart the MCP server) to record events")
+        },
+        "count": entries.len(),
+        "entries": entries,
     })
     .to_string())
 }
@@ -1263,9 +1339,18 @@ async fn tool_huginn_recrawl_file(
     let analysis = file_analyzer::analyze_file(&entry, AnalysisDepth::Deep, &graph);
 
     let mut saved = 0usize;
+    let mut duplicates = 0usize;
+    let mut superseded = 0usize;
     for input in memory_entry_generator::file_entries(&analysis, project_id) {
-        if librarian.propose(input).await.is_ok() {
-            saved += 1;
+        if let Ok(result) = librarian.propose(input).await {
+            match result.action {
+                SaveAction::Duplicate => duplicates += 1,
+                SaveAction::Updated => {
+                    saved += 1;
+                    superseded += 1;
+                }
+                _ => saved += 1,
+            }
         }
     }
 
@@ -1274,6 +1359,8 @@ async fn tool_huginn_recrawl_file(
         "projectId": project_id,
         "depth": format!("{:?}", analysis.depth),
         "entriesSaved": saved,
+        "duplicates": duplicates,
+        "superseded": superseded,
     })
     .to_string())
 }
@@ -1483,10 +1570,13 @@ fn tool_definitions() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: "muninn_stats".into(),
-            description: "Get memory system statistics.".into(),
+            description: "Get memory system statistics. Without arguments: totals across every namespace plus a per-namespace breakdown. Pass projectId (or namespace) to scope to one project.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "projectId": { "type": "string", "description": "Scope stats to this project (its namespace)" },
+                    "namespace": { "type": "string", "description": "Explicit namespace override (rarely needed)" },
+                },
             }),
         },
         ToolInfo {
@@ -1509,7 +1599,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "event": { "type": "string", "enum": ["search_scoring", "decay_compute", "auto_link", "layer_graduation", "dedup_decision", "touch_promotion", "hook_timing"], "description": "Filter by event type" },
+                    "event": { "type": "string", "enum": ["search_scoring", "decay_compute", "auto_link", "layer_graduation", "dedup_decision", "touch_promotion", "hook_timing", "injection"], "description": "Filter by event type" },
                     "limit": { "type": "number", "description": "Max entries (default: 20)" },
                     "since": { "type": "string", "description": "ISO timestamp" },
                     "entryId": { "type": "string", "description": "Filter by entry ID" },

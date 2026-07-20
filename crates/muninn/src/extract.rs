@@ -353,6 +353,11 @@ pub struct ExtractState {
     pub save_count: u32,
     #[serde(default)]
     pub last_save_ts: Option<i64>,
+    /// Claude Code session this state belongs to. The state file lives in
+    /// temp_dir and never rotates on its own — without this marker the
+    /// MAX_AUTO_SAVES_PER_SESSION cap was effectively a lifetime cap.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 pub fn extract_state_path(project_id: &str) -> std::path::PathBuf {
@@ -753,6 +758,7 @@ mod tests {
             topic_keys_saved: vec!["bugfix:auth:abc123".into()],
             save_count: 1,
             last_save_ts: Some(0),
+            session_id: None,
         };
         let filtered = dedup_insights(vec![insight], &state, 100_000);
         assert!(filtered.is_empty());
@@ -772,6 +778,7 @@ mod tests {
             topic_keys_saved: vec![],
             save_count: MAX_AUTO_SAVES_PER_SESSION,
             last_save_ts: Some(0),
+            session_id: None,
         };
         let filtered = dedup_insights(vec![insight], &state, 100_000);
         assert!(filtered.is_empty());
@@ -792,6 +799,7 @@ mod tests {
             topic_keys_saved: vec![],
             save_count: 0,
             last_save_ts: Some(now - 10_000), // 10s ago, below 30s min
+            session_id: None,
         };
         let filtered = dedup_insights(vec![insight], &state, now);
         assert!(filtered.is_empty());

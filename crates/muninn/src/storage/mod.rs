@@ -5,13 +5,31 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::types::{
-    ApplyOutcome, DebugLogEntry, DebugLogInput, DebugLogQuery, ListFilters, MemoryEdge,
-    MemoryEdgeInput, MemoryEntry, MemoryEntryInput, MemoryStats, MergeCounts, ObservationInput,
-    OutboxInput, OutboxRow, PendingObservation, SaveResult, SearchQuery, Session, SessionInput,
-    SessionUpdate, SyncConflict, SyncState,
+    ApplyOutcome, DebugLogEntry, DebugLogInput, DebugLogQuery, DuplicateCluster, GlobalStats,
+    ListFilters, MemoryEdge, MemoryEdgeInput, MemoryEntry, MemoryEntryInput, MemoryStats,
+    MergeCounts, ObservationInput, OutboxInput, OutboxRow, PendingObservation, SaveResult,
+    SearchQuery, Session, SessionInput, SessionUpdate, SyncConflict, SyncState,
 };
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+/// SHA-256 hex over normalized title+content — the exact-duplicate guard
+/// used by `save`. Normalization is deliberately conservative (lowercase,
+/// trim, collapse whitespace runs) so only true restatements collapse.
+pub fn content_hash(title: &str, content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    fn normalize(s: &str) -> String {
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(normalize(title).as_bytes());
+    hasher.update(b"\n");
+    hasher.update(normalize(content).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -38,6 +56,12 @@ pub trait MemoryStorage: Send + Sync {
     async fn save(&self, input: MemoryEntryInput, namespace: &str) -> StorageResult<SaveResult>;
     async fn get(&self, id: Uuid) -> StorageResult<MemoryEntry>;
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry>;
+
+    /// Record retrieval of the given entries in one atomic statement:
+    /// server-side `access_count + 1`, stamp `last_accessed_at`, and promote
+    /// colder-than-EPISODIC layers to EPISODIC. Returns rows touched.
+    /// Replaces the old per-entry get-then-update (racy) fire-and-forget.
+    async fn touch_entries(&self, ids: &[Uuid]) -> StorageResult<i64>;
     async fn delete(&self, id: Uuid) -> StorageResult<()>;
     async fn list(&self, filters: ListFilters) -> StorageResult<Vec<MemoryEntry>>;
 
@@ -46,12 +70,13 @@ pub trait MemoryStorage: Send + Sync {
 
     // ── Search ─────────────────────────────────────────────────
     async fn search(&self, query: SearchQuery) -> StorageResult<Vec<MemoryEntry>>;
+    /// Cosine-similarity search. `filters.query` is unused; the struct
+    /// carries namespace/limit/entry_type/project_id so both search arms
+    /// apply identical predicates.
     async fn semantic_search(
         &self,
-        query: &str,
         embedding: &[f32],
-        limit: usize,
-        namespace: &str,
+        filters: SearchQuery,
     ) -> StorageResult<Vec<MemoryEntry>>;
     async fn fts_search(&self, query: SearchQuery) -> StorageResult<Vec<MemoryEntry>>;
 
@@ -77,6 +102,11 @@ pub trait MemoryStorage: Send + Sync {
 
     // ── Stats ──────────────────────────────────────────────────
     async fn get_stats(&self, namespace: &str) -> StorageResult<MemoryStats>;
+
+    /// Cross-namespace aggregate: unfiltered totals plus a per-namespace
+    /// entry/session breakdown. The single-namespace `get_stats` cannot see
+    /// per-project data (namespace == project_id by write invariant).
+    async fn get_stats_all(&self) -> StorageResult<GlobalStats>;
 
     // ── Admin ──────────────────────────────────────────────────
     /// Count live entries + sessions with `project_id = source` or
@@ -120,12 +150,46 @@ pub trait MemoryStorage: Send + Sync {
     async fn recover_stale_observations(&self, older_than_secs: i64) -> StorageResult<i64>;
 
     /// Return true if any `pending_observations` row with this hash exists
-    /// newer than `window_secs`. Used for 30-sec SHA256 dedup on enqueue.
+    /// newer than `window_secs`. Used for the 30-sec enqueue dedup window.
+    /// (The hash here is `extract::short_hash_public` — a truncated
+    /// non-cryptographic hash, distinct from `content_hash()` used on
+    /// `memory_entries`.)
     async fn check_observation_duplicate(
         &self,
         content_hash: &str,
         window_secs: i64,
     ) -> StorageResult<bool>;
+
+    // ── Content-hash maintenance (dedup backfill/cleanup) ──────
+
+    /// Rows still lacking `content_hash`: `(id, title, content)`, batched.
+    /// Covers live AND soft-deleted rows so cluster detection is complete.
+    async fn list_missing_content_hash(
+        &self,
+        limit: usize,
+    ) -> StorageResult<Vec<(Uuid, String, String)>>;
+
+    /// Set `content_hash` directly, without touching `updated_at`.
+    async fn set_content_hash(&self, id: Uuid, hash: &str) -> StorageResult<()>;
+
+    /// Live rows sharing a `(namespace, content_hash)` value, grouped into
+    /// clusters of 2+ members. `namespace = None` scans all namespaces.
+    async fn find_duplicate_clusters(
+        &self,
+        namespace: Option<&str>,
+    ) -> StorageResult<Vec<DuplicateCluster>>;
+
+    /// Maintenance-only (`runar scrub`): overwrite title/content/tags and
+    /// refresh `content_hash` regardless of `deleted_at`, so credential
+    /// tombstones can be redacted too. The guarded FTS triggers keep the
+    /// index correct for both live and deleted rows.
+    async fn redact_entry_row(
+        &self,
+        id: Uuid,
+        title: &str,
+        content: &str,
+        tags: &[String],
+    ) -> StorageResult<()>;
 
     // ── Human-in-loop verification (A10) ──────────────────────
 
@@ -157,6 +221,33 @@ pub trait MemoryStorage: Send + Sync {
         age_days: i64,
         conf_cap: f32,
         max: usize,
+    ) -> StorageResult<Vec<Uuid>>;
+
+    // ── Two-stage GC ───────────────────────────────────────────
+
+    /// GC stage 1: soft-delete never-accessed crawl-origin entries older
+    /// than `age_days`. Crawl-origin = `source = 'scout'`; Human/System/
+    /// Agent and verified rows are excluded by construction. `dry_run`
+    /// returns the candidate ids without mutating.
+    async fn soft_delete_stale_crawl(
+        &self,
+        namespace: &str,
+        age_days: i64,
+        max: usize,
+        dry_run: bool,
+    ) -> StorageResult<Vec<Uuid>>;
+
+    /// GC stage 2: hard-purge rows soft-deleted longer than
+    /// `older_than_days` ago. `namespace = None` purges all namespaces.
+    /// FK CASCADE removes embeddings + edges; the guarded FTS triggers keep
+    /// the index consistent. Irreversible — callers gate on explicit
+    /// confirmation. `dry_run` returns candidates without mutating.
+    async fn purge_soft_deleted(
+        &self,
+        namespace: Option<&str>,
+        older_than_days: i64,
+        max: usize,
+        dry_run: bool,
     ) -> StorageResult<Vec<Uuid>>;
 
     /// List every edge across the DB up to `limit`. Used by `runar export`
