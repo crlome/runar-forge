@@ -943,7 +943,10 @@ async fn tool_stats(args: &Value, lib: &MemoryLibrarian) -> Result<String, Strin
     // Explicit scope (projectId acts as the namespace, matching the write
     // invariant) → single-namespace stats. No scope → global aggregate.
     if let Some(scope) = namespace.or(project_id) {
-        let stats = lib.get_stats(Some(scope)).await.map_err(|e| e.to_string())?;
+        let stats = lib
+            .get_stats(Some(scope))
+            .await
+            .map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({
             "scope": scope,
             "totalEntries": stats.total_entries,

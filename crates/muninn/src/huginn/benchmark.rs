@@ -574,8 +574,16 @@ mod tests {
         let a = run(&curator, "proj_a", true).await.unwrap();
         let b = run(&curator, "proj_b", true).await.unwrap();
 
-        let answers_a: Vec<&str> = a.question_results.iter().map(|r| r.answer.as_str()).collect();
-        let answers_b: Vec<&str> = b.question_results.iter().map(|r| r.answer.as_str()).collect();
+        let answers_a: Vec<&str> = a
+            .question_results
+            .iter()
+            .map(|r| r.answer.as_str())
+            .collect();
+        let answers_b: Vec<&str> = b
+            .question_results
+            .iter()
+            .map(|r| r.answer.as_str())
+            .collect();
         assert_ne!(
             answers_a, answers_b,
             "benchmark must reflect per-project memory, not a shared namespace"

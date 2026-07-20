@@ -966,9 +966,7 @@ impl MemoryStorage for PostgresAdapter {
                     event,
                     entry_id: entry_id_opt.and_then(|s| s.parse().ok()),
                     data: row.get("data"),
-                    duration_ms: row
-                        .get::<_, Option<f32>>("duration_ms")
-                        .map(|v| v as f64),
+                    duration_ms: row.get::<_, Option<f32>>("duration_ms").map(|v| v as f64),
                     created_at: row.get("created_at"),
                 }
             })
@@ -1120,7 +1118,11 @@ impl MemoryStorage for PostgresAdapter {
             let ns: String = row.get::<_, &str>(0).to_string();
             by_ns
                 .entry(ns.clone())
-                .or_insert(NamespaceStats { namespace: ns, entries: 0, sessions: 0 })
+                .or_insert(NamespaceStats {
+                    namespace: ns,
+                    entries: 0,
+                    sessions: 0,
+                })
                 .entries = row.get::<_, i64>(1);
         }
         for row in client
@@ -1134,7 +1136,11 @@ impl MemoryStorage for PostgresAdapter {
             let ns: String = row.get::<_, &str>(0).to_string();
             by_ns
                 .entry(ns.clone())
-                .or_insert(NamespaceStats { namespace: ns, entries: 0, sessions: 0 })
+                .or_insert(NamespaceStats {
+                    namespace: ns,
+                    entries: 0,
+                    sessions: 0,
+                })
                 .sessions = row.get::<_, i64>(1);
         }
         let mut by_namespace: Vec<NamespaceStats> = by_ns.into_values().collect();
@@ -1459,7 +1465,11 @@ impl MemoryStorage for PostgresAdapter {
         let days = older_than_days.to_string();
         let limit = max as i64;
 
-        let ns_clause = if ns_owned.is_some() { " AND namespace = $2" } else { "" };
+        let ns_clause = if ns_owned.is_some() {
+            " AND namespace = $2"
+        } else {
+            ""
+        };
         let inner = format!(
             "SELECT id FROM muninn.memory_entries
              WHERE deleted_at IS NOT NULL
@@ -1481,9 +1491,7 @@ impl MemoryStorage for PostgresAdapter {
                 .collect());
         }
 
-        let sql = format!(
-            "DELETE FROM muninn.memory_entries WHERE id IN ({inner}) RETURNING id"
-        );
+        let sql = format!("DELETE FROM muninn.memory_entries WHERE id IN ({inner}) RETURNING id");
         let rows = client.query(&sql, &args).await.map_err(db_err)?;
 
         // Queue hygiene rides along: confirmed observations are fully
@@ -1570,7 +1578,11 @@ impl MemoryStorage for PostgresAdapter {
     ) -> StorageResult<Vec<DuplicateCluster>> {
         let client = self.get_client().await?;
         let ns_owned = namespace.map(|s| s.to_string());
-        let ns_clause = if ns_owned.is_some() { " AND namespace = $1" } else { "" };
+        let ns_clause = if ns_owned.is_some() {
+            " AND namespace = $1"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT e.content_hash, e.id, e.namespace, e.title, e.access_count, e.verified, e.created_at
              FROM muninn.memory_entries e

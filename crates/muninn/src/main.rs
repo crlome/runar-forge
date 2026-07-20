@@ -710,10 +710,7 @@ async fn rotate_or_create_session(lib: &librarian::MemoryLibrarian, project_id: 
                 summary: summary_text,
                 // Preserve a real goal captured from the user's first prompt;
                 // never persist the auto-start placeholder as the outcome.
-                goal: session
-                    .goal
-                    .clone()
-                    .filter(|g| g != "Auto-started session"),
+                goal: session.goal.clone().filter(|g| g != "Auto-started session"),
                 files_modified: files.clone(),
                 ..Default::default()
             };
@@ -1286,7 +1283,9 @@ async fn run_gc(
     // Stage 2 — permanent purge of old tombstones.
     if hard {
         if !dry_run && !yes {
-            let candidates = lib.gc_purge(None, hard_age_days, GC_BATCH_MAX, true).await?;
+            let candidates = lib
+                .gc_purge(None, hard_age_days, GC_BATCH_MAX, true)
+                .await?;
             println!(
                 "--hard would PERMANENTLY delete {} rows soft-deleted more than {hard_age_days} days ago \
                  (entries + FTS + edges + embeddings, all namespaces).",
@@ -1297,7 +1296,9 @@ async fn run_gc(
             );
             return Ok(());
         }
-        let ids = lib.gc_purge(None, hard_age_days, GC_BATCH_MAX, dry_run).await?;
+        let ids = lib
+            .gc_purge(None, hard_age_days, GC_BATCH_MAX, dry_run)
+            .await?;
         if dry_run {
             println!(
                 "Stage 2 dry-run: {} tombstones older than {hard_age_days}d would be purged permanently.",
@@ -1597,7 +1598,10 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
         prompt.to_string()
     };
     let content = if prompt.chars().count() > MAX_PROMPT_CONTENT_CHARS {
-        format!("{}…[truncated]", char_prefix(prompt, MAX_PROMPT_CONTENT_CHARS))
+        format!(
+            "{}…[truncated]",
+            char_prefix(prompt, MAX_PROMPT_CONTENT_CHARS)
+        )
     } else {
         prompt.to_string()
     };
@@ -1877,9 +1881,9 @@ async fn main() -> anyhow::Result<()> {
             configure,
         } => {
             let _ = with_auto_capture; // deprecated no-op, kept for old scripts
-            // Default ON with a persisted opt-out: re-running setup without
-            // flags used to silently delete the enqueue/summarize hooks —
-            // the reason auto-capture died on 2026-05-04.
+                                       // Default ON with a persisted opt-out: re-running setup without
+                                       // flags used to silently delete the enqueue/summarize hooks —
+                                       // the reason auto-capture died on 2026-05-04.
             let auto_capture = if no_auto_capture {
                 false
             } else {
@@ -2023,11 +2027,8 @@ async fn main() -> anyhow::Result<()> {
                             .await;
                         }
                     };
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(150),
-                        telemetry,
-                    )
-                    .await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(150), telemetry)
+                        .await;
                 }
             }
             if silent {
@@ -2278,8 +2279,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
         } => {
             let lib = create_librarian().await?;
-            let report =
-                maintenance::run_scrub(&lib, project.as_deref(), dry_run, limit).await?;
+            let report = maintenance::run_scrub(&lib, project.as_deref(), dry_run, limit).await?;
             let mode = if dry_run { "dry-run" } else { "rewrite" };
             println!("Scrub ({mode}): scanned {} entries.", report.scanned);
             if report.hits_by_kind.is_empty() {
@@ -2292,7 +2292,10 @@ async fn main() -> anyhow::Result<()> {
                 if dry_run {
                     println!("\nRe-run without --dry-run to rewrite these entries in place.");
                 } else {
-                    println!("\nRewrote {} entries (FTS reindexed, hashes refreshed).", report.rewritten);
+                    println!(
+                        "\nRewrote {} entries (FTS reindexed, hashes refreshed).",
+                        report.rewritten
+                    );
                     println!("Rotate any credentials that appeared here — redaction does not un-leak them.");
                 }
             }
@@ -2316,7 +2319,10 @@ async fn main() -> anyhow::Result<()> {
             let lib = create_librarian().await?;
             let report =
                 maintenance::run_dedup(&lib, project.as_deref(), dry_run, backfill_only).await?;
-            println!("Dedup: backfilled content_hash on {} rows.", report.backfilled);
+            println!(
+                "Dedup: backfilled content_hash on {} rows.",
+                report.backfilled
+            );
             if backfill_only {
                 println!("Backfill-only mode: no clusters were evaluated.");
             } else {

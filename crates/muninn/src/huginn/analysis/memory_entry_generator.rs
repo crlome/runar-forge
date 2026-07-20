@@ -98,7 +98,11 @@ pub fn pattern_entry(pattern: &CrossFilePattern, project_id: &str) -> MemoryEntr
             pattern.name.clone(),
         ],
         project_id: Some(project_id.into()),
-        topic_key: Some(format!("scout:pattern:{}:{}", project_id, slug(&pattern.name))),
+        topic_key: Some(format!(
+            "scout:pattern:{}:{}",
+            project_id,
+            slug(&pattern.name)
+        )),
         ..Default::default()
     }
 }

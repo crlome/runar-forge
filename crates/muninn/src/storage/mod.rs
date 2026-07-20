@@ -19,7 +19,10 @@ pub type StorageResult<T> = Result<T, StorageError>;
 pub fn content_hash(title: &str, content: &str) -> String {
     use sha2::{Digest, Sha256};
     fn normalize(s: &str) -> String {
-        s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     let mut hasher = Sha256::new();
     hasher.update(normalize(title).as_bytes());

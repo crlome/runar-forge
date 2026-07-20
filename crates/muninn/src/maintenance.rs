@@ -230,7 +230,10 @@ mod tests {
         assert_eq!(report.hits_by_kind.get("keyed-secret"), Some(&1));
         assert_eq!(report.rewritten, 0);
         let entry = lib.get(r.id).await.unwrap();
-        assert!(entry.content.contains("Sup3rS3cret99"), "dry-run must not mutate");
+        assert!(
+            entry.content.contains("Sup3rS3cret99"),
+            "dry-run must not mutate"
+        );
 
         let report = run_scrub(&lib, None, false, 1000).await.unwrap();
         assert_eq!(report.rewritten, 1);
@@ -290,7 +293,10 @@ mod tests {
 
         let report = run_dedup(&lib, None, false, false).await.unwrap();
         assert_eq!(report.soft_deleted, 1);
-        assert!(lib.get(ids[0]).await.is_ok(), "most-accessed keeper survives");
+        assert!(
+            lib.get(ids[0]).await.is_ok(),
+            "most-accessed keeper survives"
+        );
         assert!(lib.get(ids[1]).await.is_err(), "loser soft-deleted");
         assert!(lib.get(ids[2]).await.is_ok(), "unique row untouched");
     }

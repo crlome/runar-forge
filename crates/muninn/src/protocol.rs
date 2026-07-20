@@ -195,7 +195,12 @@ pub fn is_machine_generated_prompt(s: &str) -> bool {
                 t.len() >= 10
                     && (t.starts_with("at ")
                         || t.starts_with('[')
-                        || t.chars().take(10).collect::<String>().matches(|c: char| c.is_ascii_digit()).count() >= 6
+                        || t.chars()
+                            .take(10)
+                            .collect::<String>()
+                            .matches(|c: char| c.is_ascii_digit())
+                            .count()
+                            >= 6
                         || ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
                             .iter()
                             .any(|lvl| t.starts_with(lvl) || t.get(1..1 + lvl.len()) == Some(lvl)))

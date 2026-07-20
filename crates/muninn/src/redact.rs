@@ -79,16 +79,35 @@ static WHOLE_MATCH: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     vec![
         (
             "pem-key",
-            Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)").unwrap(),
+            Regex::new(
+                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
+            )
+            .unwrap(),
         ),
-        ("github-token", Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b").unwrap()),
-        ("github-token", Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b").unwrap()),
-        ("aws-key-id", Regex::new(r"\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b").unwrap()),
-        ("atlassian-token", Regex::new(r"\bATATT[A-Za-z0-9_\-=]{20,}\b").unwrap()),
-        ("slack-token", Regex::new(r"\bxox[abpos]-[A-Za-z0-9-]{10,}\b").unwrap()),
+        (
+            "github-token",
+            Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b").unwrap(),
+        ),
+        (
+            "github-token",
+            Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b").unwrap(),
+        ),
+        (
+            "aws-key-id",
+            Regex::new(r"\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b").unwrap(),
+        ),
+        (
+            "atlassian-token",
+            Regex::new(r"\bATATT[A-Za-z0-9_\-=]{20,}\b").unwrap(),
+        ),
+        (
+            "slack-token",
+            Regex::new(r"\bxox[abpos]-[A-Za-z0-9-]{10,}\b").unwrap(),
+        ),
         (
             "jwt",
-            Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b").unwrap(),
+            Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+                .unwrap(),
         ),
     ]
 });
@@ -335,7 +354,8 @@ mod tests {
 
     #[test]
     fn redacts_jwt_but_not_fragment() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P";
+        let jwt =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P";
         let (out, _) = redact_secrets(&format!("token: {jwt}"));
         assert!(out.contains("[REDACTED:jwt]"), "{out}");
 
@@ -358,7 +378,10 @@ mod tests {
     #[test]
     fn redacts_url_password_keeps_username() {
         let (out, _) = redact_secrets("postgres://muninn:hunter2secret@10.0.0.5:5432/db");
-        assert!(out.contains("://muninn:[REDACTED:url-credentials]@10.0.0.5"), "{out}");
+        assert!(
+            out.contains("://muninn:[REDACTED:url-credentials]@10.0.0.5"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -370,7 +393,10 @@ mod tests {
     #[test]
     fn redacts_keyed_assignments() {
         let (out, _) = redact_secrets("TENANT_DB_PASS=Sup3rS3cret99 host=10.0.0.5");
-        assert!(out.contains("TENANT_DB_PASS=[REDACTED:keyed-secret]"), "{out}");
+        assert!(
+            out.contains("TENANT_DB_PASS=[REDACTED:keyed-secret]"),
+            "{out}"
+        );
         assert!(out.contains("host=10.0.0.5"));
 
         let (out, _) = redact_secrets(r#"api_key: "sk-live-abcdef123456""#);
@@ -411,7 +437,10 @@ mod tests {
         assert!(out.contains("[REDACTED:keyed-secret]"), "{out}");
 
         // Short and full git SHAs still pass.
-        for sha in ["token=a1b2c3d", "commit_token=3f5a2b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a"] {
+        for sha in [
+            "token=a1b2c3d",
+            "commit_token=3f5a2b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a",
+        ] {
             let (out, hits) = redact_secrets(sha);
             assert_eq!(out, sha);
             assert_eq!(total_hits(&hits), 0);
@@ -431,7 +460,8 @@ mod tests {
 
     #[test]
     fn jwt_assigned_to_key_not_double_redacted() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P";
+        let jwt =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P";
         let (out, hits) = redact_secrets(&format!("JWT_ACCESS_SECRET={jwt}"));
         assert!(out.contains("JWT_ACCESS_SECRET=[REDACTED:jwt]"), "{out}");
         assert_eq!(total_hits(&hits), 1, "{hits:?}");

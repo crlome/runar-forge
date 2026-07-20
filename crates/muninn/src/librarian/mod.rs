@@ -106,8 +106,11 @@ impl MemoryLibrarian {
         // they are caller-supplied and FTS-indexed.
         let (title_scrubbed, title_hits) = crate::redact::redact_secrets(&input.title);
         let (content_scrubbed, content_hits) = crate::redact::redact_secrets(&input.content);
-        let mut secret_hits: usize =
-            title_hits.iter().chain(content_hits.iter()).map(|h| h.count).sum();
+        let mut secret_hits: usize = title_hits
+            .iter()
+            .chain(content_hits.iter())
+            .map(|h| h.count)
+            .sum();
         input.title = title_scrubbed;
         input.content = content_scrubbed;
         for tag in input.tags.iter_mut() {
@@ -930,7 +933,9 @@ impl MemoryLibrarian {
         content: &str,
         tags: &[String],
     ) -> StorageResult<()> {
-        self.storage.redact_entry_row(id, title, content, tags).await
+        self.storage
+            .redact_entry_row(id, title, content, tags)
+            .await
     }
 
     pub async fn find_duplicate_clusters(
@@ -1163,7 +1168,6 @@ pub(crate) fn decide_target_layer(
 
     None
 }
-
 
 async fn auto_link_entry(
     storage: &dyn MemoryStorage,
@@ -1746,7 +1750,9 @@ Here's a summary of what we did.\n\
         })
         .await
         .unwrap();
-        lib.search("observable", 5, None, None, None, None).await.unwrap();
+        lib.search("observable", 5, None, None, None, None)
+            .await
+            .unwrap();
         let rows = lib.query_debug_log(DebugLogQuery::default()).await.unwrap();
         assert!(rows.is_empty(), "no telemetry without RUNAR_DEBUG");
 
@@ -1815,14 +1821,28 @@ Here's a summary of what we did.\n\
 
         // Project-scoped search finds the entry written to namespace proj_a.
         let hits = lib
-            .search("gateway timeout backoff", 10, None, Some("proj_a"), None, None)
+            .search(
+                "gateway timeout backoff",
+                10,
+                None,
+                Some("proj_a"),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "proj_a search should find its own entry");
 
         // A different project sees nothing.
         let hits = lib
-            .search("gateway timeout backoff", 10, None, Some("proj_b"), None, None)
+            .search(
+                "gateway timeout backoff",
+                10,
+                None,
+                Some("proj_b"),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(hits.is_empty(), "proj_b must not see proj_a entries");
@@ -1832,7 +1852,10 @@ Here's a summary of what we did.\n\
             .search("gateway timeout backoff", 10, None, None, None, None)
             .await
             .unwrap();
-        assert!(hits.is_empty(), "default-namespace search must not leak proj_a rows");
+        assert!(
+            hits.is_empty(),
+            "default-namespace search must not leak proj_a rows"
+        );
     }
 
     #[tokio::test]
@@ -1856,7 +1879,11 @@ Here's a summary of what we did.\n\
             })
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "list with project_id should resolve namespace=proj_a");
+        assert_eq!(
+            rows.len(),
+            1,
+            "list with project_id should resolve namespace=proj_a"
+        );
     }
 
     #[tokio::test]
@@ -1893,8 +1920,16 @@ Here's a summary of what we did.\n\
         .unwrap();
 
         let packet = lib.get_context(None, Some("proj_a"), 3).await.unwrap();
-        assert_eq!(packet.recent_entries.len(), 2, "entry + session-end entry expected");
-        assert_eq!(packet.recent_sessions.len(), 1, "completed session should surface");
+        assert_eq!(
+            packet.recent_entries.len(),
+            2,
+            "entry + session-end entry expected"
+        );
+        assert_eq!(
+            packet.recent_sessions.len(),
+            1,
+            "completed session should surface"
+        );
         assert!(!packet.formatted.is_empty());
     }
 
@@ -1915,7 +1950,11 @@ Here's a summary of what we did.\n\
             .unwrap();
 
         let entry = lib.get(result.id).await.unwrap();
-        assert!(!entry.content.contains("Sup3rS3cret99"), "{}", entry.content);
+        assert!(
+            !entry.content.contains("Sup3rS3cret99"),
+            "{}",
+            entry.content
+        );
         assert!(!entry.content.contains("ghp_abcdef"), "{}", entry.content);
         assert!(entry.content.contains("[REDACTED:keyed-secret]"));
         assert!(entry.content.contains("[REDACTED:github-token]"));
@@ -1954,7 +1993,11 @@ Here's a summary of what we did.\n\
             .search("checkout payment gateway", 10, None, None, None, None)
             .await
             .unwrap();
-        assert!(results.len() >= 2, "expected both entries, got {}", results.len());
+        assert!(
+            results.len() >= 2,
+            "expected both entries, got {}",
+            results.len()
+        );
         assert_eq!(
             results[0].entry_type,
             EntryType::Note,

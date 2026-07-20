@@ -729,10 +729,8 @@ impl MemoryStorage for SqliteAdapter {
                AND e.namespace = ?2
                AND e.deleted_at IS NULL",
         );
-        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(query.query.clone()),
-            Box::new(ns.to_string()),
-        ];
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(query.query.clone()), Box::new(ns.to_string())];
         if let Some(ref t) = query.entry_type {
             sql.push_str(&format!(" AND e.type = ?{}", args.len() + 1));
             args.push(Box::new(t.as_str().to_string()));
@@ -1225,26 +1223,38 @@ impl MemoryStorage for SqliteAdapter {
             )
             .map_err(db_err)?;
         for (ns, n) in stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(db_err)?
             .filter_map(|r| r.ok())
         {
             by_ns
                 .entry(ns.clone())
-                .or_insert(NamespaceStats { namespace: ns, entries: 0, sessions: 0 })
+                .or_insert(NamespaceStats {
+                    namespace: ns,
+                    entries: 0,
+                    sessions: 0,
+                })
                 .entries = n;
         }
         let mut stmt = db
             .prepare("SELECT namespace, COUNT(*) FROM sessions GROUP BY namespace")
             .map_err(db_err)?;
         for (ns, n) in stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(db_err)?
             .filter_map(|r| r.ok())
         {
             by_ns
                 .entry(ns.clone())
-                .or_insert(NamespaceStats { namespace: ns, entries: 0, sessions: 0 })
+                .or_insert(NamespaceStats {
+                    namespace: ns,
+                    entries: 0,
+                    sessions: 0,
+                })
                 .sessions = n;
         }
 
@@ -1615,7 +1625,11 @@ impl MemoryStorage for SqliteAdapter {
             .map_err(|e| StorageError::Database(e.to_string()))?;
         let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
 
-        let ns_clause = if namespace.is_some() { " AND namespace = ?2" } else { "" };
+        let ns_clause = if namespace.is_some() {
+            " AND namespace = ?2"
+        } else {
+            ""
+        };
         let select_sql = format!(
             "SELECT id FROM memory_entries
              WHERE deleted_at IS NOT NULL AND deleted_at < ?1{ns_clause}
@@ -1748,7 +1762,11 @@ impl MemoryStorage for SqliteAdapter {
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        let ns_clause = if namespace.is_some() { " AND namespace = ?1" } else { "" };
+        let ns_clause = if namespace.is_some() {
+            " AND namespace = ?1"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT e.content_hash, e.id, e.namespace, e.title, e.access_count, e.verified, e.created_at
              FROM memory_entries e
@@ -2714,7 +2732,11 @@ mod tests {
         for (title, entry_type, pid) in [
             ("alpha gateway decision", EntryType::Decision, "proj_a"),
             ("alpha gateway note", EntryType::Note, "proj_a"),
-            ("alpha gateway decision other", EntryType::Decision, "proj_b"),
+            (
+                "alpha gateway decision other",
+                EntryType::Decision,
+                "proj_b",
+            ),
         ] {
             adapter
                 .save(
@@ -2755,7 +2777,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 2, "two proj_a rows expected");
-        assert!(hits.iter().all(|e| e.project_id.as_deref() == Some("proj_a")));
+        assert!(hits
+            .iter()
+            .all(|e| e.project_id.as_deref() == Some("proj_a")));
 
         // Combined.
         let hits = adapter
@@ -2902,10 +2926,16 @@ mod tests {
         }
 
         // Dry run: candidate listed, nothing removed.
-        let dry = adapter.purge_soft_deleted(None, 30, 1000, true).await.unwrap();
+        let dry = adapter
+            .purge_soft_deleted(None, 30, 1000, true)
+            .await
+            .unwrap();
         assert_eq!(dry, vec![a.id]);
 
-        let purged = adapter.purge_soft_deleted(None, 30, 1000, false).await.unwrap();
+        let purged = adapter
+            .purge_soft_deleted(None, 30, 1000, false)
+            .await
+            .unwrap();
         assert_eq!(purged, vec![a.id]);
 
         {
@@ -3028,12 +3058,23 @@ mod tests {
 
         let cold_entry = adapter.get(cold.id).await.unwrap();
         assert_eq!(cold_entry.access_count, 2);
-        assert!(cold_entry.last_accessed_at.is_some(), "timestamp must accompany count");
-        assert_eq!(cold_entry.layer, MemoryLayer::EPISODIC, "cold layer promoted to EPISODIC");
+        assert!(
+            cold_entry.last_accessed_at.is_some(),
+            "timestamp must accompany count"
+        );
+        assert_eq!(
+            cold_entry.layer,
+            MemoryLayer::EPISODIC,
+            "cold layer promoted to EPISODIC"
+        );
 
         let hot_entry = adapter.get(hot.id).await.unwrap();
         assert_eq!(hot_entry.access_count, 2);
-        assert_eq!(hot_entry.layer, MemoryLayer::WORKING, "hotter layers stay put");
+        assert_eq!(
+            hot_entry.layer,
+            MemoryLayer::WORKING,
+            "hotter layers stay put"
+        );
     }
 
     #[tokio::test]
@@ -3070,9 +3111,17 @@ mod tests {
         let stats = adapter.get_stats_all().await.unwrap();
         assert_eq!(stats.total_entries, 3);
         assert_eq!(stats.total_sessions, 1);
-        let a = stats.by_namespace.iter().find(|n| n.namespace == "proj_a").unwrap();
+        let a = stats
+            .by_namespace
+            .iter()
+            .find(|n| n.namespace == "proj_a")
+            .unwrap();
         assert_eq!((a.entries, a.sessions), (2, 1));
-        let b = stats.by_namespace.iter().find(|n| n.namespace == "proj_b").unwrap();
+        let b = stats
+            .by_namespace
+            .iter()
+            .find(|n| n.namespace == "proj_b")
+            .unwrap();
         assert_eq!((b.entries, b.sessions), (1, 0));
 
         // Scoped stats keep their old single-namespace shape.
@@ -3260,7 +3309,11 @@ mod tests {
                 params![id],
             )
             .unwrap();
-            assert_eq!(raw_fts_count(&db), 0, "soft-deleted row must leave the index");
+            assert_eq!(
+                raw_fts_count(&db),
+                0,
+                "soft-deleted row must leave the index"
+            );
 
             // Editing a tombstone is a no-op on FTS (no corruption).
             db.execute(
