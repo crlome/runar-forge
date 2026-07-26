@@ -24,6 +24,7 @@ pub mod setup;
 pub mod storage;
 pub mod summarizer;
 pub mod sync;
+pub mod text;
 pub mod tokens;
 pub mod types;
 pub mod update;

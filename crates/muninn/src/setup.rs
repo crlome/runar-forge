@@ -333,12 +333,191 @@ pub fn setup_claude_code(
         .ok_or_else(|| anyhow::anyhow!("settings.json is not a JSON object"))?;
 
     let log_path = runar_dir().join("hook.log").to_string_lossy().into_owned();
+    let existing_hooks = sobj.get("hooks").cloned().unwrap_or(json!({}));
+    let hooks_obj = build_hooks_object(
+        &existing_hooks,
+        &binary_path,
+        project_id,
+        &log_path,
+        with_auto_capture,
+    );
+    sobj.insert("hooks".into(), Value::Object(hooks_obj));
+
+    write_json_pretty(&settings_path, &settings)?;
+
+    // Step 3: Append Memory section to CLAUDE.md if missing
+    let claude_md_path = cwd.join("CLAUDE.md");
+    let md = if claude_md_path.exists() {
+        fs::read_to_string(&claude_md_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if !md.contains("## Memory") {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&claude_md_path)?;
+        f.write_all(MEMORY_SECTION.as_bytes())?;
+    }
+
+    Ok(ClaudeCodeSetup {
+        project_id: project_id.to_string(),
+        claude_json_path,
+        settings_path,
+        claude_md_path,
+        binary_path,
+    })
+}
+
+/// One project's outcome from `setup claude-code --all-projects`.
+pub struct HookMigration {
+    pub dir: PathBuf,
+    pub project_id: String,
+    pub had_legacy_pre_tool_use: bool,
+}
+
+/// Re-point every already-installed project at the current hook layout.
+///
+/// Hooks live in each project's own `.claude/settings.json`, so a change to
+/// the layout only reaches the project you happen to be standing in. After the
+/// v0.9.0 PreToolUse → SessionStart move that is not good enough: every other
+/// project keeps a stale hook that injects nothing.
+///
+/// Projects come from the `projects` map in `~/.claude.json` (the paths Claude
+/// Code itself has opened). Only directories that already carry a runar hook
+/// are touched, and each keeps the `--project` id it was installed with — this
+/// migrates, it does not enroll.
+pub fn migrate_installed_hooks() -> anyhow::Result<Vec<HookMigration>> {
+    let binary_path = resolve_stable_binary();
+    let log_path = runar_dir().join("hook.log").to_string_lossy().into_owned();
+
+    let claude_json: Value = read_json_or_empty(&home_dir().join(".claude.json"))?;
+    let Some(projects) = claude_json.get("projects").and_then(|v| v.as_object()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut migrated = Vec::new();
+    for dir in projects.keys() {
+        let dir = PathBuf::from(dir);
+        let settings_path = dir.join(".claude").join("settings.json");
+        if !settings_path.exists() {
+            continue;
+        }
+        let mut settings: Value = match read_json_or_empty(&settings_path) {
+            Ok(v) => v,
+            Err(_) => continue, // unreadable or malformed — leave it alone
+        };
+        let Some(sobj) = settings.as_object_mut() else {
+            continue;
+        };
+        let existing_hooks = sobj.get("hooks").cloned().unwrap_or(json!({}));
+        let Some(project_id) = installed_project_id(&existing_hooks) else {
+            continue; // no runar hooks here — not ours to rewrite
+        };
+
+        let had_legacy_pre_tool_use = event_has_runar_hook(&existing_hooks, "PreToolUse");
+        // Preserve the auto-capture choice this project was set up with.
+        let with_auto_capture = hook_commands(&existing_hooks)
+            .iter()
+            .any(|c| c.contains(" enqueue") || c.contains(" summarize"));
+
+        let hooks_obj = build_hooks_object(
+            &existing_hooks,
+            &binary_path,
+            &project_id,
+            &log_path,
+            with_auto_capture,
+        );
+        sobj.insert("hooks".into(), Value::Object(hooks_obj));
+        write_json_pretty(&settings_path, &settings)?;
+
+        migrated.push(HookMigration {
+            dir,
+            project_id,
+            had_legacy_pre_tool_use,
+        });
+    }
+    Ok(migrated)
+}
+
+/// Every runar hook command string across all events, in any order.
+fn hook_commands(existing_hooks: &Value) -> Vec<String> {
+    let Some(events) = existing_hooks.as_object() else {
+        return Vec::new();
+    };
+    events
+        .values()
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .filter(|c| c.contains("runar"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn event_has_runar_hook(existing_hooks: &Value, event: &str) -> bool {
+    existing_hooks
+        .get(event)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.contains("runar"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Recover the `--project <id>` a project's hooks were installed with, so a
+/// migration never silently re-namespaces someone's memories.
+fn installed_project_id(existing_hooks: &Value) -> Option<String> {
+    for command in hook_commands(existing_hooks) {
+        let mut parts = command.split_whitespace();
+        while let Some(tok) = parts.next() {
+            if tok != "--project" {
+                continue;
+            }
+            if let Some(raw) = parts.next() {
+                let id = raw.trim_matches(|c| c == '\'' || c == '"');
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build the complete `hooks` object for `.claude/settings.json`.
+///
+/// Pure so the wiring is testable without touching `$HOME` or the CWD — the
+/// PreToolUse → SessionStart move in v0.9.0 is exactly the kind of change that
+/// needs a regression test rather than a manual eyeball of a settings file.
+fn build_hooks_object(
+    existing_hooks: &Value,
+    binary_path: &str,
+    project_id: &str,
+    log_path: &str,
+    with_auto_capture: bool,
+) -> serde_json::Map<String, Value> {
     // Render each hook from a raw arg vector. Shell-form (quoted) on Unix,
     // exec-form (no shell) on Windows — see `runar_hook_entry`.
     let entry =
-        |matcher: &str, args: &[&str]| runar_hook_entry(matcher, &binary_path, args, &log_path);
+        |matcher: &str, args: &[&str]| runar_hook_entry(matcher, binary_path, args, log_path);
 
-    let existing_hooks = sobj.get("hooks").cloned().unwrap_or(json!({}));
     let pre_tool = filter_runar_hooks(
         existing_hooks
             .get("PreToolUse")
@@ -367,9 +546,22 @@ pub fn setup_claude_code(
             .cloned()
             .unwrap_or_default(),
     );
+    let session_start = filter_runar_hooks(
+        existing_hooks
+            .get("SessionStart")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    );
 
-    let mut pre_tool = pre_tool;
-    pre_tool.push(entry(
+    // The context packet is session-scoped, so it belongs on SessionStart.
+    // Until v0.9.0 it was wired to PreToolUse with matcher ".*" — every tool
+    // call, no cache: 243 fires per session, 98.8% of them byte-identical.
+    // `pre_tool` is intentionally left with only non-runar entries (they were
+    // already stripped by filter_runar_hooks), which also migrates existing
+    // installs on re-run.
+    let mut session_start = session_start;
+    session_start.push(entry(
         ".*",
         &["context", "--silent", "--project", project_id],
     ));
@@ -407,41 +599,23 @@ pub fn setup_claude_code(
     }
 
     let mut hooks_obj = existing_hooks.as_object().cloned().unwrap_or_default();
-    hooks_obj.insert("PreToolUse".into(), Value::Array(pre_tool));
+    // Drop the key entirely when nothing is left, rather than leaving an empty
+    // array behind from a pre-v0.9.0 install.
+    if pre_tool.is_empty() {
+        hooks_obj.remove("PreToolUse");
+    } else {
+        hooks_obj.insert("PreToolUse".into(), Value::Array(pre_tool));
+    }
+    hooks_obj.insert("SessionStart".into(), Value::Array(session_start));
     hooks_obj.insert("PostToolUse".into(), Value::Array(post_tool));
     hooks_obj.insert("UserPromptSubmit".into(), Value::Array(user_prompt));
     if with_auto_capture {
         hooks_obj.insert("SessionEnd".into(), Value::Array(session_end));
-    } else if hooks_obj.get("SessionEnd").is_none() {
-        // Don't introduce an empty array if the user never turned it on.
     }
-    sobj.insert("hooks".into(), Value::Object(hooks_obj));
+    // When auto-capture is off we leave any existing SessionEnd key alone
+    // rather than introducing an empty array the user never asked for.
 
-    write_json_pretty(&settings_path, &settings)?;
-
-    // Step 3: Append Memory section to CLAUDE.md if missing
-    let claude_md_path = cwd.join("CLAUDE.md");
-    let md = if claude_md_path.exists() {
-        fs::read_to_string(&claude_md_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    if !md.contains("## Memory") {
-        use std::io::Write;
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&claude_md_path)?;
-        f.write_all(MEMORY_SECTION.as_bytes())?;
-    }
-
-    Ok(ClaudeCodeSetup {
-        project_id: project_id.to_string(),
-        claude_json_path,
-        settings_path,
-        claude_md_path,
-        binary_path,
-    })
+    hooks_obj
 }
 
 /// Shell-form hook entry (Unix). Windows builds exec-form inline in
@@ -604,13 +778,6 @@ pub fn ping_file_path(project_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("runar-ping-{project_id}"))
 }
 
-/// Render a Claude Code hook additionalContext response (empty = no injection).
-/// Real content comes from item 2 (`runar context`). For now, emitting empty
-/// JSON so hooks execute cleanly without errors.
-pub fn empty_hook_response() -> String {
-    json!({ "additionalContext": "" }).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +795,106 @@ mod tests {
         assert_eq!(
             parse_project_from_remote("https://github.com/foo/bar"),
             Some("bar".into())
+        );
+    }
+
+    fn hooks_for(existing: Value) -> serde_json::Map<String, Value> {
+        build_hooks_object(&existing, "/bin/runar", "proj", "/log/hook.log", false)
+    }
+
+    /// Full invocation per hook entry. Unix stores one shell-form string;
+    /// Windows stores the binary in `command` and the subcommand in `args`,
+    /// so asserting on `command` alone would silently pass there.
+    fn commands_for(hooks: &serde_json::Map<String, Value>, event: &str) -> Vec<String> {
+        hooks
+            .get(event)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        let inner = &e["hooks"][0];
+                        let command = inner["command"].as_str()?;
+                        let args = inner["args"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                            .unwrap_or_default();
+                        Some(if args.is_empty() {
+                            command.to_string()
+                        } else {
+                            format!("{command} {args}")
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn context_hook_is_wired_to_session_start_not_pre_tool_use() {
+        let hooks = hooks_for(json!({}));
+
+        let session_start = commands_for(&hooks, "SessionStart");
+        assert!(
+            session_start.iter().any(|c| c.contains("context")),
+            "context packet must fire once per session: {session_start:?}"
+        );
+        assert!(
+            !hooks.contains_key("PreToolUse"),
+            "PreToolUse fires on every tool call — 243×/session with no cache"
+        );
+    }
+
+    #[test]
+    fn rerunning_setup_migrates_a_legacy_pre_tool_use_install() {
+        // What every pre-v0.9.0 project has on disk today.
+        let legacy = json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "'/Users/x/.runar-forge/bin/runar' context --silent --project 'proj'"
+                }]
+            }]
+        });
+
+        let hooks = hooks_for(legacy);
+
+        assert!(
+            !hooks.contains_key("PreToolUse"),
+            "the stale runar PreToolUse entry must be removed, not left behind"
+        );
+        assert!(commands_for(&hooks, "SessionStart")
+            .iter()
+            .any(|c| c.contains("context")));
+    }
+
+    #[test]
+    fn migration_preserves_third_party_pre_tool_use_hooks() {
+        let existing = json!({
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{ "type": "command", "command": "'/x/.runar-forge/bin/runar' context --silent" }]
+                },
+                {
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": "/usr/local/bin/my-own-linter" }]
+                }
+            ]
+        });
+
+        let hooks = hooks_for(existing);
+        let pre_tool = commands_for(&hooks, "PreToolUse");
+
+        assert_eq!(
+            pre_tool,
+            vec!["/usr/local/bin/my-own-linter".to_string()],
+            "someone else's hooks are not ours to delete"
         );
     }
 

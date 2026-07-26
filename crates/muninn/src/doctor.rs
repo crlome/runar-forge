@@ -379,6 +379,24 @@ fn check_hook_log() -> Check {
         return Check::pass_with("hook log", "empty");
     }
     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // A panicking hook produces no output and no error the user ever sees —
+    // it just stops working. Never let that hide behind a green check.
+    let (panics, last) = crate::hooks_runtime::count_hook_panics();
+    if panics > 0 {
+        return Check::fail_hint(
+            "hook log",
+            format!(
+                "{panics} panic(s) in {} — the panicking hook injects nothing{}",
+                path.display(),
+                last.map(|l| format!("\n     last: {l}"))
+                    .unwrap_or_default()
+            ),
+            "upgrade to a build with the fix, then clear the log: \
+             `mv ~/.runar-forge/hook.log{,.old}`",
+        );
+    }
+
     let tail = crate::hooks_runtime::tail_hook_log(5);
     if tail.is_empty() {
         return Check::pass_with("hook log", format!("{}B", size));

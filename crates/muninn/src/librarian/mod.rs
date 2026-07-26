@@ -1080,14 +1080,10 @@ fn format_context_packet(
                 EntryType::Bug | EntryType::Decision => 400,
                 EntryType::Pattern => 300,
                 EntryType::Architecture => 250,
-                EntryType::Session => e.content.len(),
+                EntryType::Session => e.content.chars().count(),
                 _ => 200,
             };
-            let summary = if e.content.len() > max_chars {
-                format!("{}...", &e.content[..max_chars])
-            } else {
-                e.content.clone()
-            };
+            let summary = crate::text::truncate_ellipsis(&e.content, max_chars);
             lines.push(format!(
                 "- **{}** [{}]: {}",
                 e.title,
