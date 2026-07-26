@@ -288,6 +288,18 @@ enum Commands {
         backfill_only: bool,
     },
 
+    /// Soft-delete captured prompts that were machine payloads, not user
+    /// input (IDE selections, task notifications, agent templates). Judged
+    /// by the same filter that guards the capture path.
+    PurgeNoise {
+        /// Limit to one project namespace (default: all namespaces)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Report matches without soft-deleting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     Gc {
         /// Project namespace to garbage-collect (auto-detected if omitted)
         #[arg(short, long)]
@@ -299,6 +311,9 @@ enum Commands {
         /// --stage1-age-days (reversible until --hard purges them)
         #[arg(long)]
         stage1: bool,
+        /// Run stage 1 across every namespace instead of just one project
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = "60")]
         stage1_age_days: i64,
         /// Stage 2: PERMANENTLY purge rows soft-deleted more than
@@ -1034,7 +1049,7 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
 
     if let Some(session) = active {
         let ping = protocol::read_ping(pid);
-        let session_summary = build_session_summary(&summary, summary_body, &ping);
+        let session_summary = build_session_summary(&summary, summary_body, &ping, &session.goal);
         let _ = lib
             .end_session(session.id, session_summary, Some(pid))
             .await;
@@ -1097,6 +1112,7 @@ fn build_session_summary(
     summary: &summarizer::SynthesizedSummary,
     summary_body: String,
     ping: &protocol::PingData,
+    existing_goal: &Option<String>,
 ) -> types::SessionSummary {
     let files_modified = if ping.files_modified.is_empty() {
         summary
@@ -1108,9 +1124,18 @@ fn build_session_summary(
     } else {
         ping.files_modified.clone()
     };
+    // A goal captured from the user's first real prompt beats anything the
+    // summarizer reconstructs from tool calls. This overwrite was unguarded
+    // and clobbered 8 sessions, 4 of which had a genuine human goal — with
+    // the auto-expire path at the other end of the same file filtering
+    // correctly all along.
+    let goal = match existing_goal {
+        Some(g) if !g.is_empty() && g != "Auto-started session" => g.clone(),
+        _ => summary.request.clone(),
+    };
     types::SessionSummary {
         summary: summary_body,
-        goal: Some(summary.request.clone()),
+        goal: Some(goal),
         instructions: Vec::new(),
         accomplished: summary.completed.clone(),
         discoveries: summary.learned.clone(),
@@ -1262,6 +1287,7 @@ async fn run_gc(
     project: Option<String>,
     dry_run: bool,
     stage1: bool,
+    all: bool,
     stage1_age_days: i64,
     hard: bool,
     hard_age_days: i64,
@@ -1275,19 +1301,37 @@ async fn run_gc(
 
     // Stage 1 — soft-delete never-accessed crawl bulk (reversible).
     if stage1 {
-        let ids = lib
-            .gc_stage1(Some(pid), stage1_age_days, GC_BATCH_MAX, dry_run)
-            .await?;
+        // Stage 1 is per-namespace, unlike scrub/dedup/gc_purge which all
+        // sweep every namespace. --all closes that gap so cleaning up does
+        // not require a shell loop over `-p`.
+        let namespaces: Vec<String> = if all {
+            lib.list_namespaces().await?
+        } else {
+            vec![pid.to_string()]
+        };
+        let mut total = 0usize;
+        for ns in &namespaces {
+            let ids = lib
+                .gc_stage1(Some(ns), stage1_age_days, GC_BATCH_MAX, dry_run)
+                .await?;
+            if all && !ids.is_empty() {
+                println!("  {ns}: {}", ids.len());
+            }
+            total += ids.len();
+        }
+        let scope = if all {
+            format!("{} namespaces", namespaces.len())
+        } else {
+            format!("'{pid}'")
+        };
         if dry_run {
             println!(
-                "Stage 1 dry-run ('{pid}'): {} never-accessed scout entries older than {stage1_age_days}d would be soft-deleted.",
-                ids.len()
+                "Stage 1 dry-run ({scope}): {total} never-accessed scout entries older than {stage1_age_days}d would be soft-deleted."
             );
         } else {
             println!(
-                "Stage 1 ('{pid}'): soft-deleted {} never-accessed scout entries older than {stage1_age_days}d. \
-                 Recoverable until `runar gc --hard` purges them.",
-                ids.len()
+                "Stage 1 ({scope}): soft-deleted {total} never-accessed scout entries older than {stage1_age_days}d. \
+                 Recoverable until `runar gc --hard` purges them."
             );
         }
     }
@@ -1669,6 +1713,18 @@ const DEFAULT_CONTEXT_HOOK_EVENT: &str = "SessionStart";
 /// with `RUNAR_RECALL_LIMIT` (0 disables recall entirely).
 const DEFAULT_RECALL_LIMIT: usize = 8;
 
+/// Characters of a prompt that decide whether two captures are "the same
+/// prompt". Long enough to separate genuinely different questions, short
+/// enough to collapse a fixed template carrying a varying payload.
+const PROMPT_PREFIX_CHARS: usize = 512;
+
+/// Supersession key for a captured prompt: `prompt:<hash of its prefix>`.
+fn prompt_topic_key(prompt: &str) -> String {
+    let prefix = char_prefix(prompt, PROMPT_PREFIX_CHARS);
+    let hash = storage::content_hash("", prefix);
+    format!("prompt:{}", &hash[..16])
+}
+
 async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::Result<()> {
     let pid = project_id.unwrap_or("default");
     let librarian = create_librarian_for_hook(pid).await?;
@@ -1699,6 +1755,14 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
         source: Some(types::MemorySource::Human),
         tags,
         project_id: project_id.map(|s| s.to_string()),
+        // Near-duplicate collapse. content_hash only catches byte-identical
+        // rows, so a template with a varying tail — an agent's instruction
+        // block with a different record pasted in each time — defeats it by
+        // construction: 215 such rows arrived in six days with 215 distinct
+        // hashes and two distinct prefixes. Keying supersession on a prefix
+        // hash means the newest copy replaces the last one instead of
+        // stacking, using the topic_key machinery that already exists.
+        topic_key: Some(prompt_topic_key(prompt)),
         ..Default::default()
     };
     let _ = librarian.propose(input).await?;
@@ -2471,10 +2535,33 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::PurgeNoise { project, dry_run } => {
+            let lib = create_librarian().await?;
+            let report = maintenance::run_purge_noise(&lib, project.as_deref(), dry_run).await?;
+            println!(
+                "Scanned {} captured prompts; {} are machine payloads.",
+                report.scanned, report.matched
+            );
+            for (ns, count) in &report.by_namespace {
+                println!("  {ns}: {count}");
+            }
+            if dry_run {
+                println!(
+                    "\nDry-run: nothing was deleted. Re-run without --dry-run to soft-delete them."
+                );
+            } else {
+                println!(
+                    "\nSoft-deleted {} rows. Recoverable until `runar gc --hard` purges them.",
+                    report.soft_deleted
+                );
+            }
+        }
+
         Commands::Gc {
             project,
             dry_run,
             stage1,
+            all,
             stage1_age_days,
             hard,
             hard_age_days,
@@ -2484,6 +2571,7 @@ async fn main() -> anyhow::Result<()> {
                 project,
                 dry_run,
                 stage1,
+                all,
                 stage1_age_days,
                 hard,
                 hard_age_days,

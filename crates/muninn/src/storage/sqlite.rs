@@ -1722,10 +1722,17 @@ impl MemoryStorage for SqliteAdapter {
                     args.iter().map(|b| b.as_ref()).collect();
                 db.execute(&sql, params_ref.as_slice()).map_err(db_err)?;
             }
+        }
 
-            // Queue hygiene rides along: confirmed observations are fully
-            // processed and may predate enqueue-side redaction — purge the
-            // ones older than the same grace window.
+        // Queue hygiene: confirmed observations are fully processed and may
+        // predate enqueue-side redaction — purge the ones older than the same
+        // grace window. Deliberately OUTSIDE the `!ids.is_empty()` guard: it
+        // used to be nested there, which made queue hygiene parasitic on
+        // memory-entry tombstones happening to exist. A project with nothing
+        // to purge kept its raw pre-redaction payloads forever — that is how
+        // one live credential survived the 2026-07-19 scrub inside 10 of
+        // these rows.
+        if !dry_run {
             db.execute(
                 "DELETE FROM pending_observations
                  WHERE status = 'confirmed' AND created_at < ?1",
@@ -4089,6 +4096,49 @@ mod tests {
             !adapter.check_observation_duplicate("hy", 30).await.unwrap(),
             "different hash: not a duplicate"
         );
+    }
+
+    #[tokio::test]
+    async fn purge_cleans_confirmed_observations_even_with_no_tombstones() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        adapter
+            .enqueue_observation(sample_obs("Edit", "h1", "proj"), "proj")
+            .await
+            .unwrap();
+        let claimed = adapter.claim_observations("proj", None, 10).await.unwrap();
+        let ids: Vec<Uuid> = claimed.iter().map(|o| o.id).collect();
+        adapter.confirm_observations(&ids).await.unwrap();
+
+        // Age the confirmed row past the grace window.
+        {
+            let db = adapter.db.lock().unwrap();
+            db.execute(
+                "UPDATE pending_observations SET created_at = '2020-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // No soft-deleted entries exist, so the entry-purge finds nothing.
+        // Queue hygiene must still run: it used to be nested inside the
+        // "we found tombstones" branch, so a project with nothing to purge
+        // kept its raw pre-redaction payloads indefinitely.
+        let purged = adapter
+            .purge_soft_deleted(None, 30, 1000, false)
+            .await
+            .unwrap();
+        assert!(purged.is_empty(), "no entries should have been purged");
+
+        let remaining: i64 = {
+            let db = adapter.db.lock().unwrap();
+            db.query_row("SELECT COUNT(*) FROM pending_observations", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(remaining, 0, "confirmed observations should be gone");
     }
 
     #[tokio::test]

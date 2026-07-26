@@ -210,7 +210,49 @@ pub fn is_machine_generated_prompt(s: &str) -> bool {
             return true;
         }
     }
+
+    // Agent system prompts submitted as user prompts. One project wrote 215
+    // of these in six days — 59% of every prompt captured after the v0.8.0
+    // filter shipped — because an agent pipes its own instruction template
+    // through the hook once per record it processes. They defeat exact-hash
+    // dedup by construction (fixed wrapper, varying payload) and they are
+    // short enough to slip the bulk-paste rule above.
+    let opener: String = lower.chars().take(80).collect();
+    let second_person = [
+        "you are ",
+        "you write ",
+        "you must ",
+        "you will ",
+        "your task is",
+        "your job is",
+        "act as ",
+    ]
+    .iter()
+    .any(|p| opener.contains(p));
+    if second_person && has_embedded_data_block(s) {
+        return true;
+    }
+
     false
+}
+
+/// A fact block pasted in for a machine to consume: an XML-ish tag pair or a
+/// multi-line JSON object. On its own this is unremarkable — paired with
+/// second-person instruction framing it means "agent template", not "question".
+fn has_embedded_data_block(s: &str) -> bool {
+    let looks_like_tag = s.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with('<')
+            && t.len() > 2
+            && t.ends_with('>')
+            && !t.starts_with("</")
+            && t[1..].starts_with(|c: char| c.is_ascii_alphabetic())
+    });
+    // `":` covers both pretty-printed (`"key": "value"`) and compact
+    // (`"key":"value"`) JSON. The real-world case is compact and arrives
+    // mid-truncation, so anchoring on `": "` alone matches nothing.
+    let looks_like_json = s.contains("\":") || s.contains(": {") || s.contains(":{");
+    looks_like_tag || looks_like_json
 }
 
 /// First-message payload when no ping file exists (Claude's first prompt).
@@ -276,6 +318,50 @@ pub fn parse_user_prompt(stdin_payload: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_system_prompts_are_not_user_prompts() {
+        // The exact shape that produced 215 of the 501 entries written in the
+        // six days after the v0.8.0 noise filter shipped.
+        let template = "You write short, specific B2B cold outreach emails for Valcore. \
+Valcore sells a 3D building configurator — an online quoting tool a dealer embeds.\n\
+\n\
+Hard rules:\n\
+- Use ONLY facts inside <dealer_facts>. If a value is null, do not mention it.\n\
+\n\
+<dealer_facts>\n\
+{\"dealer\": \"Acme Carports\", \"city\": \"Austin\", \"leads\": 42}\n\
+</dealer_facts>";
+        assert!(is_machine_generated_prompt(template));
+    }
+
+    #[test]
+    fn agent_template_detected_after_capture_truncation() {
+        // Captures are cut at 2,000 chars, so the closing tag is usually gone
+        // and only a fragment of compact JSON survives — which is exactly the
+        // form the 215 real rows are stored in.
+        let truncated = "You write short, specific B2B cold outreach emails for Valcore. \
+Use ONLY facts inside <dealer_facts>; if a value is null, do not mention it. \
+{\"name\":\"R & B Metal Structures Inc\",\"city\":\"Jackson\",\"rating\":4.6,\"review_phra…[truncated]";
+        assert!(is_machine_generated_prompt(truncated));
+    }
+
+    #[test]
+    fn genuine_prompts_mentioning_json_or_tags_survive() {
+        // Second-person framing alone, or a data block alone, is not enough —
+        // developers write both of these all day.
+        for prompt in [
+            "you are right, the retry should back off exponentially — can you fix it?",
+            "why does the API return {\"error\": \"unauthorized\"} for a valid token?",
+            "can you explain how <Suspense> interacts with the router here?",
+            "your task is to review this PR when you get a chance",
+        ] {
+            assert!(
+                !is_machine_generated_prompt(prompt),
+                "wrongly filtered: {prompt}"
+            );
+        }
+    }
 
     #[test]
     fn machine_generated_markers_detected() {

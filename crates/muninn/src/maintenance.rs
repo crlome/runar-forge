@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::librarian::MemoryLibrarian;
 use crate::redact;
 use crate::storage::content_hash;
-use crate::types::ListFilters;
+use crate::types::{EntryType, ListFilters};
 
 pub struct ScrubReport {
     pub scanned: usize,
@@ -182,6 +182,76 @@ pub async fn run_dedup(
             if !dry_run {
                 lib.deprecate(member.id).await?;
                 report.soft_deleted += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+pub struct NoiseReport {
+    pub scanned: usize,
+    pub matched: usize,
+    pub soft_deleted: usize,
+    pub by_namespace: BTreeMap<String, usize>,
+}
+
+/// Soft-delete captured prompts that were never user input.
+///
+/// The v0.8.0 noise filter stopped the inflow of IDE selections, task
+/// notifications and command wrappers — the newest such row predates it — but
+/// nothing removed the stock. Those 423 legacy rows went on to fill 44.6% of
+/// every context-injection slot, because the packet was ordered by recency and
+/// they are numerous. Recoverable until `runar gc --hard` purges tombstones.
+pub async fn run_purge_noise(
+    lib: &MemoryLibrarian,
+    project: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<NoiseReport> {
+    let namespaces: Vec<String> = match project {
+        Some(p) => vec![p.to_string()],
+        None => lib.list_namespaces().await?,
+    };
+
+    let mut report = NoiseReport {
+        scanned: 0,
+        matched: 0,
+        soft_deleted: 0,
+        by_namespace: BTreeMap::new(),
+    };
+
+    const BATCH: usize = 500;
+    for ns in &namespaces {
+        let mut offset = 0usize;
+        loop {
+            let batch = lib
+                .list(ListFilters {
+                    namespace: Some(ns.clone()),
+                    entry_type: Some(EntryType::UserPrompt),
+                    limit: Some(BATCH),
+                    offset: Some(offset),
+                    ..Default::default()
+                })
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            offset += batch.len();
+
+            for entry in batch {
+                report.scanned += 1;
+                // Judge the stored text with the same filter that guards the
+                // write path, so "what counts as noise" has exactly one
+                // definition and cleanup can never drift from capture.
+                if !crate::protocol::is_machine_generated_prompt(&entry.content) {
+                    continue;
+                }
+                report.matched += 1;
+                *report.by_namespace.entry(ns.clone()).or_insert(0) += 1;
+                if !dry_run {
+                    lib.deprecate(entry.id).await?;
+                    report.soft_deleted += 1;
+                }
             }
         }
     }
