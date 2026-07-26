@@ -2045,15 +2045,15 @@ async fn main() -> anyhow::Result<()> {
             let key = tool.to_lowercase();
             match key.as_str() {
                 "claude-code" if all_projects => {
-                    let migrated = setup::migrate_installed_hooks()?;
+                    let outcome = setup::migrate_installed_hooks()?;
                     println!("\nRunarForge — Claude Code hook migration\n");
-                    if migrated.is_empty() {
+                    if outcome.migrated.is_empty() {
                         println!("  No projects with runar hooks found in ~/.claude.json.");
                         println!(
                             "  Run `runar setup claude-code` inside a project to install them.\n"
                         );
                     } else {
-                        for m in &migrated {
+                        for m in &outcome.migrated {
                             let note = if m.had_legacy_pre_tool_use {
                                 " (migrated off PreToolUse)"
                             } else {
@@ -2061,17 +2061,29 @@ async fn main() -> anyhow::Result<()> {
                             };
                             println!("  {} — {}{}", m.project_id, m.dir.display(), note);
                         }
-                        let legacy = migrated
+                        let legacy = outcome
+                            .migrated
                             .iter()
                             .filter(|m| m.had_legacy_pre_tool_use)
                             .count();
                         println!(
                             "\n  {} project(s) updated; {} moved off the per-tool-call \
                              PreToolUse hook.\n",
-                            migrated.len(),
+                            outcome.migrated.len(),
                             legacy
                         );
                         println!("Restart Claude Code in those projects to activate.\n");
+                    }
+                    if !outcome.skipped.is_empty() {
+                        println!(
+                            "  WARNING — {} project(s) carry runar hooks but no readable \
+                             --project id, and were left untouched:",
+                            outcome.skipped.len()
+                        );
+                        for dir in &outcome.skipped {
+                            println!("    {}", dir.display());
+                        }
+                        println!("  Run `runar setup claude-code` from inside each one.\n");
                     }
                 }
                 "claude-code" => {

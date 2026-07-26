@@ -370,6 +370,15 @@ pub fn setup_claude_code(
     })
 }
 
+/// Result of `setup claude-code --all-projects`.
+pub struct MigrationOutcome {
+    pub migrated: Vec<HookMigration>,
+    /// Projects carrying runar hooks whose `--project` id could not be read.
+    /// Surfaced rather than skipped quietly — a migration that silently does
+    /// nothing is worse than one that fails loudly.
+    pub skipped: Vec<PathBuf>,
+}
+
 /// One project's outcome from `setup claude-code --all-projects`.
 pub struct HookMigration {
     pub dir: PathBuf,
@@ -388,16 +397,20 @@ pub struct HookMigration {
 /// Code itself has opened). Only directories that already carry a runar hook
 /// are touched, and each keeps the `--project` id it was installed with — this
 /// migrates, it does not enroll.
-pub fn migrate_installed_hooks() -> anyhow::Result<Vec<HookMigration>> {
+pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
     let binary_path = resolve_stable_binary();
     let log_path = runar_dir().join("hook.log").to_string_lossy().into_owned();
 
     let claude_json: Value = read_json_or_empty(&home_dir().join(".claude.json"))?;
     let Some(projects) = claude_json.get("projects").and_then(|v| v.as_object()) else {
-        return Ok(Vec::new());
+        return Ok(MigrationOutcome {
+            migrated: Vec::new(),
+            skipped: Vec::new(),
+        });
     };
 
     let mut migrated = Vec::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
     for dir in projects.keys() {
         let dir = PathBuf::from(dir);
         let settings_path = dir.join(".claude").join("settings.json");
@@ -413,14 +426,24 @@ pub fn migrate_installed_hooks() -> anyhow::Result<Vec<HookMigration>> {
         };
         let existing_hooks = sobj.get("hooks").cloned().unwrap_or(json!({}));
         let Some(project_id) = installed_project_id(&existing_hooks) else {
-            continue; // no runar hooks here — not ours to rewrite
+            // A project carrying runar hooks whose `--project` we cannot read
+            // is a migration failure, not a project to pass over in silence.
+            if !hook_commands(&existing_hooks).is_empty() {
+                skipped.push(dir);
+            }
+            continue;
         };
 
         let had_legacy_pre_tool_use = event_has_runar_hook(&existing_hooks, "PreToolUse");
         // Preserve the auto-capture choice this project was set up with.
-        let with_auto_capture = hook_commands(&existing_hooks)
-            .iter()
-            .any(|c| c.contains(" enqueue") || c.contains(" summarize"));
+        // Match on unquoted tokens: `shell_quote` wraps each argument, so a
+        // substring test for " enqueue" misses `'enqueue'` and would silently
+        // turn auto-capture off for every recently-configured project.
+        let with_auto_capture = hook_commands(&existing_hooks).iter().any(|c| {
+            c.split_whitespace()
+                .map(|t| t.trim_matches(|ch| ch == '\'' || ch == '"'))
+                .any(|t| t == "enqueue" || t == "summarize")
+        });
 
         let hooks_obj = build_hooks_object(
             &existing_hooks,
@@ -438,7 +461,7 @@ pub fn migrate_installed_hooks() -> anyhow::Result<Vec<HookMigration>> {
             had_legacy_pre_tool_use,
         });
     }
-    Ok(migrated)
+    Ok(MigrationOutcome { migrated, skipped })
 }
 
 /// Every runar hook command string across all events, in any order.
@@ -484,14 +507,24 @@ fn event_has_runar_hook(existing_hooks: &Value, event: &str) -> bool {
 /// Recover the `--project <id>` a project's hooks were installed with, so a
 /// migration never silently re-namespaces someone's memories.
 fn installed_project_id(existing_hooks: &Value) -> Option<String> {
+    fn unquote(s: &str) -> &str {
+        s.trim_matches(|c| c == '\'' || c == '"')
+    }
     for command in hook_commands(existing_hooks) {
         let mut parts = command.split_whitespace();
         while let Some(tok) = parts.next() {
-            if tok != "--project" {
+            // Unquote the FLAG too, not just its value. `shell_quote` wraps
+            // every argument, so a hook written by a recent version reads
+            // `'--project' 'proj'` — comparing the raw token against
+            // `--project` silently matched nothing and skipped the whole
+            // project. Since v0.9.0's own setup writes that quoted form,
+            // this made the migration a no-op on anything it had already
+            // touched.
+            if unquote(tok) != "--project" {
                 continue;
             }
             if let Some(raw) = parts.next() {
-                let id = raw.trim_matches(|c| c == '\'' || c == '"');
+                let id = unquote(raw);
                 if !id.is_empty() {
                     return Some(id.to_string());
                 }
@@ -832,6 +865,63 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn project_id_is_read_from_both_quoting_styles() {
+        // `shell_quote` wraps every argument, so hooks written by a recent
+        // version read `'--project' 'proj'`. Comparing the raw token against
+        // `--project` matched nothing, so `--all-projects` skipped those
+        // projects in silence — including every project it had itself
+        // configured, which made a second run a no-op.
+        let fully_quoted = json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "'/Users/x/.runar-forge/bin/runar' 'context' '--silent' '--project' 'valcore-lead-generator' 2>>'/x/hook.log' ; exit 0"
+                }]
+            }]
+        });
+        assert_eq!(
+            installed_project_id(&fully_quoted).as_deref(),
+            Some("valcore-lead-generator")
+        );
+
+        let flag_unquoted = json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "'/Users/x/.runar-forge/bin/runar' context --silent --project 'gsv2' 2>>'/x/hook.log' ; exit 0"
+                }]
+            }]
+        });
+        assert_eq!(
+            installed_project_id(&flag_unquoted).as_deref(),
+            Some("gsv2")
+        );
+    }
+
+    #[test]
+    fn auto_capture_is_preserved_through_quoted_hooks() {
+        // Same quoting trap: a substring test for " enqueue" misses
+        // `'enqueue'` and would silently turn auto-capture off on migration.
+        let quoted_with_capture = json!({
+            "PostToolUse": [{
+                "matcher": "Write|Edit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "'/x/runar' 'enqueue' '--silent' '--project' 'proj' 2>>'/x/hook.log' ; exit 0"
+                }]
+            }]
+        });
+        let detected = hook_commands(&quoted_with_capture).iter().any(|c| {
+            c.split_whitespace()
+                .map(|t| t.trim_matches(|ch| ch == '\'' || ch == '"'))
+                .any(|t| t == "enqueue" || t == "summarize")
+        });
+        assert!(detected, "auto-capture must survive a migration");
     }
 
     #[test]
