@@ -12,6 +12,7 @@ pub mod debug;
 pub mod doctor;
 pub mod embedding;
 pub mod extract;
+pub mod fts_query;
 pub mod hooks_runtime;
 pub mod huginn;
 pub mod identity;

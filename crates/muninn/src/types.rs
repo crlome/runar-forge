@@ -134,6 +134,15 @@ pub struct MemoryEntry {
     pub importance: f64,
     pub decay_score: f64,
     pub access_count: i32,
+    /// Times this entry was served into a model's context by automatic
+    /// recall. Separate from `access_count` (ranked search) on purpose:
+    /// one counter for two channels is what let "95.9% never retrieved"
+    /// stand for three months while 15,819 injections went unrecorded.
+    /// Reporting only — deliberately not an input to ranking or decay.
+    #[serde(default)]
+    pub injected_count: i32,
+    #[serde(default)]
+    pub last_injected_at: Option<DateTime<Utc>>,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
     pub embedding: Option<Vec<f32>>,

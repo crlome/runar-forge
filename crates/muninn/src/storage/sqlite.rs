@@ -53,6 +53,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "013_content_hash_fts_fix",
         include_str!("sql/013_content_hash_fts_fix.sql"),
     ),
+    (
+        "014_injection_counters",
+        include_str!("sql/014_injection_counters.sql"),
+    ),
 ];
 
 pub struct SqliteAdapter {
@@ -277,6 +281,12 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
         importance: 0.5,
         decay_score: 1.0,
         access_count: row.get("access_count")?,
+        injected_count: row.get("injected_count").unwrap_or(0),
+        last_injected_at: row
+            .get::<_, Option<String>>("last_injected_at")
+            .ok()
+            .flatten()
+            .map(parse_dt),
         confidence: confidence as f32,
         embedding: None,
         verified,
@@ -712,6 +722,14 @@ impl MemoryStorage for SqliteAdapter {
     }
 
     async fn fts_search(&self, query: SearchQuery) -> StorageResult<Vec<MemoryEntry>> {
+        // FTS5 reads a bare string as implicit AND with no stopword list, so
+        // a typed question ("how does auth work here") matches nothing, and
+        // its punctuation is query syntax that can raise a hard error. Rewrite
+        // to an OR expression and let bm25 `rank` do the ordering.
+        let Some(match_expr) = crate::fts_query::build(&query.query) else {
+            return Ok(Vec::new());
+        };
+
         let db = self
             .db
             .lock()
@@ -730,7 +748,7 @@ impl MemoryStorage for SqliteAdapter {
                AND e.deleted_at IS NULL",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(query.query.clone()), Box::new(ns.to_string())];
+            vec![Box::new(match_expr), Box::new(ns.to_string())];
         if let Some(ref t) = query.entry_type {
             sql.push_str(&format!(" AND e.type = ?{}", args.len() + 1));
             args.push(Box::new(t.as_str().to_string()));
@@ -1549,6 +1567,42 @@ impl MemoryStorage for SqliteAdapter {
         let params_ref: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let touched = db.execute(&sql, params_ref.as_slice()).map_err(db_err)?;
         Ok(touched as i64)
+    }
+
+    async fn mark_injected(&self, ids: &[Uuid]) -> StorageResult<i64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+
+        // Chunked: SQLite caps bound parameters at 32,766, and an unchunked
+        // IN-list is a failure that no small-fixture test ever reproduces.
+        const CHUNK: usize = 500;
+        let mut total = 0usize;
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders: Vec<String> =
+                (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+            // `updated_at` is intentionally left alone: it drives dedup and
+            // supersession, and serving an entry is not editing it.
+            let sql = format!(
+                "UPDATE memory_entries
+                 SET injected_count = injected_count + 1,
+                     last_injected_at = ?1
+                 WHERE id IN ({}) AND deleted_at IS NULL",
+                placeholders.join(", "),
+            );
+            let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.clone())];
+            for id in chunk {
+                args.push(Box::new(id.to_string()));
+            }
+            let params_ref: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            total += db.execute(&sql, params_ref.as_slice()).map_err(db_err)?;
+        }
+        Ok(total as i64)
     }
 
     // ── Two-stage GC ──────────────────────────────────────────
@@ -4220,6 +4274,8 @@ mod tests {
         // clock_skew_secs=2 includes them.
         for offset in [60, 30, 10] {
             let mut e = MemoryEntry {
+                injected_count: 0,
+                last_injected_at: None,
                 id: Uuid::new_v4(),
                 namespace: "test".into(),
                 title: format!("e-{offset}"),
@@ -4276,6 +4332,8 @@ mod tests {
         adapter.initialize().await.unwrap();
 
         let entry = MemoryEntry {
+            injected_count: 0,
+            last_injected_at: None,
             id: Uuid::new_v4(),
             namespace: "test".into(),
             title: "Remote-origin row".into(),

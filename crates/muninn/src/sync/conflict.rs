@@ -140,6 +140,8 @@ mod tests {
 
     fn entry(updated: DateTime<Utc>, verified: bool, deleted: bool) -> MemoryEntry {
         MemoryEntry {
+            injected_count: 0,
+            last_injected_at: None,
             id: uuid::Uuid::new_v4(),
             namespace: "test".into(),
             title: "T".into(),
