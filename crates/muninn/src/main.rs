@@ -7,9 +7,11 @@ use clap::{Parser, Subcommand};
 // binary's perspective.
 use runar_muninn::{
     breaker, config_cmd, curator, doctor, embedding, extract, hooks_runtime, huginn, librarian,
-    maintenance, mcp, protocol, redact, setup, storage, summarizer, sync as sync_cmd, types,
+    maintenance, mcp, protocol, redact, setup, storage, summarizer, sync as sync_cmd, text, types,
     update as update_cmd, wizard,
 };
+
+use text::char_prefix;
 
 use librarian::MemoryLibrarian;
 use storage::postgres::PostgresAdapter;
@@ -104,10 +106,17 @@ enum Commands {
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
         configure: bool,
+        /// Re-point every already-installed project at the current hook
+        /// layout. Hooks live per project, so a layout change (like the
+        /// v0.9.0 PreToolUse → SessionStart move) otherwise only reaches
+        /// the directory you are standing in. Migrates only; never enrolls
+        /// a new project, and keeps each project's existing --project id.
+        #[arg(long)]
+        all_projects: bool,
     },
 
     // ── Hook-support commands (called by Claude Code hooks) ────────
-    /// Print memory context for PreToolUse hook (stub until item 2)
+    /// Print the memory context packet (SessionStart hook payload)
     Context {
         #[arg(short, long)]
         project: Option<String>,
@@ -822,11 +831,14 @@ async fn run_extract(project: Option<String>, silent: bool) {
 
     if silent && !filtered.is_empty() {
         let titles: Vec<&str> = filtered.iter().map(|i| i.title.as_str()).collect();
-        emit_additional_context(&format!(
-            "Auto-learned {} insight(s): {}",
-            filtered.len(),
-            titles.join("; ")
-        ));
+        emit_additional_context(
+            "PostToolUse",
+            &format!(
+                "Auto-learned {} insight(s): {}",
+                filtered.len(),
+                titles.join("; ")
+            ),
+        );
     }
 }
 
@@ -1531,7 +1543,7 @@ async fn run_nudge(project: Option<String>, silent: bool) {
     // No ping file yet → first-message reminder
     if data.last_ping.is_none() && data.last_save.is_none() {
         if silent {
-            emit_additional_context(&protocol::first_message_reminder());
+            emit_additional_context("UserPromptSubmit", &protocol::first_message_reminder());
         }
         return;
     }
@@ -1556,12 +1568,25 @@ async fn run_nudge(project: Option<String>, silent: bool) {
     }
 
     let minutes = elapsed / 60_000;
-    emit_additional_context(&protocol::idle_nudge_message(minutes, &data.files_modified));
+    emit_additional_context(
+        "UserPromptSubmit",
+        &protocol::idle_nudge_message(minutes, &data.files_modified),
+    );
 }
 
-fn emit_additional_context(s: &str) {
-    let payload = serde_json::json!({ "additionalContext": s });
-    print!("{payload}");
+/// Emit a hook response in the shape Claude Code actually reads.
+///
+/// `additionalContext` MUST be nested under `hookSpecificOutput` with the
+/// echoing `hookEventName`. A bare top-level `{"additionalContext": …}` parses
+/// as structured hook output with no recognised field and is silently
+/// discarded — which is why nothing Muninn emitted between the initial commit
+/// and v0.9.0 ever reached a model, despite telemetry counting 211M characters
+/// "injected". Ironically, printing plain text would have worked.
+fn emit_additional_context(hook_event: &str, s: &str) {
+    print!(
+        "{}",
+        hooks_runtime::additional_context_response(hook_event, s)
+    );
 }
 
 /// Best-effort stdin reader. Returns whatever arrived before the timeout.
@@ -1581,13 +1606,9 @@ async fn read_stdin_with_timeout(timeout: std::time::Duration) -> String {
 /// bulk pastes stop bloating rows.
 const MAX_PROMPT_CONTENT_CHARS: usize = 2_000;
 
-/// Char-boundary-safe prefix (byte slicing panics on multibyte input).
-fn char_prefix(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
+/// Hook `runar context` is wired to as of v0.9.0. Used when stdin carries no
+/// `hook_event_name` (manual run, or a caller that pipes nothing).
+const DEFAULT_CONTEXT_HOOK_EVENT: &str = "SessionStart";
 
 async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::Result<()> {
     let pid = project_id.unwrap_or("default");
@@ -1716,11 +1737,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 for entry in &results {
                     println!("─── {} [{}]", entry.title, entry.entry_type.as_str());
-                    let preview = if entry.content.len() > 200 {
-                        format!("{}...", &entry.content[..200])
-                    } else {
-                        entry.content.clone()
-                    };
+                    let preview = text::truncate_ellipsis(&entry.content, 200);
                     println!("    {preview}");
                     println!();
                 }
@@ -1879,6 +1896,7 @@ async fn main() -> anyhow::Result<()> {
             with_auto_capture,
             no_auto_capture,
             configure,
+            all_projects,
         } => {
             let _ = with_auto_capture; // deprecated no-op, kept for old scripts
                                        // Default ON with a persisted opt-out: re-running setup without
@@ -1903,6 +1921,36 @@ async fn main() -> anyhow::Result<()> {
             }
             let key = tool.to_lowercase();
             match key.as_str() {
+                "claude-code" if all_projects => {
+                    let migrated = setup::migrate_installed_hooks()?;
+                    println!("\nRunarForge — Claude Code hook migration\n");
+                    if migrated.is_empty() {
+                        println!("  No projects with runar hooks found in ~/.claude.json.");
+                        println!(
+                            "  Run `runar setup claude-code` inside a project to install them.\n"
+                        );
+                    } else {
+                        for m in &migrated {
+                            let note = if m.had_legacy_pre_tool_use {
+                                " (migrated off PreToolUse)"
+                            } else {
+                                ""
+                            };
+                            println!("  {} — {}{}", m.project_id, m.dir.display(), note);
+                        }
+                        let legacy = migrated
+                            .iter()
+                            .filter(|m| m.had_legacy_pre_tool_use)
+                            .count();
+                        println!(
+                            "\n  {} project(s) updated; {} moved off the per-tool-call \
+                             PreToolUse hook.\n",
+                            migrated.len(),
+                            legacy
+                        );
+                        println!("Restart Claude Code in those projects to activate.\n");
+                    }
+                }
                 "claude-code" => {
                     if configure {
                         config_cmd::cmd_wizard()?;
@@ -1918,7 +1966,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("     muninn (unified — includes huginn + curator tools)\n");
                     println!("  Hooks configured in {}:", result.settings_path.display());
                     println!(
-                        "     PreToolUse:        context injection (--project {})",
+                        "     SessionStart:      context injection (--project {})",
                         result.project_id
                     );
                     println!("     PostToolUse:       session ping on file writes");
@@ -1987,14 +2035,41 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Context { project, silent } => {
-            // Memory Protocol + context packet injection (PreToolUse hook payload).
-            // Must NEVER panic: hook failure would break Claude Code tool calls.
+            // Memory Protocol + context packet injection (SessionStart hook
+            // payload since v0.9.0). Must NEVER panic: hook failure would
+            // break Claude Code tool calls.
             if hooks_runtime::hooks_disabled() {
                 if silent {
-                    print!("{{\"additionalContext\":\"\"}}");
+                    emit_additional_context(DEFAULT_CONTEXT_HOOK_EVENT, "");
                 }
                 return Ok(());
             }
+            // Which hook invoked us decides both the event name we must echo
+            // and whether we should speak at all.
+            let hook_event = if silent {
+                let body = read_stdin_with_timeout(std::time::Duration::from_millis(400)).await;
+                protocol::parse_hook_event(&body)
+                    .unwrap_or_else(|| DEFAULT_CONTEXT_HOOK_EVENT.to_string())
+            } else {
+                DEFAULT_CONTEXT_HOOK_EVENT.to_string()
+            };
+
+            // Legacy install guard. Before v0.9.0 this command was wired to
+            // PreToolUse with matcher ".*" — 243 fires per session, 98.8% of
+            // them byte-identical. That was survivable only because the
+            // payload was malformed and got dropped. Now that it is well
+            // formed, honouring a stale PreToolUse hook would inject ~13 KB
+            // on every tool call. Stay silent and tell the user to migrate.
+            if silent && hook_event == "PreToolUse" {
+                hooks_runtime::append_hook_log(
+                    "context",
+                    "legacy PreToolUse hook detected — run `runar setup claude-code` \
+                     to migrate to the SessionStart/UserPromptSubmit hooks (no context injected)",
+                );
+                emit_additional_context("PreToolUse", "");
+                return Ok(());
+            }
+
             let resolved = Some(resolve_project_id(project));
             let hook_started = std::time::Instant::now();
             let work = build_context(&resolved);
@@ -2032,8 +2107,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if silent {
-                let payload = serde_json::json!({ "additionalContext": full });
-                print!("{payload}");
+                emit_additional_context(&hook_event, &full);
             } else {
                 println!("{full}");
             }
@@ -2231,11 +2305,7 @@ async fn main() -> anyhow::Result<()> {
             );
             for e in matching {
                 println!("═══ {}", e.title);
-                let preview = if e.content.len() > 400 {
-                    format!("{}...", &e.content[..400])
-                } else {
-                    e.content.clone()
-                };
+                let preview = text::truncate_ellipsis(&e.content, 400);
                 for line in preview.lines() {
                     println!("  {line}");
                 }

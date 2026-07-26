@@ -384,11 +384,7 @@ fn synthesize(context: &AssembledContext, project_id: Option<&str>) -> CuratorAn
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let excerpt = if e.content.len() > 200 {
-                format!("{}...", &e.content[..200])
-            } else {
-                e.content.clone()
-            };
+            let excerpt = crate::text::truncate_ellipsis(&e.content, 200);
             Citation {
                 entry_id: e.id.to_string(),
                 title: e.title.clone(),

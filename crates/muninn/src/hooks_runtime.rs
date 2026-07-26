@@ -105,11 +105,86 @@ pub fn tail_hook_log(n: usize) -> Vec<String> {
     lines
 }
 
+/// Count panic lines in the hook log, and return the most recent one.
+///
+/// A panicking hook is invisible from inside the process that panicked, and
+/// `runar doctor` used to report "hook log: 350KB" as a passing check while
+/// the log held 1,526 panics that had silently disabled context injection for
+/// three projects. Anything that crashes a hook must be surfaced as a failure.
+pub fn count_hook_panics() -> (usize, Option<String>) {
+    let Ok(content) = fs::read_to_string(hook_log_path()) else {
+        return (0, None);
+    };
+    let panics: Vec<&str> = content
+        .lines()
+        .filter(|l| l.contains("panicked at"))
+        .collect();
+    let last = panics.last().map(|s| s.trim().to_string());
+    (panics.len(), last)
+}
+
+/// Serialize a Claude Code hook response that actually reaches the model.
+///
+/// The contract is `hookSpecificOutput.additionalContext` with the event name
+/// echoed back. A bare top-level `{"additionalContext": …}` is well-formed
+/// JSON, parses as structured hook output, matches no recognised field, and is
+/// dropped without a warning — that single mistake meant every context packet,
+/// nudge, and reminder Muninn emitted before v0.9.0 was discarded, while
+/// telemetry happily counted the characters it had printed.
+pub fn additional_context_response(hook_event: &str, body: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": hook_event,
+            "additionalContext": body,
+        }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::test_support::{with_runar_home, HOME_LOCK};
+
+    /// The regression test for the defect that made the whole memory system a
+    /// no-op: assert on the shape the *consumer* reads, not on what we print.
+    #[test]
+    fn hook_response_nests_additional_context_under_hook_specific_output() {
+        let raw = additional_context_response("SessionStart", "remembered thing");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+        let hso = v
+            .get("hookSpecificOutput")
+            .expect("additionalContext must be nested under hookSpecificOutput");
+        assert_eq!(hso["hookEventName"], "SessionStart");
+        assert_eq!(hso["additionalContext"], "remembered thing");
+
+        // The pre-v0.9.0 shape must never come back.
+        assert!(
+            v.get("additionalContext").is_none(),
+            "top-level additionalContext is silently discarded by Claude Code"
+        );
+    }
+
+    #[test]
+    fn hook_response_round_trips_every_event_we_wire() {
+        for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+            let raw = additional_context_response(event, "x");
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["hookSpecificOutput"]["hookEventName"], event);
+            assert_eq!(v["hookSpecificOutput"]["additionalContext"], "x");
+        }
+    }
+
+    #[test]
+    fn hook_response_escapes_content_safely() {
+        // Packets carry code, quotes, newlines and non-ASCII routinely.
+        let body = "fn main() {\n  println!(\"café \\ 配置\");\n}";
+        let raw = additional_context_response("SessionStart", body);
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], body);
+    }
 
     // Group every env-mutating test under a single combined mutex-locked
     // function so cargo's default parallel runner doesn't race them. Also

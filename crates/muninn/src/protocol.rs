@@ -243,6 +243,23 @@ Files modified: {file_context}"
 /// Extract the user prompt from a Claude Code UserPromptSubmit hook payload.
 /// Current Claude Code sends `prompt`; older/TS-era payloads sent `user_prompt`.
 /// Accept both so the hook keeps working across versions.
+/// Which hook fired, straight from the payload Claude Code pipes on stdin.
+///
+/// Used to decide the `hookSpecificOutput.hookEventName` we must echo back,
+/// and to recognise a legacy `PreToolUse` install that predates the
+/// SessionStart/UserPromptSubmit split.
+pub fn parse_hook_event(stdin_payload: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Payload {
+        hook_event_name: Option<String>,
+    }
+    serde_json::from_str::<Payload>(stdin_payload)
+        .ok()
+        .and_then(|p| p.hook_event_name)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub fn parse_user_prompt(stdin_payload: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Payload {
