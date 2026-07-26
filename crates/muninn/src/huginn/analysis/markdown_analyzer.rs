@@ -306,11 +306,7 @@ fn strip_md_inline(s: &str) -> String {
 }
 
 fn truncate_to(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
+    crate::text::truncate_ellipsis(s, max)
 }
 
 #[cfg(test)]

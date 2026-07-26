@@ -565,11 +565,7 @@ fn short_hash(s: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
+    crate::text::truncate_ellipsis(s, max)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -577,6 +573,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_never_panics_on_multibyte_input() {
+        // v0.9.0 fixed four byte-slicing sites and missed three more, this
+        // one included — it panicked in production the day the release
+        // shipped. Every truncation helper gets the same sweep now.
+        for s in [
+            "café serves crème brûlée",
+            "配置ファイルを読み込む",
+            "🐦‍⬛ raven emoji with a ZWJ sequence",
+            "Здравствуйте, мир",
+        ] {
+            for n in 0..s.len() + 2 {
+                let _ = truncate(s, n);
+            }
+        }
+    }
 
     fn edit_payload(file: &str, old: &str, new: &str) -> HookPayload {
         HookPayload {

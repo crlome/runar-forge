@@ -159,10 +159,10 @@ fn derive_title(content: &str) -> String {
     let cleaned = first
         .trim_start_matches(['*', '_', '`'])
         .trim_end_matches(['*', '_', '`']);
-    if cleaned.len() <= 100 {
+    if cleaned.chars().count() <= 100 {
         cleaned.to_string()
     } else {
-        format!("{}…", &cleaned[..97])
+        format!("{}…", crate::text::char_prefix(cleaned, 97))
     }
 }
 
