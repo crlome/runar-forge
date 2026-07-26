@@ -289,10 +289,13 @@ impl Summarizer for ClaudeSummarizer {
 
 fn truncate_value(v: &serde_json::Value, max_len: usize) -> serde_json::Value {
     let s = v.to_string();
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         return v.clone();
     }
-    serde_json::Value::String(format!("{}…(truncated)", &s[..max_len]))
+    serde_json::Value::String(format!(
+        "{}…(truncated)",
+        crate::text::char_prefix(&s, max_len)
+    ))
 }
 
 fn strip_json_fence(s: &str) -> &str {

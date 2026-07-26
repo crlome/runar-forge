@@ -136,11 +136,7 @@ fn render_markdown(project_id: Option<&str>, sections: &[OnboardingSection]) -> 
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
+    crate::text::truncate_ellipsis(s, max)
 }
 
 #[cfg(test)]

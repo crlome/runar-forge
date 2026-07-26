@@ -718,11 +718,7 @@ fn synthesize_onboarding(question: &ClassifiedQuestion, entries: &[&MemoryEntry]
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
+    crate::text::truncate_ellipsis(s, max)
 }
 
 // ── Oracle (main pipeline) ─────────────────────────────────────────
