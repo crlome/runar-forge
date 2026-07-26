@@ -1049,7 +1049,7 @@ async fn run_summarize(project: Option<String>, silent: bool, max: usize) {
 
     if let Some(session) = active {
         let ping = protocol::read_ping(pid);
-        let session_summary = build_session_summary(&summary, summary_body, &ping);
+        let session_summary = build_session_summary(&summary, summary_body, &ping, &session.goal);
         let _ = lib
             .end_session(session.id, session_summary, Some(pid))
             .await;
@@ -1112,6 +1112,7 @@ fn build_session_summary(
     summary: &summarizer::SynthesizedSummary,
     summary_body: String,
     ping: &protocol::PingData,
+    existing_goal: &Option<String>,
 ) -> types::SessionSummary {
     let files_modified = if ping.files_modified.is_empty() {
         summary
@@ -1123,9 +1124,18 @@ fn build_session_summary(
     } else {
         ping.files_modified.clone()
     };
+    // A goal captured from the user's first real prompt beats anything the
+    // summarizer reconstructs from tool calls. This overwrite was unguarded
+    // and clobbered 8 sessions, 4 of which had a genuine human goal — with
+    // the auto-expire path at the other end of the same file filtering
+    // correctly all along.
+    let goal = match existing_goal {
+        Some(g) if !g.is_empty() && g != "Auto-started session" => g.clone(),
+        _ => summary.request.clone(),
+    };
     types::SessionSummary {
         summary: summary_body,
-        goal: Some(summary.request.clone()),
+        goal: Some(goal),
         instructions: Vec::new(),
         accomplished: summary.completed.clone(),
         discoveries: summary.learned.clone(),
