@@ -382,6 +382,78 @@ impl MemoryLibrarian {
         entry_type: Option<EntryType>,
         tags: Option<Vec<String>>,
     ) -> StorageResult<Vec<MemoryEntry>> {
+        self.fused_search_inner(query, limit, namespace, project_id, entry_type, tags, true)
+            .await
+    }
+
+    /// Ranked recall for automatic context injection.
+    ///
+    /// Same ranking as `fused_search`, but records the result as an
+    /// *injection* rather than a *retrieval*: `injected_count` instead of
+    /// `access_count`. The distinction matters because this fires on every
+    /// user prompt — folding it into `access_count` would promote the same
+    /// handful of entries past `citation_threshold` within hours and lock
+    /// them into the decay/Hebbian path, exactly the failure mode that made
+    /// the old recency-window packet self-reinforcing.
+    pub async fn recall_for_prompt(
+        &self,
+        prompt: &str,
+        limit: usize,
+        project_id: Option<&str>,
+    ) -> StorageResult<Vec<MemoryEntry>> {
+        let started = std::time::Instant::now();
+        // Over-fetch, then drop the types that are captured *input* rather
+        // than knowledge. Without this the arm recalls the very prompt it was
+        // triggered by — user prompts are the largest and most textually
+        // similar cohort in the corpus, and a 0.5× rank multiplier is not
+        // enough to keep them out of the top 8.
+        let entries: Vec<MemoryEntry> = self
+            .fused_search_inner(prompt, limit * 3, None, project_id, None, None, false)
+            .await?
+            .into_iter()
+            .filter(|e| !matches!(e.entry_type, EntryType::UserPrompt | EntryType::Session))
+            .take(limit)
+            .collect();
+
+        let ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
+        if ids.is_empty() {
+            return Ok(entries);
+        }
+        let _ = self.storage.mark_injected(&ids).await;
+
+        if self.debug_enabled {
+            crate::debug::log(
+                &self.storage,
+                DebugLogInput {
+                    event: DebugEvent::Injection,
+                    entry_id: None,
+                    data: serde_json::json!({
+                        "hookEvent": "UserPromptSubmit",
+                        "projectId": project_id,
+                        "namespace": self.scope(None, project_id),
+                        "entryIds": ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                        "entryCount": ids.len(),
+                    }),
+                    duration_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
+                },
+            )
+            .await;
+        }
+
+        Ok(entries)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fused_search_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        namespace: Option<&str>,
+        project_id: Option<&str>,
+        entry_type: Option<EntryType>,
+        tags: Option<Vec<String>>,
+        touch: bool,
+    ) -> StorageResult<Vec<MemoryEntry>> {
         const USER_PROMPT_RANK_MULTIPLIER: f64 = 0.5;
         let search_started = std::time::Instant::now();
         let ns = self.scope(namespace, project_id);
@@ -496,8 +568,14 @@ impl MemoryLibrarian {
         // Record retrieval before returning: one atomic UPDATE for all
         // returned ids. Awaited on purpose — the old fire-and-forget spawn
         // died with short-lived hook processes and left partial writes.
-        let touched_ids: Vec<Uuid> = scored.iter().map(|(_, e)| e.id).collect();
-        let _ = self.storage.touch_entries(&touched_ids).await;
+        // Skipped for automatic recall, which counts as an injection.
+        let touched_ids: Vec<Uuid> = if touch {
+            let ids: Vec<Uuid> = scored.iter().map(|(_, e)| e.id).collect();
+            let _ = self.storage.touch_entries(&ids).await;
+            ids
+        } else {
+            Vec::new()
+        };
 
         if self.debug_enabled {
             let duration_ms = search_started.elapsed().as_secs_f64() * 1000.0;
@@ -507,7 +585,10 @@ impl MemoryLibrarian {
                     event: DebugEvent::SearchScoring,
                     entry_id: None,
                     data: serde_json::json!({
-                        "query": query,
+                        // Redacted: debug_log is not namespace-scoped, and
+                        // automatic recall now puts whole user prompts through
+                        // this path. Clean while n=3 is not a guarantee.
+                        "query": crate::redact::redact_secrets(query).0,
                         "namespace": ns,
                         "projectId": project_id,
                         "semanticCount": semantic_ranks.len(),
@@ -634,12 +715,16 @@ impl MemoryLibrarian {
             .take(session_count)
             .collect();
 
+        // Fetch exactly what gets rendered. The old 40-vs-`take(32)` mismatch
+        // meant 20% of every logged injection slot named an entry the packet
+        // never contained — an overstatement baked into every metric derived
+        // from this event.
         let recent_entries = self
             .storage
             .list(ListFilters {
                 namespace: Some(ns.to_string()),
                 project_id: project_id.map(|s| s.to_string()),
-                limit: Some(40),
+                limit: Some(CONTEXT_ENTRY_LIMIT),
                 ..Default::default()
             })
             .await?;
@@ -655,6 +740,7 @@ impl MemoryLibrarian {
                     event: DebugEvent::Injection,
                     entry_id: None,
                     data: serde_json::json!({
+                        "hookEvent": "SessionStart",
                         "projectId": project_id,
                         "namespace": ns,
                         "entryIds": recent_entries
@@ -1046,6 +1132,34 @@ pub struct LayerTransition {
     pub days_since_access: i64,
 }
 
+/// Entries carried by the SessionStart context packet. One constant so the
+/// number fetched, the number rendered, and the number logged cannot drift.
+pub const CONTEXT_ENTRY_LIMIT: usize = 32;
+
+/// Render memories recalled for a specific user prompt.
+///
+/// Deliberately terser than the SessionStart packet: this fires once per
+/// prompt, so it must earn its tokens on every single one.
+pub fn format_recall_packet(entries: &[MemoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "## Muninn — relevant memories for this request".to_string(),
+        String::new(),
+    ];
+    for e in entries {
+        lines.push(format!(
+            "- **{}** [{}]: {}",
+            e.title,
+            e.entry_type.as_str(),
+            crate::text::truncate_ellipsis(&e.content, 300)
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 fn format_context_packet(
     sessions: &[&Session],
     entries: &[MemoryEntry],
@@ -1075,7 +1189,7 @@ fn format_context_packet(
 
     if !entries.is_empty() {
         lines.push("### Key Knowledge".into());
-        for e in entries.iter().take(32) {
+        for e in entries.iter().take(CONTEXT_ENTRY_LIMIT) {
             let max_chars = match e.entry_type {
                 EntryType::Bug | EntryType::Decision => 400,
                 EntryType::Pattern => 300,
@@ -1326,6 +1440,8 @@ mod tests {
         let now = Utc::now();
 
         let fresh_entry = MemoryEntry {
+            injected_count: 0,
+            last_injected_at: None,
             id: Uuid::new_v4(),
             title: "Fresh".into(),
             content: "Just created".into(),
@@ -1883,6 +1999,78 @@ Here's a summary of what we did.\n\
     }
 
     #[tokio::test]
+    async fn recall_skips_captured_prompts_and_returns_knowledge() {
+        let lib = test_librarian().await;
+
+        lib.propose(MemoryEntryInput {
+            title: "Pattern: authentication-flow".into(),
+            content: "JWT issued at login, refreshed by the gateway".into(),
+            entry_type: EntryType::Pattern,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // The same text the user just typed, captured moments earlier. This
+        // is the highest-similarity row in the corpus and must never come
+        // back as a "memory" — the arm would be echoing the prompt at itself.
+        lib.propose(MemoryEntryInput {
+            title: "how does authentication work".into(),
+            content: "how does authentication work".into(),
+            entry_type: EntryType::UserPrompt,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let hits = lib
+            .recall_for_prompt("how does authentication work", 8, Some("proj_a"))
+            .await
+            .unwrap();
+
+        assert!(!hits.is_empty(), "the pattern entry should be recalled");
+        assert!(
+            hits.iter().all(|e| e.entry_type != EntryType::UserPrompt),
+            "captured prompts are input, not knowledge: {:?}",
+            hits.iter().map(|e| e.entry_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_counts_as_injection_not_retrieval() {
+        let lib = test_librarian().await;
+
+        lib.propose(MemoryEntryInput {
+            title: "Bug: connection pool exhaustion".into(),
+            content: "pool size 5 was too small under load".into(),
+            entry_type: EntryType::Bug,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let hits = lib
+            .recall_for_prompt("connection pool exhaustion", 8, Some("proj_a"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let entry = lib.get(hits[0].id).await.unwrap();
+        assert_eq!(entry.injected_count, 1, "injection must be recorded");
+        assert!(entry.last_injected_at.is_some());
+        assert_eq!(
+            entry.access_count, 0,
+            "automatic recall must not inflate access_count — it fires on \
+             every prompt and would pin the same rows past the citation \
+             threshold within hours"
+        );
+        assert!(entry.last_accessed_at.is_none());
+    }
+
+    #[tokio::test]
     async fn test_get_context_serves_project_entries_and_sessions() {
         let lib = test_librarian().await;
 
@@ -2071,6 +2259,8 @@ Here's a summary of what we did.\n\
     ) -> MemoryEntry {
         let now = Utc::now();
         MemoryEntry {
+            injected_count: 0,
+            last_injected_at: None,
             id: Uuid::new_v4(),
             title: "tier-fixture".into(),
             content: "x".into(),

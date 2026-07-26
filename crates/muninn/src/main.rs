@@ -1538,40 +1538,94 @@ async fn run_nudge(project: Option<String>, silent: bool) {
         }
     }
 
-    let data = protocol::read_ping(pid);
+    // Step 2: Recall memories relevant to *this* prompt. This is the only
+    // relevance-ranked injection in the system — the SessionStart packet is
+    // a recency window, so without this nothing ever surfaces a memory
+    // because it matches what the user is actually asking about.
+    let recall = match &user_prompt {
+        Some(prompt) if silent => recall_for_prompt(prompt, pid).await,
+        _ => String::new(),
+    };
 
+    let data = protocol::read_ping(pid);
+    let nudge = nudge_message(&data);
+
+    if silent {
+        let body = [recall.as_str(), nudge.as_deref().unwrap_or("")]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !body.is_empty() {
+            emit_additional_context("UserPromptSubmit", &body);
+        }
+    }
+}
+
+/// Memories worth putting in front of Claude for this specific prompt, or an
+/// empty string. Never panics and never blocks the hook for long: the whole
+/// lookup is capped well inside the hook budget.
+async fn recall_for_prompt(prompt: &str, pid: &str) -> String {
+    // Machine payloads (IDE selections, task notifications, log pastes) are
+    // not questions, and searching them wastes a hook's entire time budget.
+    if prompt.chars().count() < protocol::MIN_PROMPT_LENGTH
+        || protocol::is_trivial_prompt(prompt)
+        || protocol::is_machine_generated_prompt(prompt)
+    {
+        return String::new();
+    }
+    let limit: usize = std::env::var("RUNAR_RECALL_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RECALL_LIMIT);
+    if limit == 0 {
+        return String::new();
+    }
+
+    let work = async {
+        let lib = create_librarian_for_hook(pid).await.ok()?;
+        let entries = lib.recall_for_prompt(prompt, limit, Some(pid)).await.ok()?;
+        Some(librarian::format_recall_packet(&entries))
+    };
+    match tokio::time::timeout(hooks_runtime::hook_budget(), work).await {
+        Ok(Some(packet)) => packet,
+        Ok(None) => String::new(),
+        Err(_) => {
+            hooks_runtime::append_hook_log("nudge", "recall budget exceeded");
+            String::new()
+        }
+    }
+}
+
+/// The idle-save reminder, if this session has earned one.
+fn nudge_message(data: &protocol::PingData) -> Option<String> {
     // No ping file yet → first-message reminder
     if data.last_ping.is_none() && data.last_save.is_none() {
-        if silent {
-            emit_additional_context("UserPromptSubmit", &protocol::first_message_reminder());
-        }
-        return;
+        return Some(protocol::first_message_reminder());
     }
 
     // Nudge timer: last_save is the real signal; fall back to last_ping
     let ref_ts = data.last_save.or(data.last_ping).unwrap_or(0);
     let elapsed = protocol::now_ms() - ref_ts;
     if elapsed < protocol::NUDGE_THRESHOLD_MS {
-        return; // recent save — no nudge
+        return None; // recent save — no nudge
     }
 
     // Don't nudge brand-new sessions
     if let Some(started) = data.session_started_at {
         if protocol::now_ms() - started < protocol::MIN_SESSION_AGE_MS {
-            return;
+            return None;
         }
     }
 
     // Only nudge when files were tracked (something actually happened)
-    if data.files_modified.is_empty() || !silent {
-        return;
+    if data.files_modified.is_empty() {
+        return None;
     }
 
     let minutes = elapsed / 60_000;
-    emit_additional_context(
-        "UserPromptSubmit",
-        &protocol::idle_nudge_message(minutes, &data.files_modified),
-    );
+    Some(protocol::idle_nudge_message(minutes, &data.files_modified))
 }
 
 /// Emit a hook response in the shape Claude Code actually reads.
@@ -1609,6 +1663,11 @@ const MAX_PROMPT_CONTENT_CHARS: usize = 2_000;
 /// Hook `runar context` is wired to as of v0.9.0. Used when stdin carries no
 /// `hook_event_name` (manual run, or a caller that pipes nothing).
 const DEFAULT_CONTEXT_HOOK_EVENT: &str = "SessionStart";
+
+/// Memories recalled per user prompt. Small on purpose: this fires on every
+/// prompt, so each entry has to earn its tokens every single time. Override
+/// with `RUNAR_RECALL_LIMIT` (0 disables recall entirely).
+const DEFAULT_RECALL_LIMIT: usize = 8;
 
 async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::Result<()> {
     let pid = project_id.unwrap_or("default");

@@ -909,6 +909,8 @@ mod tests {
 
     fn mk_entry(title: &str, content: &str, etype: EntryType) -> MemoryEntry {
         MemoryEntry {
+            injected_count: 0,
+            last_injected_at: None,
             id: uuid::Uuid::new_v4(),
             title: title.into(),
             content: content.into(),

@@ -62,6 +62,16 @@ pub trait MemoryStorage: Send + Sync {
     /// colder-than-EPISODIC layers to EPISODIC. Returns rows touched.
     /// Replaces the old per-entry get-then-update (racy) fire-and-forget.
     async fn touch_entries(&self, ids: &[Uuid]) -> StorageResult<i64>;
+
+    /// Record that the given entries were served into a model's context.
+    ///
+    /// Deliberately separate from `touch_entries`: injection and ranked
+    /// search are different channels with different volumes, and folding
+    /// them into one counter is what made "95.9% never retrieved" a
+    /// three-month-old misreading. These counters feed reporting only —
+    /// not decay, citation thresholds, or dedup keeper selection.
+    async fn mark_injected(&self, ids: &[Uuid]) -> StorageResult<i64>;
+
     async fn delete(&self, id: Uuid) -> StorageResult<()>;
     async fn list(&self, filters: ListFilters) -> StorageResult<Vec<MemoryEntry>>;
 

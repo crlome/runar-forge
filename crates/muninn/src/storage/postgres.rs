@@ -67,6 +67,10 @@ pub const PG_MIGRATIONS: &[(&str, &str)] = &[
         "013_content_hash",
         include_str!("pg_sql/013_content_hash.sql"),
     ),
+    (
+        "014_injection_counters",
+        include_str!("pg_sql/014_injection_counters.sql"),
+    ),
 ];
 
 pub struct PostgresAdapter {
@@ -218,6 +222,8 @@ fn row_to_entry(row: &tokio_postgres::Row) -> MemoryEntry {
         importance: 0.5,
         decay_score: 1.0,
         access_count: row.get("access_count"),
+        injected_count: row.try_get("injected_count").unwrap_or(0),
+        last_injected_at: row.try_get("last_injected_at").ok().flatten(),
         confidence,
         embedding: None,
         verified,
@@ -1390,6 +1396,27 @@ impl MemoryStorage for PostgresAdapter {
             .await
             .map_err(db_err)?;
         Ok(touched as i64)
+    }
+
+    async fn mark_injected(&self, ids: &[Uuid]) -> StorageResult<i64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let client = self.get_client().await?;
+        let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        // `updated_at` is intentionally left alone: it drives dedup and
+        // supersession, and serving an entry is not editing it.
+        let marked = client
+            .execute(
+                "UPDATE muninn.memory_entries
+                 SET injected_count = injected_count + 1,
+                     last_injected_at = NOW()
+                 WHERE id = ANY($1) AND deleted_at IS NULL",
+                &[&id_strs],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(marked as i64)
     }
 
     // ── Two-stage GC ──────────────────────────────────────────
