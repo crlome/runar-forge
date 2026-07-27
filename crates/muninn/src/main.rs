@@ -2551,8 +2551,12 @@ async fn main() -> anyhow::Result<()> {
             let lib = create_librarian().await?;
             let report = maintenance::run_purge_noise(&lib, project.as_deref(), dry_run).await?;
             println!(
-                "Scanned {} captured prompts; {} are machine payloads.",
-                report.scanned, report.matched
+                "Scanned {} entries; {} are noise ({} machine payloads, \
+                 {} rows from retired extraction rules).",
+                report.scanned,
+                report.matched,
+                report.matched - report.retired_rule_rows,
+                report.retired_rule_rows
             );
             for (ns, count) in &report.by_namespace {
                 println!("  {ns}: {count}");

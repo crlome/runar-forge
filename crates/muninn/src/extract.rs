@@ -94,55 +94,17 @@ fn extract_from_edit(payload: &HookPayload) -> Vec<ExtractedInsight> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let hash6 = short_hash(&format!("{old_str}{new_str}"));
 
-    // Rule: null/none check added
-    if !has_null_check(old_str) && has_null_check(new_str) {
-        out.push(ExtractedInsight {
-            title: format!("Bug fix: null check added in {file_stem}"),
-            content: format!(
-                "Null/none check added in `{file_path}`.\n\n**Before:**\n```\n{}\n```\n\n**After:**\n```\n{}\n```",
-                truncate(old_str, 300),
-                truncate(new_str, 300)
-            ),
-            entry_type: EntryType::Bug,
-            tags: vec!["auto-extract".into(), "bugfix".into(), file_path.into()],
-            topic_key: Some(format!("bugfix:{file_stem}:{hash6}")),
-            confidence: 0.80,
-        });
-    }
-
-    // Rule: error handling added
-    if !has_error_handling(old_str) && has_error_handling(new_str) {
-        out.push(ExtractedInsight {
-            title: format!("Bug fix: error handling added in {file_stem}"),
-            content: format!(
-                "Error handling added in `{file_path}`.\n\n**Before:**\n```\n{}\n```\n\n**After:**\n```\n{}\n```",
-                truncate(old_str, 300),
-                truncate(new_str, 300)
-            ),
-            entry_type: EntryType::Bug,
-            tags: vec!["auto-extract".into(), "bugfix".into(), file_path.into()],
-            topic_key: Some(format!("bugfix:{file_stem}:{hash6}")),
-            confidence: 0.75,
-        });
-    }
-
-    // Rule: off-by-one fix
-    if is_off_by_one_fix(old_str, new_str) {
-        out.push(ExtractedInsight {
-            title: format!("Bug fix: off-by-one in {file_stem}"),
-            content: format!(
-                "Boundary condition fix in `{file_path}`.\n\n**Before:**\n```\n{}\n```\n\n**After:**\n```\n{}\n```",
-                truncate(old_str, 300),
-                truncate(new_str, 300)
-            ),
-            entry_type: EntryType::Bug,
-            tags: vec!["auto-extract".into(), "bugfix".into(), "off-by-one".into(), file_path.into()],
-            topic_key: Some(format!("bugfix:{file_stem}:{hash6}")),
-            confidence: 0.85,
-        });
-    }
+    // REMOVED in 0.9.3 — the three "Bug fix: …" diff rules (null check
+    // added / error handling added / off-by-one). They inferred "a bug was
+    // fixed" from the shape of a diff and stored the diff itself, so the
+    // content was a worse, staler copy of what `git blame` already answers,
+    // under a title the heuristic frequently got wrong ("error handling
+    // added" fired on a diff of import statements). They reached 229 live
+    // rows and 41% of this project's SessionStart packet while carrying no
+    // root cause — the one thing a memory system exists to keep and the one
+    // thing a diff cannot supply. A real bug memory comes from `muninn_save`,
+    // where the why is available.
 
     // Rule: config value change
     if is_config_file(file_path) {
@@ -160,14 +122,23 @@ fn extract_from_edit(payload: &HookPayload) -> Vec<ExtractedInsight> {
         });
     }
 
-    // Rule: env var addition
+    // Rule: env var addition. Worth keeping where the diff rules were not:
+    // "which file reads MAX_FAILED_LOGINS" is a genuinely non-obvious fact
+    // that is hard to grep for unless you already know the name. The body
+    // quotes the line that reads the variable rather than the head of the
+    // diff, which used to be an unrelated slice of the same edit.
     if !has_env_var_read(old_str) && has_env_var_read(new_str) {
         let var_hint = extract_env_var_name(new_str).unwrap_or_else(|| "unknown".into());
+        let usage = new_str
+            .lines()
+            .find(|l| l.contains(&var_hint))
+            .map(str::trim)
+            .unwrap_or("");
         out.push(ExtractedInsight {
             title: format!("New env var: {var_hint} in {file_stem}"),
             content: format!(
-                "Environment variable `{var_hint}` introduced in `{file_path}`.\n\n```\n{}\n```",
-                truncate(new_str, 300)
+                "Environment variable `{var_hint}` is read in `{file_path}`.\n\n```\n{}\n```",
+                truncate(usage, 200)
             ),
             entry_type: EntryType::Decision,
             tags: vec!["auto-extract".into(), "env-var".into(), file_path.into()],
@@ -407,50 +378,6 @@ pub fn dedup_insights(
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-fn has_null_check(s: &str) -> bool {
-    let lower = s.to_lowercase();
-    lower.contains("!= null")
-        || lower.contains("!== null")
-        || lower.contains("!= nil")
-        || lower.contains("is_some()")
-        || lower.contains("is_none()")
-        || lower.contains("if let some")
-        || lower.contains("!= none")
-        || lower.contains("is not none")
-}
-
-fn has_error_handling(s: &str) -> bool {
-    let lower = s.to_lowercase();
-    lower.contains("try {")
-        || lower.contains("try{")
-        || lower.contains("catch(")
-        || lower.contains("catch (")
-        || lower.contains(".unwrap_or")
-        || lower.contains("unwrap_or_else")
-        || lower.contains("match err")
-        || lower.contains("=> err(")
-        || (s.contains('?') && (lower.contains(".await") || lower.contains("fn ")))
-}
-
-fn is_off_by_one_fix(old: &str, new: &str) -> bool {
-    let boundary_ctx = |s: &str| {
-        let l = s.to_lowercase();
-        l.contains("len") || l.contains("length") || l.contains("count") || l.contains("size")
-    };
-    if !boundary_ctx(old) && !boundary_ctx(new) {
-        return false;
-    }
-    // Check if < became <= or vice versa, or +1/-1 added/removed
-    (old.contains("< ") && new.contains("<= "))
-        || (old.contains("<= ") && new.contains("< "))
-        || (old.contains("> ") && new.contains(">= "))
-        || (old.contains(">= ") && new.contains("> "))
-        || (!old.contains("+ 1") && new.contains("+ 1"))
-        || (!old.contains("- 1") && new.contains("- 1"))
-        || (old.contains("+ 1") && !new.contains("+ 1"))
-        || (old.contains("- 1") && !new.contains("- 1"))
-}
-
 fn is_config_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
@@ -633,16 +560,28 @@ mod tests {
     }
 
     #[test]
-    fn edit_null_check_detected() {
-        let p = edit_payload(
-            "src/auth.rs",
-            "fn check(token: Token) { token.validate() }",
-            "fn check(token: Token) { if let Some(t) = token.as_ref() { t.validate() } }",
-        );
-        let insights = extract_insights(&p);
-        assert!(insights
-            .iter()
-            .any(|i| i.entry_type == EntryType::Bug && i.title.contains("null check")));
+    fn code_shape_edits_no_longer_claim_to_be_bug_fixes() {
+        // Adding a null check, error handling, or shifting a boundary are
+        // all just shapes in a diff. Inferring "a bug was fixed" from them
+        // produced 229 titled-but-rootless rows; `git blame` answers the
+        // same question better. Real bug memories come from muninn_save.
+        for (old, new) in [
+            (
+                "fn check(token: Token) { token.validate() }",
+                "fn check(token: Token) { if let Some(t) = token.as_ref() { t.validate() } }",
+            ),
+            (
+                "let v = parse(s);",
+                "let v = parse(s).unwrap_or_else(|e| { log(e); default() });",
+            ),
+            ("for i in 0..items.len() - 1 {", "for i in 0..items.len() {"),
+        ] {
+            let insights = extract_insights(&edit_payload("src/auth.rs", old, new));
+            assert!(
+                !insights.iter().any(|i| i.entry_type == EntryType::Bug),
+                "diff shape must not be reported as a bug fix: {new}"
+            );
+        }
     }
 
     #[test]
@@ -676,19 +615,6 @@ mod tests {
         assert!(insights
             .iter()
             .any(|i| i.title.contains("PORT") && i.entry_type == EntryType::Decision));
-    }
-
-    #[test]
-    fn edit_off_by_one_detected() {
-        let p = edit_payload(
-            "src/iter.rs",
-            "for i in 0..items.len() - 1 {",
-            "for i in 0..items.len() {",
-        );
-        let insights = extract_insights(&p);
-        assert!(insights
-            .iter()
-            .any(|i| i.entry_type == EntryType::Bug && i.title.contains("off-by-one")));
     }
 
     #[test]

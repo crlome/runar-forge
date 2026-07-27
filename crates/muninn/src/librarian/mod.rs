@@ -715,19 +715,30 @@ impl MemoryLibrarian {
             .take(session_count)
             .collect();
 
-        // Fetch exactly what gets rendered. The old 40-vs-`take(32)` mismatch
+        // Over-fetch, drop captured input, then trim to what gets rendered.
+        //
+        // Two things this guards. First the 40-vs-`take(32)` mismatch, which
         // meant 20% of every logged injection slot named an entry the packet
-        // never contained — an overstatement baked into every metric derived
-        // from this event.
-        let recent_entries = self
+        // never contained. Second, and larger: this packet is ordered by
+        // recency, so without a type filter it fills with whatever was
+        // written last — measured at 47% captured user prompts and 41%
+        // auto-extracted diffs, leaving zero decisions, patterns or
+        // architecture in a 12.8 KB payload sent to every session. Prompts
+        // are the user's own words read back at them, and session-summary
+        // entries duplicate the "Recent Sessions" block rendered above.
+        let recent_entries: Vec<MemoryEntry> = self
             .storage
             .list(ListFilters {
                 namespace: Some(ns.to_string()),
                 project_id: project_id.map(|s| s.to_string()),
-                limit: Some(CONTEXT_ENTRY_LIMIT),
+                limit: Some(CONTEXT_ENTRY_LIMIT * 4),
                 ..Default::default()
             })
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|e| !matches!(e.entry_type, EntryType::UserPrompt | EntryType::Session))
+            .take(CONTEXT_ENTRY_LIMIT)
+            .collect();
 
         let stats = self.storage.get_stats(ns).await?;
 
@@ -2104,10 +2115,17 @@ Here's a summary of what we did.\n\
         .unwrap();
 
         let packet = lib.get_context(None, Some("proj_a"), 3).await.unwrap();
+        // The session-end entry is deliberately absent: it duplicates the
+        // "Recent Sessions" block, which is rendered from the sessions table.
         assert_eq!(
             packet.recent_entries.len(),
-            2,
-            "entry + session-end entry expected"
+            1,
+            "the context entry surfaces; the session-end entry does not"
+        );
+        assert_eq!(
+            packet.recent_entries[0].entry_type,
+            EntryType::Context,
+            "curated knowledge, not captured input"
         );
         assert_eq!(
             packet.recent_sessions.len(),
@@ -2115,6 +2133,52 @@ Here's a summary of what we did.\n\
             "completed session should surface"
         );
         assert!(!packet.formatted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_packet_excludes_captured_input() {
+        let lib = test_librarian().await;
+
+        // Recency alone fills this packet with whatever was written last.
+        // Measured on a real corpus that was 47% captured prompts and 41%
+        // auto-extracted diffs, leaving no decisions or architecture at all.
+        for i in 0..40 {
+            lib.propose(MemoryEntryInput {
+                title: format!("typed prompt {i}"),
+                content: format!("what does the {i}th thing do"),
+                entry_type: EntryType::UserPrompt,
+                project_id: Some("proj_a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        lib.propose(MemoryEntryInput {
+            title: "Decision: use RRF for fusion".into(),
+            content: "reciprocal rank fusion beat naive score addition".into(),
+            entry_type: EntryType::Decision,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let packet = lib.get_context(None, Some("proj_a"), 3).await.unwrap();
+
+        assert!(
+            packet
+                .recent_entries
+                .iter()
+                .all(|e| e.entry_type != EntryType::UserPrompt),
+            "prompts are the user's own words read back at them"
+        );
+        assert!(
+            packet
+                .recent_entries
+                .iter()
+                .any(|e| e.entry_type == EntryType::Decision),
+            "the decision must survive 40 newer prompts"
+        );
     }
 
     #[tokio::test]
