@@ -194,6 +194,26 @@ pub struct NoiseReport {
     pub matched: usize,
     pub soft_deleted: usize,
     pub by_namespace: BTreeMap<String, usize>,
+    /// Subset of `matched` produced by extraction rules that have since been
+    /// retired. Reported separately so "we stopped writing these" and "we
+    /// removed the ones already written" stay legible as distinct events.
+    pub retired_rule_rows: usize,
+}
+
+/// Titles produced by the three "Bug fix: …" diff rules retired in 0.9.3.
+/// Matched together with the `auto-extract` tag so a human-written bug entry
+/// that happens to share a prefix is never touched.
+const RETIRED_RULE_TITLE_PREFIXES: &[&str] = &[
+    "Bug fix: null check added in ",
+    "Bug fix: error handling added in ",
+    "Bug fix: off-by-one in ",
+];
+
+fn is_retired_rule_row(entry: &crate::types::MemoryEntry) -> bool {
+    entry.tags.iter().any(|t| t == "auto-extract")
+        && RETIRED_RULE_TITLE_PREFIXES
+            .iter()
+            .any(|p| entry.title.starts_with(p))
 }
 
 /// Soft-delete captured prompts that were never user input.
@@ -218,39 +238,58 @@ pub async fn run_purge_noise(
         matched: 0,
         soft_deleted: 0,
         by_namespace: BTreeMap::new(),
+        retired_rule_rows: 0,
     };
 
     const BATCH: usize = 500;
     for ns in &namespaces {
-        let mut offset = 0usize;
-        loop {
-            let batch = lib
-                .list(ListFilters {
-                    namespace: Some(ns.clone()),
-                    entry_type: Some(EntryType::UserPrompt),
-                    limit: Some(BATCH),
-                    offset: Some(offset),
-                    ..Default::default()
-                })
-                .await?;
-            if batch.is_empty() {
-                break;
-            }
-            offset += batch.len();
-
-            for entry in batch {
-                report.scanned += 1;
-                // Judge the stored text with the same filter that guards the
-                // write path, so "what counts as noise" has exactly one
-                // definition and cleanup can never drift from capture.
-                if !crate::protocol::is_machine_generated_prompt(&entry.content) {
-                    continue;
+        // Two cohorts, one command: prompts that were machine payloads, and
+        // rows written by extraction rules that no longer exist. Both are
+        // "the store holds something we would not write today".
+        for entry_type in [EntryType::UserPrompt, EntryType::Bug] {
+            let mut offset = 0usize;
+            loop {
+                let batch = lib
+                    .list(ListFilters {
+                        namespace: Some(ns.clone()),
+                        entry_type: Some(entry_type),
+                        limit: Some(BATCH),
+                        offset: Some(offset),
+                        ..Default::default()
+                    })
+                    .await?;
+                if batch.is_empty() {
+                    break;
                 }
-                report.matched += 1;
-                *report.by_namespace.entry(ns.clone()).or_insert(0) += 1;
-                if !dry_run {
-                    lib.deprecate(entry.id).await?;
-                    report.soft_deleted += 1;
+                offset += batch.len();
+
+                for entry in batch {
+                    report.scanned += 1;
+                    let matched = match entry_type {
+                        // Judge the stored text with the same filter that
+                        // guards the write path, so "what counts as noise"
+                        // has exactly one definition and cleanup can never
+                        // drift from capture.
+                        EntryType::UserPrompt => {
+                            crate::protocol::is_machine_generated_prompt(&entry.content)
+                        }
+                        _ => {
+                            let hit = is_retired_rule_row(&entry);
+                            if hit {
+                                report.retired_rule_rows += 1;
+                            }
+                            hit
+                        }
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    report.matched += 1;
+                    *report.by_namespace.entry(ns.clone()).or_insert(0) += 1;
+                    if !dry_run {
+                        lib.deprecate(entry.id).await?;
+                        report.soft_deleted += 1;
+                    }
                 }
             }
         }
