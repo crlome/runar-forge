@@ -856,33 +856,37 @@ mod tests {
         // `index::index_project(..)` — the callee belongs to no type, so the
         // type branch cannot find it and the bare-name tiers do not apply to a
         // qualified call.
+        let a = native("src/a.rs");
+        let idx = native("src/index.rs");
         let files = vec![
             facts(
-                "src/a.rs",
+                &a,
                 vec![func("caller")],
-                vec![call("src/a.rs:caller", "run_index", Some("index"))],
+                vec![call(&format!("{a}:caller"), "run_index", Some("index"))],
             ),
-            facts("src/index.rs", vec![func("run_index")], vec![]),
+            facts(&idx, vec![func("run_index")], vec![]),
         ];
         let out = resolve(&files, nowhere());
         assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
-        assert_eq!(out.edges[0].target_qualified, "src/index.rs:run_index");
+        assert_eq!(out.edges[0].target_qualified, format!("{idx}:run_index"));
         assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
     }
 
     #[test]
     fn a_module_qualified_call_to_a_module_that_does_not_exist_is_unresolved() {
+        let a = native("src/a.rs");
+        let idx = native("src/index.rs");
         let files = vec![
             facts(
-                "src/a.rs",
+                &a,
                 vec![func("caller")],
-                vec![call("src/a.rs:caller", "run_index", Some("elsewhere"))],
+                vec![call(&format!("{a}:caller"), "run_index", Some("elsewhere"))],
             ),
-            facts("src/index.rs", vec![func("run_index")], vec![]),
+            facts(&idx, vec![func("run_index")], vec![]),
         ];
         let out = resolve(&files, nowhere());
         assert!(out.edges.is_empty(), "got {:?}", out.edges);
-        assert_eq!(out.unresolved.get("src/a.rs"), Some(&1));
+        assert_eq!(out.unresolved.get(a.as_str()), Some(&1));
     }
 
     #[test]
