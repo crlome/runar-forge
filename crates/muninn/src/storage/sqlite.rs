@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::{MemoryStorage, StorageError, StorageResult};
@@ -493,6 +493,27 @@ impl MemoryStorage for SqliteAdapter {
             rusqlite::Error::QueryReturnedNoRows => StorageError::NotFound(id),
             _ => db_err(e),
         })
+    }
+
+    async fn get_by_topic_key(
+        &self,
+        namespace: &str,
+        topic_key: &str,
+    ) -> StorageResult<Option<MemoryEntry>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        db.query_row(
+            "SELECT * FROM memory_entries
+             WHERE namespace = ?1 AND topic_key = ?2 AND deleted_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1",
+            params![namespace, topic_key],
+            row_to_entry,
+        )
+        .optional()
+        .map_err(db_err)
     }
 
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry> {
@@ -3917,6 +3938,70 @@ mod tests {
             entry.topic_key.as_deref(),
             Some("note:topic-key-round-trip")
         );
+    }
+
+    #[tokio::test]
+    async fn get_by_topic_key_resolves_live_row_only() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let first = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "Auth flow v1".into(),
+                    content: "initial write-up".into(),
+                    entry_type: EntryType::Decision,
+                    topic_key: Some("decision:auth-flow".into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let found = adapter
+            .get_by_topic_key("test", "decision:auth-flow")
+            .await
+            .unwrap()
+            .expect("saved topic_key must resolve");
+        assert_eq!(found.id, first.id);
+
+        let missing = adapter
+            .get_by_topic_key("test", "decision:never-written")
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+
+        let other_ns = adapter
+            .get_by_topic_key("other-ns", "decision:auth-flow")
+            .await
+            .unwrap();
+        assert!(other_ns.is_none(), "lookup must stay namespace-scoped");
+
+        let second = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "Auth flow v2".into(),
+                    content: "revised write-up".into(),
+                    entry_type: EntryType::Decision,
+                    topic_key: Some("decision:auth-flow".into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.action, SaveAction::Updated);
+
+        let found = adapter
+            .get_by_topic_key("test", "decision:auth-flow")
+            .await
+            .unwrap()
+            .expect("superseded topic_key must still resolve");
+        assert_eq!(found.id, second.id);
+        assert_ne!(found.id, first.id);
+        assert_eq!(found.title, "Auth flow v2");
+        assert!(found.deleted_at.is_none());
     }
 
     #[tokio::test]

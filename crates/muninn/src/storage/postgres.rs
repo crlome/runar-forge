@@ -443,6 +443,26 @@ impl MemoryStorage for PostgresAdapter {
         Ok(row_to_entry(&row))
     }
 
+    async fn get_by_topic_key(
+        &self,
+        namespace: &str,
+        topic_key: &str,
+    ) -> StorageResult<Option<MemoryEntry>> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT * FROM muninn.memory_entries
+                 WHERE namespace = $1 AND topic_key = $2 AND deleted_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                &[&namespace, &topic_key],
+            )
+            .await
+            .map_err(db_err)?;
+
+        Ok(row.as_ref().map(row_to_entry))
+    }
+
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry> {
         let client = self.get_client().await?;
 

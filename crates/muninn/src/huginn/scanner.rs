@@ -99,9 +99,18 @@ fn walk_dir(
             continue;
         }
 
-        if path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
             walk_dir(&path, root, ignore, files, dirs_scanned);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if let Some(file_entry) = create_file_entry(&path, root) {
                 files.push(file_entry);
             }
@@ -353,6 +362,36 @@ mod tests {
         assert!(paths.contains(&"keep.ts"));
         assert!(!paths.iter().any(|p| p.contains("generated")));
         assert!(!paths.iter().any(|p| p.contains("vendor")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("real.ts"), "export const a = 1\n").unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/app.ts"), "export const b = 2\n").unwrap();
+
+        symlink(root, root.join("src/loop")).unwrap();
+        symlink(root.join("src"), root.join("mirror")).unwrap();
+        symlink(root.join("real.ts"), root.join("alias.ts")).unwrap();
+
+        let result = scan_project(root);
+        let paths: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(result.files.len(), 2);
+        assert!(paths.contains(&"real.ts"));
+        assert!(paths.contains(&"src/app.ts"));
+        assert!(!paths.contains(&"alias.ts"));
+        assert!(!paths.iter().any(|p| p.contains("loop")));
+        assert!(!paths.iter().any(|p| p.contains("mirror")));
     }
 
     #[test]

@@ -55,6 +55,14 @@ pub trait MemoryStorage: Send + Sync {
     // ── Memory entries ─────────────────────────────────────────
     async fn save(&self, input: MemoryEntryInput, namespace: &str) -> StorageResult<SaveResult>;
     async fn get(&self, id: Uuid) -> StorageResult<MemoryEntry>;
+
+    /// Fetch the live entry for a (namespace, topic_key) pair, if any.
+    async fn get_by_topic_key(
+        &self,
+        namespace: &str,
+        topic_key: &str,
+    ) -> StorageResult<Option<MemoryEntry>>;
+
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry>;
 
     /// Record retrieval of the given entries in one atomic statement:

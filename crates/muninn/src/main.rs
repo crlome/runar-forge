@@ -1918,14 +1918,23 @@ async fn main() -> anyhow::Result<()> {
                 huginn::crawl_project_with_mode(&root, &project, &librarian, crawl_mode).await?;
 
             println!("\nCrawl complete:");
-            println!("  Total files:    {}", result.total_files);
-            println!("  Deep analysis:  {}", result.analyzed_deep);
-            println!("  Medium:         {}", result.analyzed_medium);
-            println!("  Light:          {}", result.analyzed_light);
-            println!("  Skipped:        {}", result.skipped);
-            println!("  Patterns found: {}", result.patterns_found);
-            println!("  Tech debt:      {}", result.techdebt_markers);
-            println!("  Entries saved:  {}", result.entries_saved);
+            println!("  Mode:            {:?}", result.effective_mode);
+            println!("  Total files:     {}", result.total_files);
+            println!("  Files changed:   {}", result.files_changed);
+            println!("  Deep analysis:   {}", result.analyzed_deep);
+            println!("  Medium:          {}", result.analyzed_medium);
+            println!("  Light:           {}", result.analyzed_light);
+            println!("  Skipped:         {}", result.skipped);
+            println!("  Patterns found:  {}", result.patterns_found);
+            println!("  Tech debt:       {}", result.techdebt_markers);
+            println!("  Entries saved:   {}", result.entries_saved);
+            println!("  Entries retired: {}", result.entries_deprecated);
+            if matches!(result.effective_mode, huginn::CrawlMode::Incremental) {
+                println!(
+                    "\nCross-file patterns and the architecture summary were left as the last\n\
+                     full crawl produced them. Run with --mode full to refresh them."
+                );
+            }
         }
         Commands::Init {
             storage,
