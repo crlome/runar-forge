@@ -6,7 +6,7 @@
 //! is registered here (unlike the TS version which registers three).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -68,6 +68,9 @@ pub struct ClaudeCodeSetup {
     pub settings_path: PathBuf,
     pub claude_md_path: PathBuf,
     pub binary_path: String,
+    /// Whether the opt-in `Grep|Glob` search-hint PreToolUse hook was written,
+    /// so the caller's summary reports what is actually on disk.
+    pub search_hints: bool,
 }
 
 pub fn detect_project_id() -> String {
@@ -280,9 +283,16 @@ fn runar_hook_entry(matcher: &str, binary_path: &str, args: &[&str], log_path: &
     }
 }
 
+/// Configure Claude Code for `project_id`.
+///
+/// `with_search_hints` is authoritative: whatever the caller passes is what
+/// ends up on disk. Callers that want a re-run to keep the project's previous
+/// choice read it back first with [`search_hints_installed`] — this function
+/// does not guess, so an explicit opt-out is always honoured.
 pub fn setup_claude_code(
     project_id: &str,
     with_auto_capture: bool,
+    with_search_hints: bool,
 ) -> anyhow::Result<ClaudeCodeSetup> {
     let home = home_dir();
 
@@ -340,6 +350,7 @@ pub fn setup_claude_code(
         project_id,
         &log_path,
         with_auto_capture,
+        with_search_hints,
     );
     sobj.insert("hooks".into(), Value::Object(hooks_obj));
 
@@ -367,7 +378,19 @@ pub fn setup_claude_code(
         settings_path,
         claude_md_path,
         binary_path,
+        search_hints: with_search_hints,
     })
+}
+
+/// Does `dir`'s `.claude/settings.json` already carry the opt-in search-hint
+/// PreToolUse hook? Lets a re-run default to the choice the project already
+/// made, instead of silently switching a PreToolUse hook on or off.
+pub fn search_hints_installed(dir: &Path) -> bool {
+    let settings_path = dir.join(".claude").join("settings.json");
+    let Ok(settings) = read_json_or_empty(&settings_path) else {
+        return false;
+    };
+    installed_search_hints(&settings.get("hooks").cloned().unwrap_or(json!({})))
 }
 
 /// Result of `setup claude-code --all-projects`.
@@ -428,22 +451,18 @@ pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
         let Some(project_id) = installed_project_id(&existing_hooks) else {
             // A project carrying runar hooks whose `--project` we cannot read
             // is a migration failure, not a project to pass over in silence.
-            if !hook_commands(&existing_hooks).is_empty() {
+            if !runar_hook_entries(&existing_hooks).is_empty() {
                 skipped.push(dir);
             }
             continue;
         };
 
-        let had_legacy_pre_tool_use = event_has_runar_hook(&existing_hooks, "PreToolUse");
-        // Preserve the auto-capture choice this project was set up with.
-        // Match on unquoted tokens: `shell_quote` wraps each argument, so a
-        // substring test for " enqueue" misses `'enqueue'` and would silently
-        // turn auto-capture off for every recently-configured project.
-        let with_auto_capture = hook_commands(&existing_hooks).iter().any(|c| {
-            c.split_whitespace()
-                .map(|t| t.trim_matches(|ch| ch == '\'' || ch == '"'))
-                .any(|t| t == "enqueue" || t == "summarize")
-        });
+        let had_legacy_pre_tool_use = has_legacy_pre_tool_use(&existing_hooks);
+        // Preserve the choices this project was set up with. A migration
+        // re-points hooks at the current layout; it does not enroll anyone in
+        // a feature they did not ask for, and it does not revoke one they did.
+        let with_auto_capture = installed_auto_capture(&existing_hooks);
+        let with_search_hints = installed_search_hints(&existing_hooks);
 
         let hooks_obj = build_hooks_object(
             &existing_hooks,
@@ -451,6 +470,7 @@ pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
             &project_id,
             &log_path,
             with_auto_capture,
+            with_search_hints,
         );
         sobj.insert("hooks".into(), Value::Object(hooks_obj));
         write_json_pretty(&settings_path, &settings)?;
@@ -464,8 +484,47 @@ pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
     Ok(MigrationOutcome { migrated, skipped })
 }
 
-/// Every runar hook command string across all events, in any order.
-fn hook_commands(existing_hooks: &Value) -> Vec<String> {
+/// Strip the shell quoting `shell_quote` adds around every argument. The FLAG
+/// is quoted too, not just its value: a hook written by a recent version reads
+/// `'--project' 'proj'`, so comparing a raw token against `--project` matched
+/// nothing and skipped the whole project. Since v0.9.0's own setup writes that
+/// quoted form, that made the migration a no-op on anything it had already
+/// touched.
+fn unquote(s: &str) -> &str {
+    s.trim_matches(|c| c == '\'' || c == '"')
+}
+
+/// Unquoted argument tokens of every runar-owned command in one hook entry.
+///
+/// Reads both representations `runar_hook_entry` emits: the Unix shell-form
+/// string and the Windows exec form, where the subcommand lives in `args` and
+/// a scan of `command` alone sees nothing but the binary path.
+fn runar_hook_tokens(entry: &Value) -> Vec<String> {
+    let Some(inner) = entry.get("hooks").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    for h in inner {
+        let Some(command) = h.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if !command.contains("runar") {
+            continue;
+        }
+        tokens.extend(command.split_whitespace().map(|t| unquote(t).to_string()));
+        if let Some(args) = h.get("args").and_then(|v| v.as_array()) {
+            tokens.extend(
+                args.iter()
+                    .filter_map(|a| a.as_str())
+                    .map(|a| unquote(a).to_string()),
+            );
+        }
+    }
+    tokens
+}
+
+/// Every runar hook entry across all events, in any order.
+fn runar_hook_entries(existing_hooks: &Value) -> Vec<&Value> {
     let Some(events) = existing_hooks.as_object() else {
         return Vec::new();
     };
@@ -473,60 +532,68 @@ fn hook_commands(existing_hooks: &Value) -> Vec<String> {
         .values()
         .filter_map(|v| v.as_array())
         .flatten()
-        .filter_map(|entry| entry.get("hooks").and_then(|v| v.as_array()))
-        .flatten()
-        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
-        .filter(|c| c.contains("runar"))
-        .map(str::to_string)
+        .filter(|entry| !runar_hook_tokens(entry).is_empty())
         .collect()
 }
 
-fn event_has_runar_hook(existing_hooks: &Value, event: &str) -> bool {
+/// The runar-owned PreToolUse entries only.
+fn pre_tool_runar_entries(existing_hooks: &Value) -> Vec<&Value> {
     existing_hooks
-        .get(event)
+        .get("PreToolUse")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(|v| v.as_array())
-                    .map(|inner| {
-                        inner.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.contains("runar"))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            })
+            arr.iter()
+                .filter(|entry| !runar_hook_tokens(entry).is_empty())
+                .collect()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+fn is_search_hint_entry(entry: &Value) -> bool {
+    runar_hook_tokens(entry).iter().any(|t| t == "hint")
+}
+
+/// Is the opt-in search-hint hook already installed?
+fn installed_search_hints(existing_hooks: &Value) -> bool {
+    pre_tool_runar_entries(existing_hooks)
+        .into_iter()
+        .any(is_search_hint_entry)
+}
+
+/// A runar PreToolUse entry that is *not* the opt-in search-hint hook — i.e.
+/// the pre-v0.9.0 `context` hook this migration exists to remove. A project
+/// that opted into search hints carries a PreToolUse entry by design, so it
+/// must not be counted as a legacy install on every re-run.
+fn has_legacy_pre_tool_use(existing_hooks: &Value) -> bool {
+    pre_tool_runar_entries(existing_hooks)
+        .into_iter()
+        .any(|e| !is_search_hint_entry(e))
+}
+
+/// Was this project set up with auto-capture? Matched on unquoted tokens: a
+/// substring test for " enqueue" misses `'enqueue'` and would silently turn
+/// auto-capture off for every recently-configured project.
+fn installed_auto_capture(existing_hooks: &Value) -> bool {
+    runar_hook_entries(existing_hooks).into_iter().any(|e| {
+        runar_hook_tokens(e)
+            .iter()
+            .any(|t| t == "enqueue" || t == "summarize")
+    })
 }
 
 /// Recover the `--project <id>` a project's hooks were installed with, so a
 /// migration never silently re-namespaces someone's memories.
 fn installed_project_id(existing_hooks: &Value) -> Option<String> {
-    fn unquote(s: &str) -> &str {
-        s.trim_matches(|c| c == '\'' || c == '"')
-    }
-    for command in hook_commands(existing_hooks) {
-        let mut parts = command.split_whitespace();
+    for entry in runar_hook_entries(existing_hooks) {
+        let tokens = runar_hook_tokens(entry);
+        let mut parts = tokens.iter();
         while let Some(tok) = parts.next() {
-            // Unquote the FLAG too, not just its value. `shell_quote` wraps
-            // every argument, so a hook written by a recent version reads
-            // `'--project' 'proj'` — comparing the raw token against
-            // `--project` silently matched nothing and skipped the whole
-            // project. Since v0.9.0's own setup writes that quoted form,
-            // this made the migration a no-op on anything it had already
-            // touched.
-            if unquote(tok) != "--project" {
+            if tok != "--project" {
                 continue;
             }
-            if let Some(raw) = parts.next() {
-                let id = unquote(raw);
+            if let Some(id) = parts.next() {
                 if !id.is_empty() {
-                    return Some(id.to_string());
+                    return Some(id.clone());
                 }
             }
         }
@@ -545,6 +612,7 @@ fn build_hooks_object(
     project_id: &str,
     log_path: &str,
     with_auto_capture: bool,
+    with_search_hints: bool,
 ) -> serde_json::Map<String, Value> {
     // Render each hook from a raw arg vector. Shell-form (quoted) on Unix,
     // exec-form (no shell) on Windows — see `runar_hook_entry`.
@@ -587,12 +655,28 @@ fn build_hooks_object(
             .unwrap_or_default(),
     );
 
+    // `pre_tool` now holds only non-runar entries; the runar ones were stripped
+    // by filter_runar_hooks, which is also what migrates existing installs off
+    // the pre-v0.9.0 context hook on re-run.
+    let mut pre_tool = pre_tool;
+    if with_search_hints {
+        // The one PreToolUse hook allowed back in, and only opt-in. What keeps
+        // it survivable is the matcher: `Grep|Glob` fire a handful of times per
+        // session where the v0.9.0 ".*" hook fired 243×. Widening this to
+        // `Read` or `Search` puts it straight back on the hot path.
+        //
+        // Routed through `hint`, never `context`: main.rs deliberately empties
+        // any PreToolUse `context` payload, so `context` here would be a hook
+        // that fires and delivers nothing.
+        pre_tool.push(entry(
+            "Grep|Glob",
+            &["hint", "--silent", "--project", project_id],
+        ));
+    }
+
     // The context packet is session-scoped, so it belongs on SessionStart.
     // Until v0.9.0 it was wired to PreToolUse with matcher ".*" — every tool
     // call, no cache: 243 fires per session, 98.8% of them byte-identical.
-    // `pre_tool` is intentionally left with only non-runar entries (they were
-    // already stripped by filter_runar_hooks), which also migrates existing
-    // installs on re-run.
     let mut session_start = session_start;
     session_start.push(entry(
         ".*",
@@ -832,7 +916,34 @@ mod tests {
     }
 
     fn hooks_for(existing: Value) -> serde_json::Map<String, Value> {
-        build_hooks_object(&existing, "/bin/runar", "proj", "/log/hook.log", false)
+        build_hooks_object(
+            &existing,
+            "/bin/runar",
+            "proj",
+            "/log/hook.log",
+            false,
+            false,
+        )
+    }
+
+    /// Same, with the opt-in search-hint hook enabled.
+    fn hooks_with_hints(existing: Value) -> serde_json::Map<String, Value> {
+        build_hooks_object(
+            &existing,
+            "/bin/runar",
+            "proj",
+            "/log/hook.log",
+            false,
+            true,
+        )
+    }
+
+    fn entries_for(hooks: &serde_json::Map<String, Value>, event: &str) -> Vec<Value> {
+        hooks
+            .get(event)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Full invocation per hook entry. Unix stores one shell-form string;
@@ -916,12 +1027,12 @@ mod tests {
                 }]
             }]
         });
-        let detected = hook_commands(&quoted_with_capture).iter().any(|c| {
-            c.split_whitespace()
-                .map(|t| t.trim_matches(|ch| ch == '\'' || ch == '"'))
-                .any(|t| t == "enqueue" || t == "summarize")
-        });
-        assert!(detected, "auto-capture must survive a migration");
+        assert!(
+            installed_auto_capture(&quoted_with_capture),
+            "auto-capture must survive a migration"
+        );
+        let fresh = Value::Object(hooks_for(json!({})));
+        assert!(!installed_auto_capture(&fresh));
     }
 
     #[test]
@@ -978,7 +1089,7 @@ mod tests {
             ]
         });
 
-        let hooks = hooks_for(existing);
+        let hooks = hooks_for(existing.clone());
         let pre_tool = commands_for(&hooks, "PreToolUse");
 
         assert_eq!(
@@ -986,6 +1097,213 @@ mod tests {
             vec!["/usr/local/bin/my-own-linter".to_string()],
             "someone else's hooks are not ours to delete"
         );
+
+        // Same with the opt-in hook on: ours is added, theirs is untouched.
+        let hooks = hooks_with_hints(existing);
+        let pre_tool = commands_for(&hooks, "PreToolUse");
+        assert_eq!(pre_tool.len(), 2, "{pre_tool:?}");
+        assert!(pre_tool.iter().any(|c| c == "/usr/local/bin/my-own-linter"));
+        assert!(!pre_tool.iter().any(|c| c.contains("context")));
+    }
+
+    #[test]
+    fn search_hints_add_exactly_one_narrow_pre_tool_use_hook() {
+        let hooks = hooks_with_hints(json!({}));
+        let pre_tool = entries_for(&hooks, "PreToolUse");
+
+        assert_eq!(
+            pre_tool.len(),
+            1,
+            "PreToolUse is the hot path — one entry, never a second: {pre_tool:?}"
+        );
+        assert_eq!(pre_tool[0]["matcher"], "Grep|Glob");
+
+        let tokens = runar_hook_tokens(&pre_tool[0]);
+        let rendered = commands_for(&hooks, "PreToolUse");
+        assert!(
+            tokens.iter().any(|t| t == "hint"),
+            "must run the code-graph hint subcommand: {rendered:?}"
+        );
+        assert!(
+            !tokens.iter().any(|t| t == "context"),
+            "main.rs empties any PreToolUse `context` payload by design — a \
+             `context` hook here fires and delivers nothing: {rendered:?}"
+        );
+        assert_eq!(
+            tokens.iter().filter(|t| *t == "--project").count(),
+            1,
+            "{rendered:?}"
+        );
+        assert!(tokens.iter().any(|t| t == "proj"), "{rendered:?}");
+
+        // Everything else stays exactly where v0.9.0 put it.
+        assert!(commands_for(&hooks, "SessionStart")
+            .iter()
+            .any(|c| c.contains("context")));
+    }
+
+    #[test]
+    fn search_hint_matcher_can_never_widen() {
+        // The incident this guards: matcher ".*" on PreToolUse fired 243×
+        // per session, 98.8% of the payloads byte-identical. `Grep|Glob` fire
+        // a handful of times; `Read`, `Search` or a bare wildcard would put
+        // the hook back on the hot path with no other code change needed.
+        let hooks = hooks_with_hints(json!({}));
+        for entry in entries_for(&hooks, "PreToolUse") {
+            let matcher = entry["matcher"].as_str().expect("matcher is a string");
+            assert_eq!(
+                matcher, "Grep|Glob",
+                "the search-hint matcher must not widen"
+            );
+            let tools: Vec<&str> = matcher.split('|').collect();
+            assert_eq!(tools, ["Grep", "Glob"]);
+            for banned in [
+                "Read",
+                "Search",
+                "Bash",
+                "Task",
+                "Write",
+                "Edit",
+                "MultiEdit",
+                ".*",
+                "*",
+                "",
+            ] {
+                assert!(
+                    !tools.contains(&banned),
+                    "PreToolUse must not match `{banned}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_context_pre_tool_use_is_removed_even_with_search_hints_on() {
+        // The opt-in hook must not become a hiding place for the hook v0.9.0
+        // removed: the legacy `.*` context entry still has to go.
+        let legacy = json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "'/Users/x/.runar-forge/bin/runar' context --silent --project 'proj'"
+                }]
+            }]
+        });
+
+        let hooks = hooks_with_hints(legacy);
+        let pre_tool = entries_for(&hooks, "PreToolUse");
+
+        assert_eq!(pre_tool.len(), 1, "{pre_tool:?}");
+        assert_eq!(pre_tool[0]["matcher"], "Grep|Glob");
+        let rendered = commands_for(&hooks, "PreToolUse");
+        assert!(
+            !rendered.iter().any(|c| c.contains("context")),
+            "{rendered:?}"
+        );
+        assert!(commands_for(&hooks, "SessionStart")
+            .iter()
+            .any(|c| c.contains("context")));
+    }
+
+    #[test]
+    fn a_rerun_preserves_an_installed_search_hint_hook() {
+        // `build_hooks_object` always rewrites from the flag, so what carries
+        // the choice across a re-run is the detection. Migration reads the
+        // settings file; the plain path reads `search_hints_installed`.
+        let installed = Value::Object(hooks_with_hints(json!({})));
+        assert!(installed_search_hints(&installed));
+        assert!(
+            !has_legacy_pre_tool_use(&installed),
+            "the opt-in hook is not a legacy install to migrate off"
+        );
+
+        let rebuilt = build_hooks_object(
+            &installed,
+            "/bin/runar",
+            "proj",
+            "/log/hook.log",
+            false,
+            installed_search_hints(&installed),
+        );
+        let pre_tool = entries_for(&rebuilt, "PreToolUse");
+        assert_eq!(pre_tool.len(), 1, "no duplicate on re-run: {pre_tool:?}");
+        assert_eq!(pre_tool[0]["matcher"], "Grep|Glob");
+    }
+
+    #[test]
+    fn a_rerun_does_not_silently_enroll_a_project_in_search_hints() {
+        let fresh = Value::Object(hooks_for(json!({})));
+        assert!(!installed_search_hints(&fresh));
+
+        // A pre-v0.9.0 install carries a PreToolUse entry, but it is the
+        // `context` hook — migrating it must not read as an opt-in.
+        let legacy = json!({
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "'/Users/x/.runar-forge/bin/runar' 'context' '--silent' '--project' 'proj'"
+                }]
+            }]
+        });
+        assert!(!installed_search_hints(&legacy));
+        assert!(has_legacy_pre_tool_use(&legacy));
+    }
+
+    #[test]
+    fn installed_state_is_read_from_exec_form_hooks() {
+        // Windows hooks put the subcommand in `args`; reading `command` alone
+        // sees only the binary path, so every migration decision — project id,
+        // auto-capture, search hints — would silently read as "not set".
+        let exec_form = json!({
+            "PreToolUse": [{
+                "matcher": "Grep|Glob",
+                "hooks": [{
+                    "type": "command",
+                    "command": "C:\\Users\\x\\.runar-forge\\bin\\runar.exe",
+                    "args": ["hint", "--silent", "--project", "proj"]
+                }]
+            }],
+            "SessionEnd": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "C:\\Users\\x\\.runar-forge\\bin\\runar.exe",
+                    "args": ["summarize", "--silent", "--project", "proj"]
+                }]
+            }]
+        });
+
+        assert!(installed_search_hints(&exec_form));
+        assert!(!has_legacy_pre_tool_use(&exec_form));
+        assert!(installed_auto_capture(&exec_form));
+        assert_eq!(installed_project_id(&exec_form).as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn search_hints_installed_reads_a_projects_settings_file() {
+        crate::test_support::with_runar_home(|| {
+            let dir = home_dir();
+            let claude_dir = dir.join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            let settings_path = claude_dir.join("settings.json");
+
+            assert!(
+                !search_hints_installed(&dir),
+                "a missing settings file is not an opt-in"
+            );
+
+            write_json_pretty(&settings_path, &json!({ "hooks": hooks_for(json!({})) })).unwrap();
+            assert!(!search_hints_installed(&dir));
+
+            write_json_pretty(
+                &settings_path,
+                &json!({ "hooks": hooks_with_hints(json!({})) }),
+            )
+            .unwrap();
+            assert!(search_hints_installed(&dir));
+        });
     }
 
     #[cfg(not(windows))]

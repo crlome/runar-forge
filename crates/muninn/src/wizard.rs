@@ -121,7 +121,7 @@ pub fn run_wizard() -> anyhow::Result<WizardResult> {
         .interact()?;
 
     if ran_setup {
-        match setup::setup_claude_code(&project_id, false) {
+        match setup::setup_claude_code(&project_id, false, false) {
             Ok(result) => {
                 println!("  MCP registered:  {}", result.claude_json_path.display());
                 println!("  Hooks written:   {}", result.settings_path.display());

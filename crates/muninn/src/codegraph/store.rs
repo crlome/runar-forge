@@ -525,6 +525,20 @@ impl CodeGraphStore {
 
     // ── Queries ────────────────────────────────────────────────────
 
+    /// Read-only handle if this project has a graph, else `None`.
+    ///
+    /// For the hook paths, which must never create the file, never migrate it,
+    /// and never fail a hook: every problem is simply "no graph".
+    pub fn open_if_indexed(project: &str) -> Option<Self> {
+        let path = Self::default_path();
+        if !path.exists() {
+            return None;
+        }
+        let store = Self::open_readonly(&path).ok()?;
+        let known = store.projects().ok()?;
+        known.iter().any(|p| p == project).then_some(store)
+    }
+
     /// Every project with a graph, oldest index first.
     pub fn projects(&self) -> Result<Vec<String>> {
         let db = self.lock()?;

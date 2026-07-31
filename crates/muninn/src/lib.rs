@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod embedding;
 pub mod extract;
 pub mod fts_query;
+pub mod hint;
 pub mod hooks_runtime;
 pub mod huginn;
 pub mod identity;
