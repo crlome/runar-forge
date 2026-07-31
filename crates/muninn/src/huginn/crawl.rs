@@ -197,11 +197,11 @@ impl<'a> CrawlOrchestrator<'a> {
             .await;
 
         // Phase 2.7: Symbol-level code graph. Runs ahead of the no-change
-        // shortcut below because this slice always rebuilds the whole graph,
-        // so a first `--deep` run must not be skipped just because the memory
-        // entries are already current.
+        // shortcut below: the memory entries and the graph are indexed
+        // independently, so a first `--deep` run must not be skipped just
+        // because the entries are already current.
         let codegraph = if self.deep {
-            self.index_codegraph(root, &scan.files)
+            self.index_codegraph(root, &scan.files, !incremental)
         } else {
             None
         };
@@ -376,6 +376,7 @@ impl<'a> CrawlOrchestrator<'a> {
         &self,
         root: &Path,
         files: &[FileEntry],
+        full: bool,
     ) -> Option<crate::codegraph::index::IndexOutcome> {
         use crate::codegraph::{index, store::CodeGraphStore};
 
@@ -395,7 +396,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 return None;
             }
         };
-        match index::index_project(&store, &self.project_id, root, files) {
+        match index::index_project(&store, &self.project_id, root, files, full) {
             Ok(outcome) => {
                 tracing::info!(
                     symbols = outcome.symbols,

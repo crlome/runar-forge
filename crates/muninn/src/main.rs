@@ -66,9 +66,12 @@ enum Commands {
         /// Crawl mode: auto | full | incremental (default: auto)
         #[arg(long, default_value = "auto")]
         mode: String,
-        /// Also build the symbol-level code graph (definitions, calls, metrics)
-        #[arg(long)]
+        /// Deprecated no-op: the code graph is built by default.
+        #[arg(long, hide = true)]
         deep: bool,
+        /// Skip the symbol-level code graph (definitions, calls, metrics).
+        #[arg(long)]
+        no_deep: bool,
     },
 
     /// Initialize RunarForge configuration
@@ -2363,7 +2366,12 @@ async fn main() -> anyhow::Result<()> {
             project,
             mode,
             deep,
+            no_deep,
         } => {
+            // `--deep` is kept as an accepted no-op so existing scripts and
+            // docs keep working now that it is the default.
+            let _ = deep;
+            let deep = !no_deep;
             let librarian = create_librarian().await?;
             let root = std::path::Path::new(&path).canonicalize()?;
 
@@ -2394,6 +2402,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Symbols:         {}", cg.symbols);
                 println!("  Call edges:      {}", cg.edges);
                 println!("  Files parsed:    {}", cg.files_indexed + cg.files_partial);
+                if cg.files_reused > 0 {
+                    println!("  Reused unchanged:{}", cg.files_reused);
+                }
                 println!("  Partial parses:  {}", cg.files_partial);
                 println!("  Not parseable:   {}", cg.files_skipped);
                 println!("  Unresolved calls:{}", cg.unresolved_calls);
