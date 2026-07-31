@@ -61,6 +61,23 @@ impl SymbolLabel {
         })
     }
 
+    /// Round-trip the stored string. Unknown labels read as `Function`, which
+    /// is the safest wrong answer: it is callable and owns nothing.
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "Method" => SymbolLabel::Method,
+            "Class" => SymbolLabel::Class,
+            "Interface" => SymbolLabel::Interface,
+            "Trait" => SymbolLabel::Trait,
+            "Struct" => SymbolLabel::Struct,
+            "Enum" => SymbolLabel::Enum,
+            "Type" => SymbolLabel::Type,
+            "Const" => SymbolLabel::Const,
+            "Module" => SymbolLabel::Module,
+            _ => SymbolLabel::Function,
+        }
+    }
+
     /// Whether this label can own methods, which is what makes it a container
     /// for qualified names and for the suffix resolution tier.
     pub fn is_container(self) -> bool {
@@ -137,6 +154,14 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "INHERITS" => EdgeKind::Inherits,
+            "IMPLEMENTS" => EdgeKind::Implements,
+            _ => EdgeKind::Calls,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeKind::Calls => "CALLS",

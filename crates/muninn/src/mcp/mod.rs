@@ -1132,7 +1132,7 @@ async fn tool_huginn_crawl(
         .map(CrawlMode::parse)
         .unwrap_or(CrawlMode::Auto);
     let focus = args.get("focus").and_then(|v| v.as_str()).map(String::from);
-    let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+    let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let root = std::path::Path::new(project_path)
         .canonicalize()
@@ -1157,6 +1157,7 @@ async fn tool_huginn_crawl(
             "edges": cg.edges,
             "filesParsed": cg.files_indexed + cg.files_partial,
             "filesPartial": cg.files_partial,
+            "filesReused": cg.files_reused,
             "filesNotParseable": cg.files_skipped,
             "filesErrored": cg.files_errored,
             "unresolvedCalls": cg.unresolved_calls,
@@ -1934,7 +1935,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "projectId": { "type": "string", "description": "Project identifier (used as namespace)" },
                     "mode": { "type": "string", "enum": ["full", "incremental", "auto"], "description": "Crawl mode (default: auto)" },
                     "focus": { "type": "string", "description": "Optional subpath to focus crawl on" },
-                    "deep": { "type": "boolean", "description": "Also build the symbol-level code graph: definitions, call edges and per-function complexity (default: false)" },
+                    "deep": { "type": "boolean", "description": "Build the symbol-level code graph: definitions, call edges and per-function complexity (default: true; unchanged files are reused, so a re-crawl is cheap)" },
                 },
                 "required": ["projectPath", "projectId"],
                 "additionalProperties": false,

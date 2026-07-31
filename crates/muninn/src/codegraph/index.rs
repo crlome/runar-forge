@@ -1,9 +1,10 @@
 //! Crawl-side orchestration: turn a scanned inventory into a stored graph.
 //!
-//! This slice always re-parses every supported file. Content hashes are
-//! recorded so a later slice can skip unchanged files, but that also needs the
-//! raw call sites persisted — resolution is project-wide, so an incremental
-//! pass cannot re-resolve using only the files it re-read.
+//! An incremental pass re-parses only files whose content hash changed, then
+//! re-resolves the WHOLE project — resolution is project-wide, so a call in an
+//! untouched file can start or stop resolving because of an edit elsewhere.
+//! That is affordable because each file's unresolved facts are stored, so a
+//! re-resolve costs a few table scans rather than a parse per file.
 
 use std::path::Path;
 
@@ -12,7 +13,7 @@ use crate::huginn::scanner::FileEntry;
 
 use super::extract::{extract_file, is_supported};
 use super::resolve::{resolve, FileFacts};
-use super::store::{CodeGraphStore, FileRecord, Result, SymbolRecord};
+use super::store::{CodeGraphStore, FileRecord, RawFacts, Result, SymbolRecord};
 use super::{qualified_name, FileStatus};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub struct IndexOutcome {
     pub files_partial: usize,
     pub files_skipped: usize,
     pub files_errored: usize,
+    /// Files whose content hash was unchanged, so they were not re-parsed.
+    pub files_reused: usize,
     pub symbols: usize,
     pub edges: usize,
     pub unresolved_calls: usize,
@@ -43,14 +46,25 @@ pub fn index_project(
     project: &str,
     root: &Path,
     files: &[FileEntry],
+    full: bool,
 ) -> Result<IndexOutcome> {
-    store.begin_project(project, root, true)?;
+    // A full pass clears the project first; an incremental one keeps every row
+    // it is not about to replace.
+    store.begin_project(project, root, full)?;
 
+    let known = if full {
+        std::collections::HashMap::new()
+    } else {
+        store.file_hashes(project)?
+    };
     let mut outcome = IndexOutcome::default();
     let mut facts: Vec<FileFacts> = Vec::new();
+    let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for file in files {
         let rel = file.relative_path.clone();
+        present.insert(rel.clone());
         let lang = Lang::from_extension(&file.extension);
 
         let Some(lang) = lang.filter(|l| is_supported(*l)) else {
@@ -64,6 +78,7 @@ pub fn index_project(
                     detail: None,
                 },
                 &[],
+                RawFacts::default(),
             )?;
             outcome.files_skipped += 1;
             continue;
@@ -82,6 +97,7 @@ pub fn index_project(
                         detail: Some(&e.to_string()),
                     },
                     &[],
+                    RawFacts::default(),
                 )?;
                 outcome.files_errored += 1;
                 continue;
@@ -101,11 +117,20 @@ pub fn index_project(
                         detail: Some("not valid UTF-8"),
                     },
                     &[],
+                    RawFacts::default(),
                 )?;
                 outcome.files_errored += 1;
                 continue;
             }
         };
+
+        // Unchanged since the last pass: its stored facts are still valid and
+        // are loaded in bulk below instead of being re-derived.
+        if known.get(&rel).is_some_and(|h| *h == hash) {
+            outcome.files_reused += 1;
+            continue;
+        }
+        touched.insert(rel.clone());
 
         let extract = extract_file(&source, lang, &rel);
         let status = if extract.had_errors {
@@ -146,8 +171,28 @@ pub fn index_project(
                 detail: detail.as_deref(),
             },
             &records,
+            RawFacts {
+                calls: &extract.calls,
+                imports: &extract.imports,
+                relations: &extract.relations,
+            },
         )?;
         facts.push(FileFacts { path: rel, extract });
+    }
+
+    // Files gone from the inventory must not keep contributing edges. Only on
+    // an incremental pass — a full one already cleared the project.
+    if !full {
+        for stale in known.keys().filter(|p| !present.contains(p.as_str())) {
+            store.forget_file(project, stale)?;
+        }
+    }
+
+    // Everything not re-parsed, read back rather than re-derived. This is the
+    // whole point of persisting the raw facts.
+    for (path, extract) in store.load_extracts(project, &touched)? {
+        outcome.symbols += extract.symbols.len();
+        facts.push(FileFacts { path, extract });
     }
 
     let resolved = resolve(&facts, root);
@@ -159,8 +204,12 @@ pub fn index_project(
 
     // Report what was stored, not what was resolved: two call sites on the
     // same line to the same definition collapse into one edge, and a count
-    // that disagrees with the graph is a count nobody can check.
-    outcome.edges = store.coverage(project)?.edges;
+    // that disagrees with the graph is a count nobody can check. The same
+    // applies to symbols, which now come partly from this pass and partly from
+    // rows an earlier one wrote.
+    let cov = store.coverage(project)?;
+    outcome.edges = cov.edges;
+    outcome.symbols = cov.symbols;
 
     let summary = render_summary(store, project, &outcome)?;
     store.set_summary(project, &summary)?;
@@ -246,7 +295,7 @@ mod tests {
         ];
 
         let store = CodeGraphStore::in_memory().unwrap();
-        let out = index_project(&store, "p", root, &files).unwrap();
+        let out = index_project(&store, "p", root, &files, true).unwrap();
 
         assert_eq!(out.files_skipped, 2, "md and java are not parseable here");
         let cov = store.coverage("p").unwrap();
@@ -259,13 +308,76 @@ mod tests {
         );
     }
 
+    /// The property that makes incremental indexing safe to default: the graph
+    /// it produces must be indistinguishable from a full rebuild.
+    #[test]
+    fn an_incremental_pass_agrees_with_a_full_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = || {
+            vec![
+                entry(
+                    root,
+                    "src/a.rs",
+                    "pub mod b;\nuse crate::b::helper;\npub fn alpha() { helper(); }\n",
+                ),
+                entry(root, "src/b.rs", "pub fn helper() {}\n"),
+                entry(root, "src/c.rs", "pub fn gamma() {}\n"),
+            ]
+        };
+
+        let full_store = CodeGraphStore::in_memory().unwrap();
+        index_project(&full_store, "p", root, &files(), true).unwrap();
+        let full_cov = full_store.coverage("p").unwrap();
+
+        let inc_store = CodeGraphStore::in_memory().unwrap();
+        index_project(&inc_store, "p", root, &files(), true).unwrap();
+        // Edit one file; the other two must be reused, not re-parsed.
+        let changed = vec![
+            entry(
+                root,
+                "src/a.rs",
+                "pub mod b;\nuse crate::b::helper;\npub fn alpha() { helper(); helper(); }\n",
+            ),
+            entry(root, "src/b.rs", "pub fn helper() {}\n"),
+            entry(root, "src/c.rs", "pub fn gamma() {}\n"),
+        ];
+        let out = index_project(&inc_store, "p", root, &changed, false).unwrap();
+        assert_eq!(out.files_reused, 2, "unchanged files must not be re-parsed");
+
+        let inc_cov = inc_store.coverage("p").unwrap();
+        assert_eq!(inc_cov.symbols, full_cov.symbols);
+        assert_eq!(inc_cov.files_total, full_cov.files_total);
+        // The cross-file edge lives in a file that was reused, so it only
+        // survives because the stored facts were re-resolved.
+        assert!(inc_cov.edges > 0, "the alpha -> helper edge was lost");
+        assert_eq!(inc_cov.edges, full_cov.edges);
+    }
+
+    #[test]
+    fn an_incremental_pass_forgets_a_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = entry(root, "src/a.rs", "pub fn alpha() {}\n");
+        let b = entry(root, "src/b.rs", "pub fn beta() {}\n");
+
+        let store = CodeGraphStore::in_memory().unwrap();
+        index_project(&store, "p", root, &[a.clone(), b], true).unwrap();
+        assert_eq!(store.coverage("p").unwrap().symbols, 2);
+
+        index_project(&store, "p", root, &[a], false).unwrap();
+        let cov = store.coverage("p").unwrap();
+        assert_eq!(cov.symbols, 1, "the deleted file kept contributing symbols");
+        assert_eq!(cov.files_total, 1);
+    }
+
     #[test]
     fn a_summary_is_stored_for_the_hook_path() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let files = vec![entry(root, "src/a.rs", "pub fn alpha() {}\n")];
         let store = CodeGraphStore::in_memory().unwrap();
-        index_project(&store, "p", root, &files).unwrap();
+        index_project(&store, "p", root, &files, true).unwrap();
 
         let summary = store.summary("p").unwrap().expect("summary is stored");
         assert!(summary.contains("symbols"), "got {summary}");
@@ -279,7 +391,7 @@ mod tests {
         let mut f = entry(root, "src/bad.rs", "pub fn x() {}\n");
         f.path = root.join("src/does-not-exist.rs");
         let store = CodeGraphStore::in_memory().unwrap();
-        let out = index_project(&store, "p", root, &[f]).unwrap();
+        let out = index_project(&store, "p", root, &[f], true).unwrap();
         assert_eq!(out.files_errored, 1);
         assert_eq!(store.coverage("p").unwrap().errored, 1);
     }

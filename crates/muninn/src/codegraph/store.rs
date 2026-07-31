@@ -11,11 +11,14 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
-use super::{name_tokens, EdgeKind, FileStatus, Resolution, SymbolMetrics};
+use super::{
+    name_tokens, EdgeKind, FileExtract, FileStatus, RawCall, RawImport, RawRelation, RawSymbol,
+    Resolution, SymbolLabel, SymbolMetrics,
+};
 
 /// Bumping this discards every project's graph. Do it whenever the extracted
 /// shape changes, since a partially-old graph is worse than no graph.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Cross-process contention is real here: a crawl writes while hooks and the
 /// MCP server read the same file.
@@ -71,6 +74,15 @@ pub struct FileRecord<'a> {
     pub detail: Option<&'a str>,
 }
 
+/// The unresolved facts a file contributes, stored so a later pass can
+/// re-resolve the whole project without re-parsing any of it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RawFacts<'a> {
+    pub calls: &'a [RawCall],
+    pub imports: &'a [RawImport],
+    pub relations: &'a [RawRelation],
+}
+
 /// A resolved relation between two definitions.
 #[derive(Debug, Clone)]
 pub struct EdgeRecord {
@@ -123,6 +135,52 @@ fn delete_fts_rows(
     };
     for id in ids {
         tx.execute("DELETE FROM code_symbols_fts WHERE rowid = ?1", params![id])?;
+    }
+    Ok(())
+}
+
+/// The container out of a stored qualified name (`src/a.rs:Engine.run`).
+/// Anchored on the last colon because a path may contain dots.
+fn container_of_qualified(qualified: &str) -> Option<String> {
+    let tail = qualified.rsplit(':').next()?;
+    let (container, _) = tail.rsplit_once('.')?;
+    (!container.is_empty()).then(|| container.to_string())
+}
+
+/// Replace one file's unresolved facts. Same transaction as its symbols, so a
+/// file is never half-described.
+fn write_raw_facts(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    path: &str,
+    raw: RawFacts<'_>,
+) -> Result<()> {
+    for table in ["code_calls", "code_imports", "code_relations"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE project = ?1 AND file_path = ?2"),
+            params![project, path],
+        )?;
+    }
+    for c in raw.calls {
+        tx.execute(
+            "INSERT INTO code_calls (project, file_path, caller, callee, qualifier, line)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![project, path, c.caller, c.callee, c.qualifier, c.line],
+        )?;
+    }
+    for i in raw.imports {
+        tx.execute(
+            "INSERT INTO code_imports (project, file_path, local_name, source)
+             VALUES (?1,?2,?3,?4)",
+            params![project, path, i.local_name, i.source],
+        )?;
+    }
+    for r in raw.relations {
+        tx.execute(
+            "INSERT INTO code_relations (project, file_path, subject, object, kind)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![project, path, r.subject, r.object, r.kind.as_str()],
+        )?;
     }
     Ok(())
 }
@@ -224,6 +282,8 @@ impl CodeGraphStore {
             "DROP TABLE IF EXISTS code_symbols_fts;
              DROP TABLE IF EXISTS code_edges;
              DROP TABLE IF EXISTS code_calls;
+             DROP TABLE IF EXISTS code_imports;
+             DROP TABLE IF EXISTS code_relations;
              DROP TABLE IF EXISTS code_nodes;
              DROP TABLE IF EXISTS code_files;
              DROP TABLE IF EXISTS code_projects;",
@@ -270,6 +330,7 @@ impl CodeGraphStore {
         project: &str,
         file: FileRecord<'_>,
         symbols: &[SymbolRecord],
+        raw: RawFacts<'_>,
     ) -> Result<()> {
         let FileRecord {
             path,
@@ -338,6 +399,8 @@ impl CodeGraphStore {
                 params![id, name_tokens(&s.name), s.qualified_name, s.file_path],
             )?;
         }
+
+        write_raw_facts(&tx, project, path, raw)?;
 
         tx.commit()?;
         Ok(())
@@ -576,6 +639,142 @@ impl CodeGraphStore {
     /// The version this build writes; a file carrying anything else is rebuilt.
     pub fn expected_schema_version() -> i64 {
         SCHEMA_VERSION
+    }
+
+    /// Rebuild the parsed facts for every indexed file except `skip`.
+    ///
+    /// This is what makes an incremental pass possible: resolution is
+    /// project-wide, so re-parsing only the changed files would lose every
+    /// other file's call sites. Reading them back costs three scans instead of
+    /// a parse per file.
+    pub fn load_extracts(
+        &self,
+        project: &str,
+        skip: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, FileExtract)>> {
+        let db = self.lock()?;
+        let mut by_file: std::collections::HashMap<String, FileExtract> =
+            std::collections::HashMap::new();
+
+        let mut stmt = db.prepare(
+            "SELECT path, status FROM code_files
+             WHERE project = ?1 AND status IN ('indexed','partial')",
+        )?;
+        let rows = stmt.query_map(params![project], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (path, status) = row?;
+            if skip.contains(&path) {
+                continue;
+            }
+            by_file.insert(
+                path,
+                FileExtract {
+                    had_errors: status == "partial",
+                    ..Default::default()
+                },
+            );
+        }
+        drop(stmt);
+
+        let mut stmt = db.prepare(
+            "SELECT file_path, name, label, start_line, end_line, signature, exported,
+                    complexity, cognitive, loop_depth, param_count, qualified_name
+             FROM code_nodes WHERE project = ?1",
+        )?;
+        let rows = stmt.query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                RawSymbol {
+                    name: r.get::<_, String>(1)?,
+                    label: SymbolLabel::from_stored(&r.get::<_, String>(2)?),
+                    // The container is only ever recoverable from the
+                    // qualified name; it is not stored on its own.
+                    container: container_of_qualified(&r.get::<_, String>(11)?),
+                    start_line: r.get(3)?,
+                    end_line: r.get(4)?,
+                    signature: r.get(5)?,
+                    exported: r.get::<_, i64>(6)? != 0,
+                    metrics: SymbolMetrics {
+                        complexity: r.get(7)?,
+                        cognitive: r.get(8)?,
+                        loop_depth: r.get(9)?,
+                        param_count: r.get(10)?,
+                    },
+                },
+            ))
+        })?;
+        for row in rows {
+            let (path, sym) = row?;
+            if let Some(e) = by_file.get_mut(&path) {
+                e.symbols.push(sym);
+            }
+        }
+        drop(stmt);
+
+        let mut stmt = db.prepare(
+            "SELECT file_path, caller, callee, qualifier, line FROM code_calls WHERE project = ?1",
+        )?;
+        let rows = stmt.query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                RawCall {
+                    caller: r.get(1)?,
+                    callee: r.get(2)?,
+                    qualifier: r.get(3)?,
+                    line: r.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (path, call) = row?;
+            if let Some(e) = by_file.get_mut(&path) {
+                e.calls.push(call);
+            }
+        }
+        drop(stmt);
+
+        let mut stmt = db
+            .prepare("SELECT file_path, local_name, source FROM code_imports WHERE project = ?1")?;
+        let rows = stmt.query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                RawImport {
+                    local_name: r.get(1)?,
+                    source: r.get(2)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (path, imp) = row?;
+            if let Some(e) = by_file.get_mut(&path) {
+                e.imports.push(imp);
+            }
+        }
+        drop(stmt);
+
+        let mut stmt = db.prepare(
+            "SELECT file_path, subject, object, kind FROM code_relations WHERE project = ?1",
+        )?;
+        let rows = stmt.query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                RawRelation {
+                    subject: r.get(1)?,
+                    object: r.get(2)?,
+                    kind: EdgeKind::from_stored(&r.get::<_, String>(3)?),
+                },
+            ))
+        })?;
+        for row in rows {
+            let (path, rel) = row?;
+            if let Some(e) = by_file.get_mut(&path) {
+                e.relations.push(rel);
+            }
+        }
+
+        Ok(by_file.into_iter().collect())
     }
 
     /// Full-text search over symbol names, ranked by BM25 and nudged toward the
@@ -923,6 +1122,38 @@ CREATE TABLE IF NOT EXISTS code_edges (
 CREATE INDEX IF NOT EXISTS idx_code_edges_source ON code_edges(source_id, type);
 CREATE INDEX IF NOT EXISTS idx_code_edges_target ON code_edges(target_id, type);
 
+-- Unresolved facts, exactly as parsed. Resolution is project-wide, so an
+-- incremental pass that re-parsed only the changed files would otherwise lose
+-- every unchanged file's call sites and have to guess. Keeping the raw facts
+-- means a re-resolve needs no re-parse.
+CREATE TABLE IF NOT EXISTS code_calls (
+  project   TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  caller    TEXT,
+  callee    TEXT NOT NULL,
+  qualifier TEXT,
+  line      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS code_imports (
+  project    TEXT NOT NULL,
+  file_path  TEXT NOT NULL,
+  local_name TEXT NOT NULL,
+  source     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS code_relations (
+  project   TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  subject   TEXT NOT NULL,
+  object    TEXT NOT NULL,
+  kind      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_calls_file     ON code_calls(project, file_path);
+CREATE INDEX IF NOT EXISTS idx_code_imports_file   ON code_imports(project, file_path);
+CREATE INDEX IF NOT EXISTS idx_code_relations_file ON code_relations(project, file_path);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
   name_tokens,
   qualified_name,
@@ -972,6 +1203,7 @@ mod tests {
                 detail: None,
             },
             &a,
+            RawFacts::default(),
         )
         .unwrap();
         s.replace_file(
@@ -984,6 +1216,7 @@ mod tests {
                 detail: None,
             },
             &a,
+            RawFacts::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1003,6 +1236,7 @@ mod tests {
                 detail: None,
             },
             &b,
+            RawFacts::default(),
         )
         .unwrap();
         let cov = s.coverage("p").unwrap();
@@ -1027,6 +1261,7 @@ mod tests {
                 sym("src/a.rs", None, "caller", SymbolLabel::Function),
                 sym("src/a.rs", None, "callee", SymbolLabel::Function),
             ],
+            RawFacts::default(),
         )
         .unwrap();
 
@@ -1076,6 +1311,7 @@ mod tests {
                 sym("src/a.rs", None, "caller", SymbolLabel::Function),
                 sym("src/a.rs", None, "callee", SymbolLabel::Function),
             ],
+            RawFacts::default(),
         )
         .unwrap();
         s.rebuild_edges(
@@ -1127,6 +1363,7 @@ mod tests {
             "p",
             rec("h1"),
             &[sym("src/a.rs", None, "zarquon", SymbolLabel::Function)],
+            RawFacts::default(),
         )
         .unwrap();
         assert_eq!(fts_hits(&s, "zarquon"), 1);
@@ -1135,6 +1372,7 @@ mod tests {
             "p",
             rec("h2"),
             &[sym("src/a.rs", None, "blarg", SymbolLabel::Function)],
+            RawFacts::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1153,6 +1391,7 @@ mod tests {
             "p",
             rec("h3"),
             &[sym("src/a.rs", None, "zarquon", SymbolLabel::Function)],
+            RawFacts::default(),
         )
         .unwrap();
         assert_eq!(fts_hits(&s, "zarquon"), 1);
@@ -1177,6 +1416,7 @@ mod tests {
                 sym("src/a.rs", Some("Widget"), "open", SymbolLabel::Method),
                 sym("src/a.rs", None, "Widget", SymbolLabel::Struct),
             ],
+            RawFacts::default(),
         )
         .unwrap();
         s.rebuild_edges(
@@ -1276,6 +1516,7 @@ mod tests {
                 sym("src/a.rs", None, "b", SymbolLabel::Function),
                 sym("src/a.rs", None, "c", SymbolLabel::Function),
             ],
+            RawFacts::default(),
         )
         .unwrap();
         let edge = |from: &str, to: &str| EdgeRecord {
@@ -1329,6 +1570,7 @@ mod tests {
                 detail: None,
             },
             &syms,
+            RawFacts::default(),
         )
         .unwrap();
 
@@ -1352,6 +1594,7 @@ mod tests {
                 detail: None,
             },
             &[sym("src/b.rs", None, "reopen", SymbolLabel::Function)],
+            RawFacts::default(),
         )
         .unwrap();
 
@@ -1424,6 +1667,7 @@ mod tests {
                 detail: None,
             },
             &[],
+            RawFacts::default(),
         )
         .unwrap();
         s.replace_file(
@@ -1436,6 +1680,7 @@ mod tests {
                 detail: Some("2 errors"),
             },
             &[],
+            RawFacts::default(),
         )
         .unwrap();
         s.replace_file(
@@ -1448,6 +1693,7 @@ mod tests {
                 detail: None,
             },
             &[],
+            RawFacts::default(),
         )
         .unwrap();
         s.replace_file(
@@ -1460,6 +1706,7 @@ mod tests {
                 detail: Some("unreadable"),
             },
             &[],
+            RawFacts::default(),
         )
         .unwrap();
 
@@ -1488,6 +1735,7 @@ mod tests {
                     detail: None,
                 },
                 &[sym("a.rs", None, "alpha", SymbolLabel::Function)],
+                RawFacts::default(),
             )
             .unwrap();
             assert_eq!(s.coverage("p").unwrap().symbols, 1);
@@ -1520,6 +1768,7 @@ mod tests {
                 detail: None,
             },
             &[],
+            RawFacts::default(),
         )
         .unwrap();
         let h = s.file_hashes("p").unwrap();
