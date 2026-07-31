@@ -926,6 +926,11 @@ fn check_search_hints() -> Check {
     }
 }
 
+/// Report the code graph without ever touching it.
+///
+/// Its absence is normal — it is built by `runar crawl`, and a project that has
+/// never been crawled simply has none — so nothing here is a failure. A schema
+/// mismatch is likewise not corruption: the next writer drops and rebuilds.
 fn check_code_graph(path: &Path) -> Check {
     let degraded =
         |detail: String| Check::skip("code graph", format!("{detail}; {CODEGRAPH_REMEDY}"));
