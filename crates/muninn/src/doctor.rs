@@ -11,7 +11,7 @@
 //! directly via `tokio_postgres::connect` / `rusqlite::open_with_flags`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,6 +19,7 @@ use chrono::Utc;
 use serde::Serialize;
 use tokio_postgres::NoTls;
 
+use crate::codegraph::store::{CodeGraphStore, Coverage};
 use crate::setup;
 use crate::storage::postgres::PG_MIGRATIONS;
 use crate::storage::sqlite::MIGRATIONS as SQLITE_MIGRATIONS;
@@ -211,6 +212,12 @@ pub async fn run(opts: DoctorOpts) -> Report {
             ));
         }
     }
+
+    // Always SQLite and always a separate file, so it is checked regardless
+    // of RUNAR_STORAGE and regardless of whether the memory DB was reachable.
+    report
+        .checks
+        .push(check_code_graph(&CodeGraphStore::default_path()));
 
     if !opts.db_only {
         report.checks.push(check_breaker_state());
@@ -860,6 +867,115 @@ fn run_sqlite_checks(report: &mut Report) {
     }
 }
 
+// ── code graph ─────────────────────────────────────────────────────
+
+/// Every degraded code-graph state has the same fix. The graph is derived
+/// data, so rebuilding it is always correct and never loses anything.
+const CODEGRAPH_REMEDY: &str = "rebuild with `runar crawl <path> --project <id> --deep`";
+
+/// Coverage costs a few aggregate queries per project, so the listing is
+/// bounded — doctor runs often and is not a coverage report.
+const CODEGRAPH_MAX_PROJECTS: usize = 8;
+
+/// The code graph is opt-in (`runar crawl --deep`), so nothing here is a
+/// failure: an absent, stale or unreadable file means queries return nothing,
+/// not that the install is broken. It is never a silent pass either — the
+/// reason always names what is wrong and how to fix it.
+fn check_code_graph(path: &Path) -> Check {
+    let degraded =
+        |detail: String| Check::skip("code graph", format!("{detail}; {CODEGRAPH_REMEDY}"));
+
+    if !path.exists() {
+        return degraded(format!(
+            "{} absent — no project crawled --deep",
+            path.display()
+        ));
+    }
+
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let header = format!("{} ({})", path.display(), human_bytes(size));
+
+    // Read-only on purpose: `open()` creates the file and rebuilds the schema
+    // on a version mismatch. Doctor reports drift; it does not fix it.
+    let store = match CodeGraphStore::open_readonly(path) {
+        Ok(s) => s,
+        Err(e) => return degraded(format!("{header} — open failed: {e}")),
+    };
+
+    // A stale version is not corruption: the next writer drops and rebuilds.
+    // It does mean every query returns nothing until then.
+    let expected = CodeGraphStore::expected_schema_version();
+    match store.stored_schema_version() {
+        Ok(Some(v)) if v == expected => {}
+        Ok(Some(v)) => {
+            return degraded(format!(
+                "{header} — schema v{v}, this build writes v{expected}"
+            ))
+        }
+        Ok(None) => return degraded(format!("{header} — no schema version recorded")),
+        Err(e) => return degraded(format!("{header} — schema version unreadable: {e}")),
+    }
+
+    let projects = match store.projects() {
+        Ok(p) => p,
+        Err(e) => return degraded(format!("{header} — project list unreadable: {e}")),
+    };
+    if projects.is_empty() {
+        return degraded(format!("{header} — no projects indexed"));
+    }
+
+    let shown = projects.len().min(CODEGRAPH_MAX_PROJECTS);
+    let mut lines: Vec<String> = Vec::with_capacity(shown + 1);
+    let mut symbols_total = 0usize;
+    let mut unreadable = false;
+    for project in projects.iter().take(shown) {
+        match store.coverage(project) {
+            Ok(cov) => {
+                symbols_total += cov.symbols;
+                lines.push(codegraph_line(project, &cov));
+            }
+            // One bad project must not hide the ones that are fine.
+            Err(e) => {
+                unreadable = true;
+                lines.push(format!("{project}: coverage unreadable: {e}"));
+            }
+        }
+    }
+    if projects.len() > shown {
+        lines.push(format!("… +{} more project(s)", projects.len() - shown));
+    }
+
+    let body = format!(
+        "{header} — schema v{expected}, {} project(s):\n     {}",
+        projects.len(),
+        lines.join("\n     ")
+    );
+    if unreadable {
+        return degraded(body);
+    }
+    // Registered projects with no symbols behind them: the deep pass ran and
+    // produced nothing, so every query answers with silence. Without this the
+    // check would read like a working graph.
+    if symbols_total == 0 && projects.len() == shown {
+        return degraded(format!("{body}\n     no symbols in any project"));
+    }
+    Check::pass_with("code graph", body)
+}
+
+/// Wording matches `codegraph::format::coverage` so the two read the same.
+fn codegraph_line(project: &str, cov: &Coverage) -> String {
+    let parsed = cov.indexed + cov.partial;
+    let pct = if cov.files_total > 0 {
+        parsed * 100 / cov.files_total
+    } else {
+        0
+    };
+    format!(
+        "{project}: {} symbols, {} edges, {parsed}/{} files parsed ({pct}%)",
+        cov.symbols, cov.edges, cov.files_total
+    )
+}
+
 // ── breaker + local env ────────────────────────────────────────────
 
 fn check_breaker_state() -> Check {
@@ -917,6 +1033,21 @@ fn check_project_local_env() -> Check {
 /// tiny set of skip-name placeholders inside doctor.
 fn box_leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 #[cfg(test)]
@@ -981,6 +1112,74 @@ mod tests {
         fs::write(&path, "# hi\nA=1\nB=2\n").unwrap();
         let c = check_env_file(&path);
         assert!(matches!(c.status, Status::Pass));
+    }
+
+    #[test]
+    fn code_graph_absent_is_not_a_failure_but_names_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = check_code_graph(&dir.path().join("codegraph.db"));
+        match c.status {
+            Status::Skip { reason } => {
+                assert!(reason.contains("--deep"), "no remedy in: {reason}");
+                assert!(reason.contains("codegraph.db"), "no path in: {reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_graph_unreadable_file_does_not_report_green() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codegraph.db");
+        fs::write(&path, b"not a sqlite database").unwrap();
+        let c = check_code_graph(&path);
+        assert!(
+            !matches!(c.status, Status::Pass),
+            "a garbage file must not pass"
+        );
+        // Still not a failure: the graph is derived data, so doctor asks for a
+        // rebuild rather than exiting non-zero.
+        match c.status {
+            Status::Skip { reason } => {
+                assert!(reason.contains("--deep"), "no remedy in: {reason}")
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_graph_line_reports_the_parsed_fraction() {
+        let cov = Coverage {
+            files_total: 10,
+            indexed: 6,
+            partial: 1,
+            skipped_lang: 3,
+            errored: 0,
+            symbols: 40,
+            edges: 25,
+            unresolved_calls: 12,
+            skipped_by_ext: vec![],
+        };
+        assert_eq!(
+            codegraph_line("proj", &cov),
+            "proj: 40 symbols, 25 edges, 7/10 files parsed (70%)"
+        );
+    }
+
+    #[test]
+    fn code_graph_line_survives_an_empty_project() {
+        // files_total = 0 would divide by zero.
+        assert_eq!(
+            codegraph_line("proj", &Coverage::default()),
+            "proj: 0 symbols, 0 edges, 0/0 files parsed (0%)"
+        );
+    }
+
+    #[test]
+    fn human_bytes_scales() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MB");
     }
 
     #[test]

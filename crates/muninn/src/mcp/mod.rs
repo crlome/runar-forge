@@ -306,6 +306,9 @@ async fn handle_tool_call(
         "huginn_architecture" => tool_huginn_architecture(args, librarian).await,
         "huginn_techdebt" => tool_huginn_techdebt(args, librarian).await,
         "huginn_recrawl_file" => tool_huginn_recrawl_file(args, librarian).await,
+        "huginn_search_graph" => tool_huginn_search_graph(args).await,
+        "huginn_symbol" => tool_huginn_symbol(args).await,
+        "huginn_trace" => tool_huginn_trace(args).await,
         "huginn_skills" => tool_huginn_skills().await,
         "huginn_benchmark" => tool_huginn_benchmark(args, curator).await,
         _ => Err(format!("unknown tool: {tool_name}")),
@@ -1196,13 +1199,173 @@ async fn tool_huginn_status(
         }
     }
 
+    // Absence of a code graph is normal — it is opt-in via `--deep` — so it is
+    // reported as a null rather than an error.
+    let code_graph = open_graph()
+        .ok()
+        .and_then(|s| s.coverage(project_id).ok())
+        .map(|c| crate::codegraph::format::coverage_json(&c));
+
     Ok(serde_json::json!({
         "projectId": project_id,
         "totalEntries": entries.len(),
         "byType": by_type,
         "lastCrawl": latest_arch.map(|e| e.created_at.to_rfc3339()),
+        "codeGraph": code_graph,
     })
     .to_string())
+}
+
+/// Open the code graph read-only. A read must never create or migrate the file.
+fn open_graph() -> Result<crate::codegraph::store::CodeGraphStore, String> {
+    use crate::codegraph::store::CodeGraphStore;
+    let path = CodeGraphStore::default_path();
+    if !path.exists() {
+        return Err(
+            "no code graph yet — run huginn_crawl with \"deep\": true for this project".to_string(),
+        );
+    }
+    CodeGraphStore::open_readonly(&path).map_err(|e| e.to_string())
+}
+
+fn wants_json(args: &Value) -> bool {
+    args.get("format").and_then(|v| v.as_str()) == Some("json")
+}
+
+fn arg_usize(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, max))
+        .unwrap_or(default)
+}
+
+async fn tool_huginn_search_graph(args: &Value) -> Result<String, String> {
+    let project_id = args
+        .get("projectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "projectId is required".to_string())?;
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "query is required".to_string())?;
+    let label = args.get("label").and_then(|v| v.as_str());
+    let limit = arg_usize(args, "limit", 12, 100);
+
+    let store = open_graph()?;
+    let rows = store
+        .search(project_id, query, label, limit)
+        .map_err(|e| e.to_string())?;
+
+    if wants_json(args) {
+        return Ok(crate::codegraph::format::symbols_json(&rows).to_string());
+    }
+    Ok(crate::codegraph::format::symbols(&rows))
+}
+
+async fn tool_huginn_symbol(args: &Value) -> Result<String, String> {
+    use crate::codegraph::store::Direction;
+
+    let project_id = args
+        .get("projectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "projectId is required".to_string())?;
+    let name = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "symbol is required".to_string())?;
+
+    let store = open_graph()?;
+    let matches = store
+        .symbol(project_id, name, 5)
+        .map_err(|e| e.to_string())?;
+    let Some(row) = matches.first() else {
+        return Ok(format!("no definition named {name}"));
+    };
+    // Several definitions share the name: name them rather than picking one.
+    if matches.len() > 1 {
+        if wants_json(args) {
+            return Ok(crate::codegraph::format::symbols_json(&matches).to_string());
+        }
+        return Ok(format!(
+            "{name} is ambiguous — {} definitions:\n{}",
+            matches.len(),
+            crate::codegraph::format::symbols(&matches)
+        ));
+    }
+
+    let callers = store
+        .neighbors(row.id, Direction::Callers)
+        .map_err(|e| e.to_string())?;
+    let callees = store
+        .neighbors(row.id, Direction::Callees)
+        .map_err(|e| e.to_string())?;
+
+    if wants_json(args) {
+        return Ok(serde_json::json!({
+            "symbol": crate::codegraph::format::symbol_json(row),
+            "callers": crate::codegraph::format::neighbors_json(&callers),
+            "callees": crate::codegraph::format::neighbors_json(&callees),
+        })
+        .to_string());
+    }
+    Ok(crate::codegraph::format::symbol_detail(
+        row, &callers, &callees,
+    ))
+}
+
+async fn tool_huginn_trace(args: &Value) -> Result<String, String> {
+    use crate::codegraph::store::Direction;
+
+    let project_id = args
+        .get("projectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "projectId is required".to_string())?;
+    let from = args
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "from is required".to_string())?;
+    let dir_arg = args
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("callers");
+    let direction = Direction::parse(dir_arg)
+        .ok_or_else(|| format!("direction must be callers or callees, got {dir_arg}"))?;
+    let depth = arg_usize(args, "depth", 2, 5);
+    let limit = arg_usize(args, "limit", 50, 200);
+
+    let store = open_graph()?;
+    let matches = store
+        .symbol(project_id, from, 2)
+        .map_err(|e| e.to_string())?;
+    let Some(row) = matches.first() else {
+        return Ok(format!("no definition named {from}"));
+    };
+    if matches.len() > 1 {
+        return Ok(format!(
+            "{from} is ambiguous — qualify it:\n{}",
+            crate::codegraph::format::symbols(&matches)
+        ));
+    }
+
+    let reached = store
+        .trace(row.id, direction, depth, limit)
+        .map_err(|e| e.to_string())?;
+
+    if wants_json(args) {
+        return Ok(serde_json::json!({
+            "from": crate::codegraph::format::symbol_json(row),
+            "direction": dir_arg,
+            "depth": depth,
+            "reached": crate::codegraph::format::neighbors_json(&reached),
+        })
+        .to_string());
+    }
+    Ok(format!(
+        "{} {dir_arg} of {} within {depth} hop(s)\n{}",
+        reached.len(),
+        row.qualified_name,
+        crate::codegraph::format::neighbors(dir_arg, &reached)
+    ))
 }
 
 async fn tool_huginn_architecture(
@@ -1434,6 +1597,11 @@ async fn tool_huginn_skills() -> Result<String, String> {
             { "name": "huginn_status", "when": "Check whether a project has been crawled" },
             { "name": "huginn_architecture", "when": "Get the latest architecture summary" },
             { "name": "huginn_techdebt", "when": "Inventory TODOs/FIXMEs in a project" },
+            { "name": "huginn_search_graph", "when": "Find where a function, type or method is defined" },
+            { "name": "huginn_symbol", "when": "Read one definition's signature, complexity, callers and callees" },
+            { "name": "huginn_trace", "when": "Find the blast radius of a change, or what a definition depends on" },
+            { "name": "huginn_recrawl_file", "when": "Refresh a single file after editing it" },
+            { "name": "huginn_benchmark", "when": "Measure whether stored memory answers real questions" },
             { "name": "curator_ask", "when": "Ask a synthesized question about the codebase" },
             { "name": "curator_onboard", "when": "Producing a first-time onboarding report for a project" },
         ]
@@ -1783,6 +1951,53 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "mode": { "type": "string", "enum": ["quick", "full"], "description": "Question set size (default: quick)" },
                 },
                 "required": ["projectId"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "huginn_search_graph".into(),
+            description: "Find definitions by name in the code graph. Returns qualified name, kind, file:line, fan-in and cyclomatic complexity, ranked by relevance. Needs a crawl run with deep=true. Absence of a result is not proof the symbol does not exist — check huginn_status for what the graph could not parse.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "projectId": { "type": "string", "description": "Project identifier" },
+                    "query": { "type": "string", "description": "Name or word to search for; camelCase and snake_case parts both match" },
+                    "label": { "type": "string", "enum": ["Function", "Method", "Class", "Interface", "Trait", "Struct", "Enum", "Type", "Const", "Module"], "description": "Restrict to one kind of definition" },
+                    "limit": { "type": "integer", "description": "Max results (default 12)" },
+                    "format": { "type": "string", "enum": ["text", "json"], "description": "text (default, compact) or json" },
+                },
+                "required": ["projectId", "query"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "huginn_symbol".into(),
+            description: "One definition in full: signature, location, complexity metrics, and its immediate callers and callees. Each edge names how it was resolved (import_map, same_module, unique_name, suffix) — that is how confident the match is.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "projectId": { "type": "string", "description": "Project identifier" },
+                    "symbol": { "type": "string", "description": "Qualified name (path:Type.method), bare name, or Type.method" },
+                    "format": { "type": "string", "enum": ["text", "json"] },
+                },
+                "required": ["projectId", "symbol"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "huginn_trace".into(),
+            description: "Walk the call graph outward from a definition to find what would be affected by changing it (direction=callers) or what it depends on (direction=callees). Breadth-first, nearest first.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "projectId": { "type": "string", "description": "Project identifier" },
+                    "from": { "type": "string", "description": "Definition to start from; same forms as huginn_symbol" },
+                    "direction": { "type": "string", "enum": ["callers", "callees"], "description": "callers = blast radius (default), callees = dependencies" },
+                    "depth": { "type": "integer", "description": "Hops to follow, 1-5 (default 2)" },
+                    "limit": { "type": "integer", "description": "Max definitions returned (default 50)" },
+                    "format": { "type": "string", "enum": ["text", "json"] },
+                },
+                "required": ["projectId", "from"],
                 "additionalProperties": false,
             }),
         },

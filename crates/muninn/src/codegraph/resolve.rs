@@ -205,10 +205,64 @@ impl<'a> Index<'a> {
             }
         }
 
+        // A single-segment module name — `index::index_project(..)`. The callee
+        // is a free function in that module's file, not a member of anything,
+        // so the type branch below can never find it.
+        for target in self.module_candidates(from, qualifier) {
+            if let Some(sym) = self.defs_by_file.get(target.as_str()).and_then(|defs| {
+                only(
+                    defs.iter()
+                        .copied()
+                        .filter(|s| s.name == callee && s.container.is_none() && is_callable(s)),
+                )
+            }) {
+                return Some((
+                    qualified_name(&target, None, &sym.name),
+                    Resolution::ImportMap,
+                ));
+            }
+        }
+
         // A bare type name: find the type, then the member on it. The tier is
         // how confidently the *type* was located.
         let (tier, owner_file) = self.locate_type(from, qualifier)?;
         self.member_of(Some(&owner_file), qualifier, callee, tier)
+    }
+
+    /// The file a module name refers to from `from`: either where an import
+    /// bound it, or a sibling `name.rs` / `name/mod.rs` declared with `mod`.
+    fn module_candidates(&self, from: &FileFacts, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let bound = self
+            .imports
+            .get(from.path.as_str())
+            .and_then(|m| m.get(name))
+            .cloned();
+        // An import of `crate::codegraph::{index, ..}` binds `index` to the
+        // path that resolved — `codegraph/mod.rs` — so the submodule beside it
+        // is tried first, and the bound file itself only as a fallback.
+        for dir in [
+            bound
+                .as_deref()
+                .map(|b| Path::new(b).parent().unwrap_or(Path::new("")).to_path_buf()),
+            Some(
+                Path::new(from.path.as_str())
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf(),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(join_rel(&dir, &format!("{name}.rs")));
+            out.push(join_rel(&dir, &format!("{name}/mod.rs")));
+        }
+        if let Some(bound) = bound {
+            out.push(bound);
+        }
+        out.retain(|c| self.defs_by_file.contains_key(c.as_str()));
+        out
     }
 
     /// The single definition named `callee` owned by container `owner`.
@@ -628,6 +682,17 @@ fn relativize(path: &Path, project_root: &Path) -> Option<String> {
 
 /// Lexical normalisation only: `..` is resolved against the path text and never
 /// against the filesystem, so this neither touches disk nor follows symlinks.
+/// Join a relative directory to a relative path, in the separator convention
+/// the scanner produced — these strings are compared against `FileFacts::path`.
+fn join_rel(dir: &Path, tail: &str) -> String {
+    let joined = if dir.as_os_str().is_empty() {
+        PathBuf::from(tail)
+    } else {
+        dir.join(tail)
+    };
+    joined.to_string_lossy().to_string()
+}
+
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
@@ -784,6 +849,40 @@ mod tests {
         assert_eq!(out.edges.len(), 1);
         assert_eq!(out.edges[0].target_qualified, "a.rs:Widget.helper");
         assert_eq!(out.edges[0].resolution, Some(Resolution::Suffix));
+    }
+
+    #[test]
+    fn a_module_qualified_call_reaches_a_free_function() {
+        // `index::index_project(..)` — the callee belongs to no type, so the
+        // type branch cannot find it and the bare-name tiers do not apply to a
+        // qualified call.
+        let files = vec![
+            facts(
+                "src/a.rs",
+                vec![func("caller")],
+                vec![call("src/a.rs:caller", "run_index", Some("index"))],
+            ),
+            facts("src/index.rs", vec![func("run_index")], vec![]),
+        ];
+        let out = resolve(&files, nowhere());
+        assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
+        assert_eq!(out.edges[0].target_qualified, "src/index.rs:run_index");
+        assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    #[test]
+    fn a_module_qualified_call_to_a_module_that_does_not_exist_is_unresolved() {
+        let files = vec![
+            facts(
+                "src/a.rs",
+                vec![func("caller")],
+                vec![call("src/a.rs:caller", "run_index", Some("elsewhere"))],
+            ),
+            facts("src/index.rs", vec![func("run_index")], vec![]),
+        ];
+        let out = resolve(&files, nowhere());
+        assert!(out.edges.is_empty(), "got {:?}", out.edges);
+        assert_eq!(out.unresolved.get("src/a.rs"), Some(&1));
     }
 
     #[test]

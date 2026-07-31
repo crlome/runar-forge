@@ -152,11 +152,15 @@ pub fn index_project(
 
     let resolved = resolve(&facts, root);
     store.rebuild_edges(project, &resolved.edges)?;
-    outcome.edges = resolved.edges.len();
     for (path, count) in &resolved.unresolved {
         store.set_unresolved(project, path, *count)?;
         outcome.unresolved_calls += count;
     }
+
+    // Report what was stored, not what was resolved: two call sites on the
+    // same line to the same definition collapse into one edge, and a count
+    // that disagrees with the graph is a count nobody can check.
+    outcome.edges = store.coverage(project)?.edges;
 
     let summary = render_summary(store, project, &outcome)?;
     store.set_summary(project, &summary)?;

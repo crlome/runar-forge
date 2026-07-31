@@ -6,6 +6,7 @@
 //! grow a second implementation for a backend this never needs.
 
 pub mod extract;
+pub mod format;
 pub mod index;
 pub mod metrics;
 pub mod resolve;
