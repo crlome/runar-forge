@@ -965,11 +965,7 @@ fn check_code_graph(path: &Path) -> Check {
 /// Wording matches `codegraph::format::coverage` so the two read the same.
 fn codegraph_line(project: &str, cov: &Coverage) -> String {
     let parsed = cov.indexed + cov.partial;
-    let pct = if cov.files_total > 0 {
-        parsed * 100 / cov.files_total
-    } else {
-        0
-    };
+    let pct = (parsed * 100).checked_div(cov.files_total).unwrap_or(0);
     format!(
         "{project}: {} symbols, {} edges, {parsed}/{} files parsed ({pct}%)",
         cov.symbols, cov.edges, cov.files_total

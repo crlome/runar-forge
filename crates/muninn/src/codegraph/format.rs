@@ -80,11 +80,7 @@ pub fn symbol_detail(row: &SymbolRow, callers: &[Neighbor], callees: &[Neighbor]
 /// Coverage as a reader should see it: what was parsed, and what was not.
 pub fn coverage(project: &str, cov: &Coverage) -> String {
     let parsed = cov.indexed + cov.partial;
-    let pct = if cov.files_total > 0 {
-        parsed * 100 / cov.files_total
-    } else {
-        0
-    };
+    let pct = (parsed * 100).checked_div(cov.files_total).unwrap_or(0);
     let mut out = format!(
         "{project}: {} symbols, {} edges, {parsed}/{} files parsed ({pct}%)\n",
         cov.symbols, cov.edges, cov.files_total

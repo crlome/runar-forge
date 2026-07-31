@@ -191,13 +191,8 @@ fn render_summary(store: &CodeGraphStore, project: &str, outcome: &IndexOutcome)
         outcome.symbols, outcome.edges, cov.files_total
     ));
     let parsed = cov.indexed + cov.partial;
-    if cov.files_total > 0 {
-        out.push_str(&format!(
-            " Parsed {}/{} ({}%).",
-            parsed,
-            cov.files_total,
-            parsed * 100 / cov.files_total
-        ));
+    if let Some(pct) = (parsed * 100).checked_div(cov.files_total) {
+        out.push_str(&format!(" Parsed {parsed}/{} ({pct}%).", cov.files_total));
     }
     if !cov.skipped_by_ext.is_empty() {
         let listed: Vec<String> = cov
