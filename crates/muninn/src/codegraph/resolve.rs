@@ -238,31 +238,41 @@ impl<'a> Index<'a> {
             .get(from.path.as_str())
             .and_then(|m| m.get(name))
             .cloned();
+
         // An import of `crate::codegraph::{index, ..}` binds `index` to the
         // path that resolved — `codegraph/mod.rs` — so the submodule beside it
-        // is tried first, and the bound file itself only as a fallback.
-        for dir in [
-            bound
-                .as_deref()
-                .map(|b| Path::new(b).parent().unwrap_or(Path::new("")).to_path_buf()),
-            Some(
-                Path::new(from.path.as_str())
-                    .parent()
-                    .unwrap_or(Path::new(""))
-                    .to_path_buf(),
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            out.push(join_rel(&dir, &format!("{name}.rs")));
-            out.push(join_rel(&dir, &format!("{name}/mod.rs")));
+        // comes first, then the bound file itself.
+        if let Some(bound) = &bound {
+            let dir = Path::new(bound.as_str()).parent().unwrap_or(Path::new(""));
+            out.push(join_rel(dir, &format!("{name}.rs")));
+            out.push(join_rel(dir, &format!("{name}/mod.rs")));
+            out.push(bound.clone());
         }
-        if let Some(bound) = bound {
-            out.push(bound);
+
+        // A sibling file only counts when this file actually declares the
+        // module. Without that check any receiver variable sharing a name with
+        // a neighbouring file would be read as a module path.
+        if self.declares_module(from, name) {
+            let here = Path::new(from.path.as_str())
+                .parent()
+                .unwrap_or(Path::new(""));
+            out.push(join_rel(here, &format!("{name}.rs")));
+            out.push(join_rel(here, &format!("{name}/mod.rs")));
         }
+
         out.retain(|c| self.defs_by_file.contains_key(c.as_str()));
         out
+    }
+
+    /// Whether `from` contains `mod <name>;`, which the extractor records as a
+    /// Module symbol.
+    fn declares_module(&self, from: &FileFacts, name: &str) -> bool {
+        self.defs_by_file
+            .get(from.path.as_str())
+            .is_some_and(|defs| {
+                defs.iter()
+                    .any(|s| s.name == name && s.label == SymbolLabel::Module)
+            })
     }
 
     /// The single definition named `callee` owned by container `owner`.
@@ -861,7 +871,8 @@ mod tests {
         let files = vec![
             facts(
                 &a,
-                vec![func("caller")],
+                // `mod index;` is what makes `index::` a module path here.
+                vec![func("caller"), sym("index", SymbolLabel::Module, None)],
                 vec![call(&format!("{a}:caller"), "run_index", Some("index"))],
             ),
             facts(&idx, vec![func("run_index")], vec![]),
@@ -870,6 +881,24 @@ mod tests {
         assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
         assert_eq!(out.edges[0].target_qualified, format!("{idx}:run_index"));
         assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    #[test]
+    fn a_qualifier_matching_a_neighbouring_file_is_not_a_module_path() {
+        // Without a `mod` declaration, `store.open()` on a local variable would
+        // otherwise be read as a call into a neighbouring `store.rs`.
+        let a = native("src/a.rs");
+        let st = native("src/store.rs");
+        let files = vec![
+            facts(
+                &a,
+                vec![func("caller")],
+                vec![call(&format!("{a}:caller"), "run_index", Some("store"))],
+            ),
+            facts(&st, vec![func("run_index")], vec![]),
+        ];
+        let out = resolve(&files, nowhere());
+        assert!(out.edges.is_empty(), "got {:?}", out.edges);
     }
 
     #[test]

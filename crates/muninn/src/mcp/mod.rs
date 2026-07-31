@@ -1201,7 +1201,7 @@ async fn tool_huginn_status(
 
     // Absence of a code graph is normal — it is opt-in via `--deep` — so it is
     // reported as a null rather than an error.
-    let code_graph = open_graph()
+    let code_graph = open_graph(project_id)
         .ok()
         .and_then(|s| s.coverage(project_id).ok())
         .map(|c| crate::codegraph::format::coverage_json(&c));
@@ -1217,7 +1217,11 @@ async fn tool_huginn_status(
 }
 
 /// Open the code graph read-only. A read must never create or migrate the file.
-fn open_graph() -> Result<crate::codegraph::store::CodeGraphStore, String> {
+///
+/// The project is checked too: once any project has a graph the file exists, so
+/// a file-only check answers "nothing found" for a project that was simply
+/// never crawled deep.
+fn open_graph(project: &str) -> Result<crate::codegraph::store::CodeGraphStore, String> {
     use crate::codegraph::store::CodeGraphStore;
     let path = CodeGraphStore::default_path();
     if !path.exists() {
@@ -1225,8 +1229,36 @@ fn open_graph() -> Result<crate::codegraph::store::CodeGraphStore, String> {
             "no code graph yet — run huginn_crawl with \"deep\": true for this project".to_string(),
         );
     }
-    CodeGraphStore::open_readonly(&path).map_err(|e| e.to_string())
+    let store = CodeGraphStore::open_readonly(&path).map_err(|e| e.to_string())?;
+    let known = store.projects().map_err(|e| e.to_string())?;
+    if !known.iter().any(|p| p == project) {
+        return Err(format!(
+            "project {project} has no code graph — run huginn_crawl with \"deep\": true for it. \
+             Projects that do: {}",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ));
+    }
+    Ok(store)
 }
+
+/// Labels the graph actually stores. An unrecognised one would silently match
+/// nothing and read as "this symbol does not exist".
+const SYMBOL_LABELS: &[&str] = &[
+    "Function",
+    "Method",
+    "Class",
+    "Interface",
+    "Trait",
+    "Struct",
+    "Enum",
+    "Type",
+    "Const",
+    "Module",
+];
 
 fn wants_json(args: &Value) -> bool {
     args.get("format").and_then(|v| v.as_str()) == Some("json")
@@ -1249,9 +1281,17 @@ async fn tool_huginn_search_graph(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "query is required".to_string())?;
     let label = args.get("label").and_then(|v| v.as_str());
+    if let Some(l) = label {
+        if !SYMBOL_LABELS.contains(&l) {
+            return Err(format!(
+                "unknown label {l}; expected one of {}",
+                SYMBOL_LABELS.join(", ")
+            ));
+        }
+    }
     let limit = arg_usize(args, "limit", 12, 100);
 
-    let store = open_graph()?;
+    let store = open_graph(project_id)?;
     let rows = store
         .search(project_id, query, label, limit)
         .map_err(|e| e.to_string())?;
@@ -1274,22 +1314,29 @@ async fn tool_huginn_symbol(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "symbol is required".to_string())?;
 
-    let store = open_graph()?;
-    let matches = store
-        .symbol(project_id, name, 5)
+    let store = open_graph(project_id)?;
+    let found = store
+        .symbol(project_id, name, 8)
         .map_err(|e| e.to_string())?;
-    let Some(row) = matches.first() else {
+    let Some(row) = found.first() else {
         return Ok(format!("no definition named {name}"));
     };
-    // Several definitions share the name: name them rather than picking one.
-    if matches.len() > 1 {
+    // Several definitions share the name: name them rather than picking one,
+    // and state how many there are rather than how many fitted the limit.
+    if found.total > 1 {
         if wants_json(args) {
-            return Ok(crate::codegraph::format::symbols_json(&matches).to_string());
+            return Ok(serde_json::json!({
+                "ambiguous": true,
+                "total": found.total,
+                "shown": found.rows.len(),
+                "candidates": crate::codegraph::format::symbols_json(&found.rows),
+            })
+            .to_string());
         }
         return Ok(format!(
             "{name} is ambiguous — {} definitions:\n{}",
-            matches.len(),
-            crate::codegraph::format::symbols(&matches)
+            found.total,
+            crate::codegraph::format::matches(&found)
         ));
     }
 
@@ -1333,17 +1380,18 @@ async fn tool_huginn_trace(args: &Value) -> Result<String, String> {
     let depth = arg_usize(args, "depth", 2, 5);
     let limit = arg_usize(args, "limit", 50, 200);
 
-    let store = open_graph()?;
-    let matches = store
-        .symbol(project_id, from, 2)
+    let store = open_graph(project_id)?;
+    let found = store
+        .symbol(project_id, from, 8)
         .map_err(|e| e.to_string())?;
-    let Some(row) = matches.first() else {
+    let Some(row) = found.first() else {
         return Ok(format!("no definition named {from}"));
     };
-    if matches.len() > 1 {
+    if found.total > 1 {
         return Ok(format!(
-            "{from} is ambiguous — qualify it:\n{}",
-            crate::codegraph::format::symbols(&matches)
+            "{from} is ambiguous — {} definitions, qualify it:\n{}",
+            found.total,
+            crate::codegraph::format::matches(&found)
         ));
     }
 
@@ -1356,15 +1404,16 @@ async fn tool_huginn_trace(args: &Value) -> Result<String, String> {
             "from": crate::codegraph::format::symbol_json(row),
             "direction": dir_arg,
             "depth": depth,
-            "reached": crate::codegraph::format::neighbors_json(&reached),
+            "truncated": reached.truncated,
+            "reached": crate::codegraph::format::neighbors_json(&reached.nodes),
         })
         .to_string());
     }
     Ok(format!(
         "{} {dir_arg} of {} within {depth} hop(s)\n{}",
-        reached.len(),
+        reached.nodes.len(),
         row.qualified_name,
-        crate::codegraph::format::neighbors(dir_arg, &reached)
+        crate::codegraph::format::reached(dir_arg, &reached)
     ))
 }
 

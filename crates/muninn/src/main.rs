@@ -1617,13 +1617,13 @@ fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
         }
 
         GraphCmd::Symbol { name, .. } => {
-            let rows = store.symbol(&project, &name, 5).map_err(graph_err)?;
-            match rows.as_slice() {
+            let found = store.symbol(&project, &name, 8).map_err(graph_err)?;
+            match found.rows.as_slice() {
                 [] => {
                     println!("No symbol matching '{name}' in project '{project}'.");
                     println!("{}", graph_crawl_hint(&project));
                 }
-                [only] => {
+                [only] if found.total == 1 => {
                     let callers = store
                         .neighbors(only.id, Direction::Callers)
                         .map_err(graph_err)?;
@@ -1632,12 +1632,12 @@ fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
                         .map_err(graph_err)?;
                     print_block(&codegraph::format::symbol_detail(only, &callers, &callees));
                 }
-                many => {
-                    print_block(&codegraph::format::symbols(many));
+                _ => {
+                    print_block(&codegraph::format::matches(&found));
                     println!(
                         "\n'{name}' is ambiguous — {} definitions match. \
                          Re-run with one of the qualified names above.",
-                        many.len()
+                        found.total
                     );
                 }
             }
@@ -1660,18 +1660,29 @@ fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
                      past that a trace returns the whole connected component"
                 );
             }
-            let rows = store.symbol(&project, &name, 1).map_err(graph_err)?;
-            let Some(root) = rows.first() else {
+            let found = store.symbol(&project, &name, 8).map_err(graph_err)?;
+            let Some(root) = found.first() else {
                 println!("No symbol matching '{name}' in project '{project}'.");
                 println!("{}", graph_crawl_hint(&project));
                 return Ok(());
             };
+            // Tracing one of several same-named definitions would answer a
+            // question the user did not ask; the MCP tool refuses here too.
+            if found.total > 1 {
+                print_block(&codegraph::format::matches(&found));
+                println!(
+                    "\n'{name}' is ambiguous — {} definitions match. \
+                     Re-run with one of the qualified names above.",
+                    found.total
+                );
+                return Ok(());
+            }
             println!(
                 "{} — {}:{}",
                 root.qualified_name, root.file_path, root.start_line
             );
             let reached = store.trace(root.id, dir, depth, limit).map_err(graph_err)?;
-            print_block(&codegraph::format::neighbors(&direction, &reached));
+            print_block(&codegraph::format::reached(&direction, &reached));
         }
 
         GraphCmd::Status { .. } => {

@@ -5,7 +5,7 @@
 //! every call and buy nothing a model needs. `format: "json"` is available for
 //! anything consuming these programmatically.
 
-use super::store::{Coverage, Neighbor, SymbolRow};
+use super::store::{Coverage, Matches, Neighbor, Reached, SymbolRow};
 
 /// `file:line`, the form an editor and a human both accept.
 fn locus(row: &SymbolRow) -> String {
@@ -14,13 +14,25 @@ fn locus(row: &SymbolRow) -> String {
 
 /// One line per definition: what it is, where it is, how connected, how complex.
 pub fn symbols(rows: &[SymbolRow]) -> String {
+    symbols_of(rows, rows.len())
+}
+
+/// Same, but stating how many matched when more did than are shown. A count
+/// that is really a limit reads as the whole truth and is acted on as such.
+pub fn matches(m: &Matches) -> String {
+    symbols_of(&m.rows, m.total)
+}
+
+fn symbols_of(rows: &[SymbolRow], total: usize) -> String {
     if rows.is_empty() {
         return "no matching symbols".into();
     }
-    let mut out = format!(
-        "symbols[{}] name | label | file:line | fan-in | complexity\n",
-        rows.len()
-    );
+    let shown = if total > rows.len() {
+        format!("symbols[{} of {total}]", rows.len())
+    } else {
+        format!("symbols[{}]", rows.len())
+    };
+    let mut out = format!("{shown} name | label | file:line | fan-in | complexity\n",);
     for r in rows {
         out.push_str(&format!(
             "{} | {} | {} | {} | {}\n",
@@ -30,6 +42,15 @@ pub fn symbols(rows: &[SymbolRow]) -> String {
             r.fan_in,
             r.metrics.complexity
         ));
+    }
+    out
+}
+
+/// A bounded walk, marked when a bound cut it short.
+pub fn reached(heading: &str, r: &Reached) -> String {
+    let mut out = neighbors(heading, &r.nodes);
+    if r.truncated {
+        out.push_str("(stopped at the depth or result limit — more exist)\n");
     }
     out
 }
