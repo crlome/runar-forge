@@ -19,8 +19,15 @@ const NODE_BUDGET: usize = 50_000;
 /// independent of that — a bodyless declaration still has a real parameter
 /// list, and it is still counted.
 pub fn measure(body: Option<Node<'_>>, params: Option<Node<'_>>, spec: &LangSpec) -> SymbolMetrics {
+    // Comments are named nodes in both grammars, so counting them would inflate
+    // the arity of any parameter list carrying a doc note.
     let param_count = params.map_or(0, |p| {
-        u32::try_from(p.named_child_count()).unwrap_or(u32::MAX)
+        let mut cursor = p.walk();
+        let n = p
+            .named_children(&mut cursor)
+            .filter(|c| !c.kind().contains("comment"))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
     });
 
     let Some(body) = body else {

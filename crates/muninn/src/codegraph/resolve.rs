@@ -46,7 +46,7 @@ pub fn resolve(files: &[FileFacts], project_root: &Path) -> Resolved {
                 // single project symbol happens to be named `get`.
                 Some(q) => index
                     .resolve_qualified(from, q, &call.callee, call.caller.as_deref())
-                    .or_else(|| index.resolve_suffix(&call.callee)),
+                    .or_else(|| index.resolve_suffix(from, &call.callee)),
                 None => index.resolve_unqualified(from, &call.callee),
             };
             let Some((target, tier)) = resolved else {
@@ -187,7 +187,7 @@ impl<'a> Index<'a> {
     ) -> Option<(String, Resolution)> {
         if matches!(qualifier, "self" | "Self" | "this") {
             let owner = caller.and_then(container_of_qualified)?;
-            return self.member_of(owner, callee, Resolution::SameModule);
+            return self.member_of(Some(&from.path), owner, callee, Resolution::SameModule);
         }
 
         if qualifier.contains("::") || qualifier.starts_with('.') {
@@ -207,49 +207,69 @@ impl<'a> Index<'a> {
 
         // A bare type name: find the type, then the member on it. The tier is
         // how confidently the *type* was located.
-        let tier = self.locate_type(from, qualifier)?;
-        self.member_of(qualifier, callee, tier)
+        let (tier, owner_file) = self.locate_type(from, qualifier)?;
+        self.member_of(Some(&owner_file), qualifier, callee, tier)
     }
 
     /// The single definition named `callee` owned by container `owner`.
+    ///
+    /// Prefers the file the owner was located in. Rust lets an `impl` block sit
+    /// in a different file from the type it extends, so a miss there falls back
+    /// to the whole project — but only when unambiguous, and the tier drops to
+    /// reflect that the file was a guess rather than the one we placed.
     fn member_of(
         &self,
+        prefer_file: Option<&str>,
         owner: &str,
         callee: &str,
         tier: Resolution,
     ) -> Option<(String, Resolution)> {
-        let (file, sym) = only(
-            self.defs_by_name
-                .get(callee)?
-                .iter()
-                .copied()
-                .filter(|(_, s)| s.container.as_deref() == Some(owner)),
-        )?;
+        let candidates = self.defs_by_name.get(callee)?;
+        let owned = |s: &RawSymbol| is_callable(s) && s.container.as_deref() == Some(owner);
+
+        if let Some(file) = prefer_file {
+            if let Some(sym) = only(
+                self.defs_by_file
+                    .get(file)?
+                    .iter()
+                    .copied()
+                    .filter(|s| s.name == callee && owned(s)),
+            ) {
+                return Some((
+                    qualified_name(file, sym.container.as_deref(), &sym.name),
+                    tier,
+                ));
+            }
+        }
+
+        let (file, sym) = only(candidates.iter().copied().filter(|(_, s)| owned(s)))?;
+        let _ = tier;
         Some((
             qualified_name(&file.path, sym.container.as_deref(), &sym.name),
-            tier,
+            Resolution::UniqueName,
         ))
     }
 
-    /// How confidently a bare type name can be placed, or None if it cannot.
-    fn locate_type(&self, from: &FileFacts, name: &str) -> Option<Resolution> {
+    /// Where a bare type name resolves to, and how confidently.
+    fn locate_type(&self, from: &FileFacts, name: &str) -> Option<(Resolution, String)> {
         let defined_in = |path: &str| {
             self.defs_by_file
                 .get(path)
                 .is_some_and(|defs| defs.iter().any(|s| s.name == name))
         };
-        if self
+        if let Some(target) = self
             .imports
             .get(from.path.as_str())
             .and_then(|m| m.get(name))
-            .is_some_and(|target| defined_in(target.as_str()))
+            .filter(|target| defined_in(target.as_str()))
         {
-            return Some(Resolution::ImportMap);
+            return Some((Resolution::ImportMap, target.clone()));
         }
         if defined_in(from.path.as_str()) {
-            return Some(Resolution::SameModule);
+            return Some((Resolution::SameModule, from.path.clone()));
         }
-        only(self.defs_by_name.get(name)?.iter().copied()).map(|_| Resolution::UniqueName)
+        let (file, _) = only(self.defs_by_name.get(name)?.iter().copied())?;
+        Some((Resolution::UniqueName, file.path.clone()))
     }
 
     /// A call written without a receiver. It can only reach something callable
@@ -266,10 +286,23 @@ impl<'a> Index<'a> {
 
     /// Last resort for a method call on a receiver of unknown type: accept it
     /// only when exactly one project type defines a method by that name.
-    fn resolve_suffix(&self, name: &str) -> Option<(String, Resolution)> {
+    fn resolve_suffix(&self, from: &FileFacts, name: &str) -> Option<(String, Resolution)> {
         if is_ubiquitous_method(name) {
             return None;
         }
+        // The owning type must be one this file can actually name — imported
+        // here or defined here. Without that the tier reasons only "some
+        // project type has a method by this name", which is true of a great
+        // many names the receiver never had.
+        let visible = |owner: &str| {
+            self.imports
+                .get(from.path.as_str())
+                .is_some_and(|m| m.contains_key(owner))
+                || self
+                    .defs_by_file
+                    .get(from.path.as_str())
+                    .is_some_and(|defs| defs.iter().any(|s| s.name == owner))
+        };
         let (file, sym) = only(
             self.defs_by_name
                 .get(name)?
@@ -279,7 +312,7 @@ impl<'a> Index<'a> {
                     is_callable(s)
                         && s.container
                             .as_deref()
-                            .is_some_and(|owner| self.containers.contains(owner))
+                            .is_some_and(|owner| self.containers.contains(owner) && visible(owner))
                 }),
         )?;
         Some((
@@ -733,6 +766,30 @@ mod tests {
 
     #[test]
     fn a_qualified_call_falls_through_ambiguity_to_the_suffix_tier() {
+        // `Widget` is defined in the calling file, so it is a type this call
+        // site could actually be holding.
+        let files = vec![
+            facts(
+                "a.rs",
+                vec![
+                    func("caller"),
+                    sym("Widget", SymbolLabel::Struct, None),
+                    sym("helper", SymbolLabel::Method, Some("Widget")),
+                ],
+                vec![call("a.rs:caller", "helper", Some("thing"))],
+            ),
+            facts("c.rs", vec![func("helper")], vec![]),
+        ];
+        let out = resolve(&files, nowhere());
+        assert_eq!(out.edges.len(), 1);
+        assert_eq!(out.edges[0].target_qualified, "a.rs:Widget.helper");
+        assert_eq!(out.edges[0].resolution, Some(Resolution::Suffix));
+    }
+
+    #[test]
+    fn the_suffix_tier_ignores_a_type_the_calling_file_cannot_name() {
+        // Without this the tier reasons only "some project type has a method by
+        // this name", which is true of a great many names the receiver never had.
         let files = vec![
             facts(
                 "a.rs",
@@ -747,12 +804,10 @@ mod tests {
                 ],
                 vec![],
             ),
-            facts("c.rs", vec![func("helper")], vec![]),
         ];
         let out = resolve(&files, nowhere());
-        assert_eq!(out.edges.len(), 1);
-        assert_eq!(out.edges[0].target_qualified, "b.rs:Widget.helper");
-        assert_eq!(out.edges[0].resolution, Some(Resolution::Suffix));
+        assert!(out.edges.is_empty(), "got {:?}", out.edges);
+        assert_eq!(out.unresolved.get("a.rs"), Some(&1));
     }
 
     #[test]

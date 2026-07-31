@@ -379,6 +379,15 @@ impl<'a> CrawlOrchestrator<'a> {
     ) -> Option<crate::codegraph::index::IndexOutcome> {
         use crate::codegraph::{index, store::CodeGraphStore};
 
+        // Indexing replaces the project's whole graph, and a focused crawl has
+        // deliberately narrowed the inventory, so running it here would delete
+        // every definition outside the focus and then report full coverage of
+        // what remains.
+        if self.focus.is_some() {
+            tracing::warn!("focused crawl: skipping the code graph, which is whole-project");
+            return None;
+        }
+
         let store = match CodeGraphStore::open_default() {
             Ok(s) => s,
             Err(e) => {
@@ -631,6 +640,76 @@ mod tests {
             r3.files_changed, 1,
             "only the modified file should be in the change set"
         );
+    }
+
+    /// Not a `#[tokio::test]`: the codegraph path is a process-wide env var, so
+    /// it has to be set and restored around a runtime we own. Overriding it is
+    /// what keeps a regression in the focus guard from writing to the real
+    /// `~/.runar-forge/codegraph.db`.
+    #[test]
+    fn a_focused_deep_crawl_leaves_the_code_graph_alone() {
+        use crate::codegraph::store::CodeGraphStore;
+
+        let _guard = crate::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("cg.db");
+        let prev = std::env::var("RUNAR_CODEGRAPH_PATH").ok();
+        std::env::set_var("RUNAR_CODEGRAPH_PATH", &graph_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let root = tmp.path().join("proj");
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::create_dir_all(root.join("lib")).unwrap();
+            fs::write(
+                root.join("src/a.ts"),
+                "export function alpha() { return 1 }\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("lib/b.ts"),
+                "export function beta() { return 2 }\n",
+            )
+            .unwrap();
+
+            let librarian = test_librarian().await;
+            let full = CrawlOrchestrator::new(&librarian, "deepfocus", CrawlMode::Full, None)
+                .with_deep(true)
+                .run(&root)
+                .await
+                .unwrap();
+            let indexed = full.codegraph.expect("a deep crawl reports its index");
+            assert!(indexed.symbols >= 2, "got {indexed:?}");
+
+            let focused = CrawlOrchestrator::new(
+                &librarian,
+                "deepfocus",
+                CrawlMode::Full,
+                Some("src".to_string()),
+            )
+            .with_deep(true)
+            .run(&root)
+            .await
+            .unwrap();
+            assert!(
+                focused.codegraph.is_none(),
+                "a focused crawl must not touch the whole-project graph"
+            );
+
+            let store = CodeGraphStore::open(&graph_path).unwrap();
+            let cov = store.coverage("deepfocus").unwrap();
+            assert_eq!(
+                cov.symbols, indexed.symbols,
+                "the focused crawl replaced the graph with its subset"
+            );
+        });
+
+        match prev {
+            Some(v) => std::env::set_var("RUNAR_CODEGRAPH_PATH", v),
+            None => std::env::remove_var("RUNAR_CODEGRAPH_PATH"),
+        }
     }
 
     #[tokio::test]

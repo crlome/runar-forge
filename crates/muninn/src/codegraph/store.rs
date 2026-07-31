@@ -97,6 +97,12 @@ pub struct Coverage {
 
 /// Drop the contentless-FTS rows for a project, optionally narrowed to one
 /// file. Must run before the matching `code_nodes` rows are deleted.
+///
+/// The table is declared `contentless_delete=1`, which is what makes a plain
+/// `DELETE` work. A `content=''` table without it needs the original column
+/// values and silently keeps the old tokens when it does not get them, leaving
+/// `code_nodes.id` rowids — which SQLite reuses — pointing at a dead symbol's
+/// terms.
 fn delete_fts_rows(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -116,11 +122,7 @@ fn delete_fts_rows(
         }
     };
     for id in ids {
-        tx.execute(
-            "INSERT INTO code_symbols_fts (code_symbols_fts, rowid, name_tokens, qualified_name, file_path)
-             VALUES ('delete', ?1, '', '', '')",
-            params![id],
-        )?;
+        tx.execute("DELETE FROM code_symbols_fts WHERE rowid = ?1", params![id])?;
     }
     Ok(())
 }
@@ -584,6 +586,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
   qualified_name,
   file_path,
   content='',
+  contentless_delete=1,
   tokenize='unicode61 remove_diacritics 2'
 );
 "#;
@@ -750,6 +753,67 @@ mod tests {
         assert_eq!(cov.symbols, 0);
         assert_eq!(cov.edges, 0, "edges must cascade with their nodes");
         assert_eq!(cov.files_total, 0);
+    }
+
+    fn fts_hits(store: &CodeGraphStore, term: &str) -> i64 {
+        let db = store.lock().unwrap();
+        db.query_row(
+            "SELECT COUNT(*) FROM code_symbols_fts WHERE code_symbols_fts MATCH ?1",
+            params![term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn removing_a_symbol_removes_its_search_tokens() {
+        // FTS5 rowids are code_nodes ids and SQLite reuses ids, so a delete that
+        // does not really delete leaves the next symbol wearing a dead one's
+        // terms — and it fails silently.
+        let s = store();
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        fn rec(hash: &str) -> FileRecord<'_> {
+            FileRecord {
+                path: "src/a.rs",
+                lang: Some("rust"),
+                content_hash: hash,
+                status: FileStatus::Indexed,
+                detail: None,
+            }
+        }
+        s.replace_file(
+            "p",
+            rec("h1"),
+            &[sym("src/a.rs", None, "zarquon", SymbolLabel::Function)],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&s, "zarquon"), 1);
+
+        s.replace_file(
+            "p",
+            rec("h2"),
+            &[sym("src/a.rs", None, "blarg", SymbolLabel::Function)],
+        )
+        .unwrap();
+        assert_eq!(
+            fts_hits(&s, "zarquon"),
+            0,
+            "tokens for a replaced symbol survived"
+        );
+        assert_eq!(fts_hits(&s, "blarg"), 1);
+
+        s.forget_file("p", "src/a.rs").unwrap();
+        assert_eq!(fts_hits(&s, "blarg"), 0, "forget_file left tokens behind");
+
+        // A full re-index must not accumulate a second copy either.
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        s.replace_file(
+            "p",
+            rec("h3"),
+            &[sym("src/a.rs", None, "zarquon", SymbolLabel::Function)],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&s, "zarquon"), 1);
     }
 
     #[test]

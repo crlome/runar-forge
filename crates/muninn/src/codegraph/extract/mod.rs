@@ -138,11 +138,19 @@ fn text<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
     node.utf8_text(bytes).unwrap_or("")
 }
 
-/// First line of a node, trimmed and length-capped. Bodies never reach storage.
+/// First line of a declaration, trimmed and length-capped.
+///
+/// Everything after the first `=` is dropped: for a const or static the
+/// declaration line carries its initializer, and that is exactly where a
+/// hardcoded credential lives. No value from the source reaches storage.
 fn signature_of(node: Node<'_>, bytes: &[u8]) -> String {
     let raw = text(node, bytes);
-    let first = raw.lines().next().unwrap_or("").trim();
-    crate::text::truncate_ellipsis(first, 200)
+    let first = raw.lines().next().unwrap_or("");
+    let head = match first.find('=') {
+        Some(i) => &first[..i],
+        None => first,
+    };
+    crate::text::truncate_ellipsis(head.trim(), 200)
 }
 
 /// Walk up to the nearest container node and read its name.
@@ -263,25 +271,29 @@ fn collect_symbols(
 }
 
 /// Visibility is a syntactic property in every language handled here.
+///
+/// The JS/TS test is the declaration's own parent chain up to the first
+/// statement boundary — scanning preceding siblings instead would mark every
+/// declaration after the file's first `export` as exported, and walking all
+/// ancestors would do the same to anything nested inside an exported function.
 fn is_exported(decl: Node<'_>, bytes: &[u8]) -> bool {
-    let head = text(decl, bytes);
-    let head = head.lines().next().unwrap_or("");
-    if head.contains("pub ") || head.starts_with("pub(") {
+    let head = text(decl, bytes).lines().next().unwrap_or("");
+    let head = head.split('=').next().unwrap_or(head);
+    if head.contains("pub ") || head.contains("pub(") {
         return true;
-    }
-    let mut sib = decl.prev_sibling();
-    while let Some(n) = sib {
-        if n.kind() == "export_statement" {
-            return true;
-        }
-        sib = n.prev_sibling();
     }
     let mut cur = decl.parent();
     while let Some(n) = cur {
-        if n.kind() == "export_statement" {
-            return true;
+        match n.kind() {
+            "export_statement" => return true,
+            // A declaration reaches its export through declaration wrappers
+            // only; anything else means we have left the statement.
+            "lexical_declaration"
+            | "variable_declaration"
+            | "variable_declarator"
+            | "declaration" => cur = n.parent(),
+            _ => return false,
         }
-        cur = n.parent();
     }
     false
 }
@@ -426,9 +438,11 @@ fn collect_relations(
             }
         }
         if let (Some(subject), Some(object)) = (subject, object) {
+            // Definitions are named without type arguments, so `impl<T> Foo<T>`
+            // has to be normalised the same way or its relation never matches.
             out.push(RawRelation {
-                subject,
-                object,
+                subject: base_type_name(&subject),
+                object: base_type_name(&object),
                 kind: spec.relation_kind,
             });
         }
@@ -439,6 +453,45 @@ fn collect_relations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signature_never_carries_a_literal_value() {
+        // The declaration line of a const holds its initializer, which is
+        // exactly where a hardcoded credential sits.
+        let src = concat!(
+            "pub const API_KEY: &str = \"sk-live-super-secret-value\";\n",
+            "static TOKEN: &str = \"ghp_anothersecret\";\n",
+            "pub fn ordinary(a: u32) -> u32 { a }\n"
+        );
+        let out = extract_file(src, Lang::Rust, "src/keys.rs");
+        assert!(!out.symbols.is_empty());
+        for sym in &out.symbols {
+            assert!(
+                !sym.signature.contains("sk-live") && !sym.signature.contains("ghp_"),
+                "signature leaked a literal: {:?}",
+                sym.signature
+            );
+        }
+        let api = out.symbols.iter().find(|s| s.name == "API_KEY").unwrap();
+        assert!(api.signature.contains("API_KEY"), "got {:?}", api.signature);
+        assert!(api.exported, "pub const should read as exported");
+    }
+
+    #[test]
+    fn only_the_exported_declaration_is_marked_exported() {
+        // Scanning preceding siblings would mark everything after the file's
+        // first `export` as exported.
+        let src = concat!(
+            "export function first() { return 1 }\n",
+            "function second() { return 2 }\n",
+            "export function third() { return 3 }\n"
+        );
+        let out = extract_file(src, Lang::TypeScript, "src/m.ts");
+        let by = |n: &str| out.symbols.iter().find(|s| s.name == n).unwrap().exported;
+        assert!(by("first"));
+        assert!(!by("second"), "a later declaration inherited the export");
+        assert!(by("third"));
+    }
 
     /// A query that fails to compile silently yields nothing at runtime, so
     /// grammar drift has to fail here instead.
