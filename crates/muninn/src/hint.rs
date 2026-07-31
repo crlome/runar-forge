@@ -217,7 +217,7 @@ pub fn emission_stats() -> Vec<(String, usize, usize)> {
     }
     let mut out: Vec<(String, usize, usize)> =
         per.into_iter().map(|(s, (n, b))| (s, n, b)).collect();
-    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out.sort_by_key(|e| std::cmp::Reverse(e.2));
     out
 }
 
