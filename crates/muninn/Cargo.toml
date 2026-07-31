@@ -100,15 +100,13 @@ futures-util = "0.3"
 # Async trait support
 async-trait = "0.1"
 
-# Code analysis (Huginn): tree-sitter + language grammars + ast-grep
+# Code analysis (Huginn): tree-sitter + language grammars
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-go = "0.23"
-ast-grep-core = "0.39"
-ast-grep-language = "0.39"
 
 [dev-dependencies]
 tokio-test = "0.4"

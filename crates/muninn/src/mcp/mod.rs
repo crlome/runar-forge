@@ -1147,6 +1147,7 @@ async fn tool_huginn_crawl(
         "patternsFound": result.patterns_found,
         "techDebtMarkers": result.techdebt_markers,
         "entriesSaved": result.entries_saved,
+        "entriesDeprecated": result.entries_deprecated,
     })
     .to_string())
 }
@@ -1290,6 +1291,21 @@ async fn tool_huginn_techdebt(
     .to_string())
 }
 
+/// Project root as recorded by the last crawl, if there is one.
+async fn crawl_root_for(
+    librarian: &Arc<MemoryLibrarian>,
+    project_id: &str,
+) -> Option<std::path::PathBuf> {
+    let key = crate::huginn::crawl::crawl_state_key_for(project_id);
+    let entry = librarian
+        .get_by_topic_key(Some(project_id), &key)
+        .await
+        .ok()??;
+    let state = crate::huginn::git::deserialize_state(&entry.content)?;
+    let root = std::path::PathBuf::from(state.project_root);
+    root.exists().then_some(root)
+}
+
 async fn tool_huginn_recrawl_file(
     args: &Value,
     librarian: &Arc<MemoryLibrarian>,
@@ -1321,12 +1337,26 @@ async fn tool_huginn_recrawl_file(
         .map(|s| s.lines().count())
         .unwrap_or(0);
 
+    // Entry topic keys are built from the project-relative path, so this has
+    // to resolve to the same root the crawl used or the write lands as a
+    // duplicate instead of superseding. Prefer the root the crawl recorded.
+    let root = crawl_root_for(librarian, project_id)
+        .await
+        .or_else(|| crate::huginn::crawl::infer_project_root(&abs));
+    let relative_path = root
+        .as_ref()
+        .and_then(|r| abs.strip_prefix(r).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| {
+            format!(
+                "cannot resolve {} relative to project {project_id}; run huginn_crawl for this project first",
+                abs.display()
+            )
+        })?;
+
     let entry = FileEntry {
         path: abs.clone(),
-        relative_path: abs
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default(),
+        relative_path,
         size: metadata.len(),
         line_count,
         last_modified: metadata.modified().ok(),

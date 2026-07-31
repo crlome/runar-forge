@@ -69,24 +69,6 @@ impl GraphBuilder {
         calculate_depths(&mut graph, &entry_set);
         graph
     }
-
-    /// Barrel files: small index files that mostly re-export
-    pub fn detect_barrels(graph: &DependencyGraph) -> Vec<String> {
-        let mut barrels = Vec::new();
-        for (path, node) in &graph.nodes {
-            let is_index = path.ends_with("index.ts")
-                || path.ends_with("index.tsx")
-                || path.ends_with("index.js")
-                || path.ends_with("index.jsx");
-            if !is_index {
-                continue;
-            }
-            if node.line_count <= 30 && node.export_count > 0 && !node.resolved_imports.is_empty() {
-                barrels.push(path.clone());
-            }
-        }
-        barrels
-    }
 }
 
 fn calculate_depths(graph: &mut DependencyGraph, entry_paths: &HashSet<String>) {
@@ -137,11 +119,6 @@ pub fn fan_in(graph: &DependencyGraph, path: &str) -> usize {
     graph.reverse_edges.get(path).map(|s| s.len()).unwrap_or(0)
 }
 
-/// Fan-out: how many files this one imports.
-pub fn fan_out(graph: &DependencyGraph, path: &str) -> usize {
-    graph.edges.get(path).map(|s| s.len()).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,27 +163,8 @@ mod tests {
         assert_eq!(graph.nodes.get("b.ts").unwrap().depth, 1);
         assert_eq!(graph.nodes.get("c.ts").unwrap().depth, 2);
 
-        assert_eq!(fan_out(&graph, "main.ts"), 2);
+        assert_eq!(graph.edges.get("main.ts").unwrap().len(), 2);
         assert_eq!(fan_in(&graph, "c.ts"), 1);
         assert_eq!(fan_in(&graph, "a.ts"), 1);
-    }
-
-    #[test]
-    fn detects_barrels() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        let index = mk_entry(
-            root,
-            "src/index.ts",
-            "export { foo } from './foo'\nexport { bar } from './bar'\n",
-        );
-        let foo = mk_entry(root, "src/foo.ts", "export function foo() {}\n");
-        let bar = mk_entry(root, "src/bar.ts", "export function bar() {}\n");
-
-        let files = vec![index, foo, bar];
-        let graph = GraphBuilder::build(&files, root, &[]);
-        let barrels = GraphBuilder::detect_barrels(&graph);
-        assert!(barrels.contains(&"src/index.ts".to_string()));
     }
 }

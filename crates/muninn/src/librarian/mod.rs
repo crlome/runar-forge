@@ -645,6 +645,17 @@ impl MemoryLibrarian {
         self.storage.get(id).await
     }
 
+    /// Metadata lookup — deliberately does not touch access counters or
+    /// decay, so a topic_key probe never looks like a retrieval.
+    pub async fn get_by_topic_key(
+        &self,
+        project_id: Option<&str>,
+        topic_key: &str,
+    ) -> StorageResult<Option<MemoryEntry>> {
+        let ns = self.scope(None, project_id);
+        self.storage.get_by_topic_key(ns, topic_key).await
+    }
+
     pub async fn list(&self, filters: ListFilters) -> StorageResult<Vec<MemoryEntry>> {
         let mut f = filters;
         if f.namespace.is_none() {

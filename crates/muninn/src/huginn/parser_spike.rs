@@ -30,15 +30,4 @@ const x = require('x')
         }
         assert_eq!(found, vec!["./foo", "bar"]);
     }
-
-    #[test]
-    fn ast_grep_pattern_match() {
-        use ast_grep_core::AstGrep;
-        use ast_grep_language::SupportLang;
-
-        let src = "app.use(authMiddleware); app.use(logger)";
-        let grep = AstGrep::new(src, SupportLang::TypeScript);
-        let matches: Vec<_> = grep.root().find_all("app.use($MW)").collect();
-        assert_eq!(matches.len(), 2);
-    }
 }
