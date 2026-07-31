@@ -1152,6 +1152,7 @@ async fn tool_huginn_crawl(
         "techDebtMarkers": result.techdebt_markers,
         "entriesSaved": result.entries_saved,
         "entriesDeprecated": result.entries_deprecated,
+        "wholeProjectEntriesRefreshed": result.whole_project_entries_refreshed,
         "codeGraph": result.codegraph.as_ref().map(|cg| serde_json::json!({
             "symbols": cg.symbols,
             "edges": cg.edges,

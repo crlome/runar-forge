@@ -224,84 +224,173 @@ impl<E: std::fmt::Display> std::fmt::Display for BreakerOutcome<E> {
 mod tests {
     use super::*;
 
+    use crate::test_support::{with_runar_home, HOME_LOCK};
+
+    /// Distinct per test so two tests inside the same `RUNAR_HOME` can never
+    /// share a state file. Orthogonal to `with_runar_home`, which is what
+    /// stops another module repointing the *directory* mid-test.
     fn unique_project() -> String {
         format!("breaker-test-{}", uuid::Uuid::new_v4())
     }
 
+    /// `with_runar_home` takes `FnOnce()`, so the async cases own their runtime
+    /// instead of wearing `#[tokio::test]`: the `HOME_LOCK` guard has to cover
+    /// the awaits, and an async test body would be holding a std `MutexGuard`
+    /// across `.await` to achieve that.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(fut)
+    }
+
     #[test]
     fn fresh_project_is_not_tripped() {
-        assert!(!is_tripped(&unique_project()));
+        with_runar_home(|| {
+            assert!(!is_tripped(&unique_project()));
+        });
     }
 
     #[test]
     fn trip_after_threshold_failures() {
-        let pid = unique_project();
-        for _ in 0..TRIP_THRESHOLD {
-            record_failure(&pid);
-        }
-        assert!(is_tripped(&pid));
+        with_runar_home(|| {
+            let pid = unique_project();
+            for _ in 0..TRIP_THRESHOLD {
+                record_failure(&pid);
+            }
+            assert!(is_tripped(&pid));
 
-        let state = read_state(&pid);
-        assert_eq!(state.consecutive_failures, TRIP_THRESHOLD);
-        assert!(state.tripped_until > now_ms());
+            let state = read_state(&pid);
+            assert_eq!(state.consecutive_failures, TRIP_THRESHOLD);
+            assert!(state.tripped_until > now_ms());
+        });
     }
 
     #[test]
     fn success_resets_counter() {
-        let pid = unique_project();
-        record_failure(&pid);
-        record_failure(&pid);
-        record_success(&pid);
-
-        let state = read_state(&pid);
-        assert_eq!(state.consecutive_failures, 0);
-        assert_eq!(state.tripped_until, 0);
-        assert!(!is_tripped(&pid));
-    }
-
-    #[tokio::test]
-    async fn retry_success_after_transient_failures() {
-        let pid = unique_project();
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-        let result: Result<i32, BreakerOutcome<&'static str>> = with_retry(&pid, || {
-            let attempts = attempts.clone();
-            async move {
-                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if n < 2 {
-                    Err("transient")
-                } else {
-                    Ok(42)
-                }
-            }
-        })
-        .await;
-
-        assert!(matches!(result, Ok(42)));
-        assert!(!is_tripped(&pid));
-    }
-
-    #[tokio::test]
-    async fn tripped_short_circuits_operation() {
-        let pid = unique_project();
-        for _ in 0..TRIP_THRESHOLD {
+        with_runar_home(|| {
+            let pid = unique_project();
             record_failure(&pid);
-        }
-        assert!(is_tripped(&pid));
+            record_failure(&pid);
+            record_success(&pid);
 
-        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let called_clone = called.clone();
+            let state = read_state(&pid);
+            assert_eq!(state.consecutive_failures, 0);
+            assert_eq!(state.tripped_until, 0);
+            assert!(!is_tripped(&pid));
+        });
+    }
 
-        let result: Result<i32, BreakerOutcome<&'static str>> = with_retry(&pid, || {
-            let called = called_clone.clone();
-            async move {
-                called.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok::<i32, &'static str>(1)
+    #[test]
+    fn db_trip_after_threshold_failures() {
+        with_runar_home(|| {
+            let pid = unique_project();
+            for _ in 0..DB_TRIP_THRESHOLD {
+                db_record_failure(&pid);
             }
-        })
-        .await;
+            assert!(is_db_tripped(&pid));
+            assert_eq!(db_state(&pid).consecutive_failures, DB_TRIP_THRESHOLD);
 
-        assert!(matches!(result, Err(BreakerOutcome::Tripped)));
-        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            // Separate state file: tripping the DB breaker must not trip the
+            // summarizer one for the same project.
+            assert!(!is_tripped(&pid));
+
+            db_record_success(&pid);
+            assert!(!is_db_tripped(&pid));
+            assert_eq!(db_state(&pid).consecutive_failures, 0);
+        });
+    }
+
+    #[test]
+    fn retry_success_after_transient_failures() {
+        with_runar_home(|| {
+            let pid = unique_project();
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+            let result: Result<i32, BreakerOutcome<&'static str>> =
+                block_on(with_retry(&pid, || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if n < 2 {
+                            Err("transient")
+                        } else {
+                            Ok(42)
+                        }
+                    }
+                }));
+
+            assert!(matches!(result, Ok(42)));
+            assert!(!is_tripped(&pid));
+        });
+    }
+
+    #[test]
+    fn tripped_short_circuits_operation() {
+        with_runar_home(|| {
+            let pid = unique_project();
+            for _ in 0..TRIP_THRESHOLD {
+                record_failure(&pid);
+            }
+            assert!(is_tripped(&pid));
+
+            let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let called_clone = called.clone();
+
+            let result: Result<i32, BreakerOutcome<&'static str>> =
+                block_on(with_retry(&pid, || {
+                    let called = called_clone.clone();
+                    async move {
+                        called.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<i32, &'static str>(1)
+                    }
+                }));
+
+            assert!(matches!(result, Err(BreakerOutcome::Tripped)));
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        });
+    }
+
+    /// Every file the breaker writes must land under `RUNAR_HOME` and nowhere
+    /// else. Drop the redirect below — the shape these tests had before they
+    /// were made hermetic — and this fails on both counts: state appears in the
+    /// ambient directory, which for a developer is the real `~/.runar-forge`.
+    #[test]
+    fn state_files_never_escape_runar_home() {
+        // Hand-rolled rather than `with_runar_home`, for two reasons: the
+        // assertion target is the *ambient* directory, which must be resolved
+        // under the lock but before the redirect (and `HOME_LOCK` is not
+        // reentrant); and the env is restored before the asserts, so a failure
+        // here can't strand `RUNAR_HOME` on a tempdir that is about to be
+        // deleted and take every later test down with it.
+        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ambient = crate::setup::runar_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("RUNAR_HOME").ok();
+        std::env::set_var("RUNAR_HOME", tmp.path());
+
+        let pid = unique_project();
+        record_failure(&pid);
+        db_record_failure(&pid);
+
+        let summarizer = format!("breaker-{pid}.json");
+        let db = format!("db-breaker-{pid}.json");
+        let home = crate::setup::runar_dir();
+        let redirected = home.starts_with(tmp.path());
+        let wrote_inside = home.join(&summarizer).is_file() && home.join(&db).is_file();
+        let escaped = ambient.join(&summarizer).exists() || ambient.join(&db).exists();
+
+        match prev {
+            Some(v) => std::env::set_var("RUNAR_HOME", v),
+            None => std::env::remove_var("RUNAR_HOME"),
+        }
+
+        assert!(redirected, "RUNAR_HOME redirect did not take effect");
+        assert!(
+            wrote_inside,
+            "breaker state must be written under RUNAR_HOME"
+        );
+        assert!(!escaped, "breaker state escaped into {}", ambient.display());
     }
 }

@@ -194,6 +194,15 @@ pub fn stats_path() -> PathBuf {
     crate::setup::runar_dir().join("hint-stats.tsv")
 }
 
+/// Record a fire that produced nothing, and why.
+///
+/// Emissions alone cannot answer the question the kill criterion is written
+/// against — a hit-rate needs the denominator. Without this, "12 emissions"
+/// could mean 12 fires or 400.
+pub fn record_gated(reason: &str) {
+    append_stat(&format!("-\tgated\t{reason}"));
+}
+
 /// One line per emission: session, bytes.
 ///
 /// The v0.9.0 post-mortem's own conclusion — latency telemetry said everything
@@ -201,8 +210,18 @@ pub fn stats_path() -> PathBuf {
 /// expensive one, so it is recorded from the first fire rather than added after
 /// someone wonders.
 pub fn record_emission(session_id: &str, bytes: usize) {
+    let session = if session_id.is_empty() {
+        "unknown"
+    } else {
+        session_id
+    };
+    append_stat(&format!("{session}\temit\t{bytes}"));
+}
+
+fn append_stat(line: &str) {
     use std::io::Write;
     let path = stats_path();
+    // `OpenOptions` creates the file, never the directory it sits in.
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -211,36 +230,75 @@ pub fn record_emission(session_id: &str, bytes: usize) {
         .append(true)
         .open(&path)
     {
-        let session = if session_id.is_empty() {
-            "unknown"
-        } else {
-            session_id
-        };
-        let _ = writeln!(f, "{session}\t{bytes}");
+        let _ = writeln!(f, "{line}");
     }
 }
 
-/// Emissions and total bytes, per session, for `runar doctor`.
-pub fn emission_stats() -> Vec<(String, usize, usize)> {
-    let Ok(body) = std::fs::read_to_string(stats_path()) else {
-        return Vec::new();
-    };
-    let mut per: std::collections::HashMap<String, (usize, usize)> =
-        std::collections::HashMap::new();
-    for line in body.lines() {
-        let Some((session, bytes)) = line.split_once('\t') else {
-            continue;
-        };
-        let Ok(bytes) = bytes.trim().parse::<usize>() else {
-            continue;
-        };
-        let e = per.entry(session.to_string()).or_default();
-        e.0 += 1;
-        e.1 += bytes;
+/// What the hook has actually cost and how often it had anything to say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HintStats {
+    pub emissions: usize,
+    pub total_bytes: usize,
+    /// Fires that produced nothing, by reason.
+    pub gated: Vec<(String, usize)>,
+    /// Distinct sessions that saw at least one emission.
+    pub sessions: usize,
+}
+
+impl HintStats {
+    pub fn fires(&self) -> usize {
+        self.emissions + self.gated.iter().map(|(_, n)| n).sum::<usize>()
     }
-    let mut out: Vec<(String, usize, usize)> =
-        per.into_iter().map(|(s, (n, b))| (s, n, b)).collect();
-    out.sort_by_key(|e| std::cmp::Reverse(e.2));
+
+    /// Emissions as a percentage of fires — the number the kill criterion is
+    /// written against. `None` until the hook has fired at all.
+    pub fn hit_rate(&self) -> Option<usize> {
+        (self.emissions * 100).checked_div(self.fires())
+    }
+
+    pub fn bytes_per_session(&self) -> Option<usize> {
+        self.total_bytes.checked_div(self.sessions)
+    }
+}
+
+/// Parse the stats file. Tolerates the older two-column rows so a file written
+/// before gated fires were counted still reports its emissions.
+pub fn hint_stats() -> HintStats {
+    let Ok(body) = std::fs::read_to_string(stats_path()) else {
+        return HintStats::default();
+    };
+    let mut out = HintStats::default();
+    let mut gated: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in body.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        match cols.as_slice() {
+            [session, "emit", bytes] => {
+                if let Ok(b) = bytes.trim().parse::<usize>() {
+                    out.emissions += 1;
+                    out.total_bytes += b;
+                    sessions.insert((*session).to_string());
+                }
+            }
+            [_, "gated", reason] => {
+                *gated.entry((*reason).to_string()).or_default() += 1;
+            }
+            // Pre-existing two-column rows: session, bytes.
+            [session, bytes] => {
+                if let Ok(b) = bytes.trim().parse::<usize>() {
+                    out.emissions += 1;
+                    out.total_bytes += b;
+                    sessions.insert((*session).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sessions = sessions.len();
+    let mut gated: Vec<(String, usize)> = gated.into_iter().collect();
+    gated.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out.gated = gated;
     out
 }
 
@@ -325,6 +383,59 @@ mod tests {
                 decide("Grep", Some("build_state"), session),
                 Decision::Lookup(_)
             ));
+        });
+    }
+
+    #[test]
+    fn stats_count_both_halves_of_the_hit_rate() {
+        crate::test_support::with_runar_home(|| {
+            for reason in ["no identifier-like token in pattern"; 3] {
+                record_gated(reason);
+            }
+            record_gated("no match in the graph");
+            record_emission("s1", 200);
+            record_emission("s1", 100);
+            record_emission("s2", 300);
+
+            let st = hint_stats();
+            assert_eq!(st.emissions, 3);
+            assert_eq!(st.fires(), 7, "gated fires are the denominator");
+            assert_eq!(st.hit_rate(), Some(42));
+            assert_eq!(st.total_bytes, 600);
+            assert_eq!(st.sessions, 2);
+            assert_eq!(st.bytes_per_session(), Some(300));
+            assert_eq!(
+                st.gated.first().map(|(r, n)| (r.as_str(), *n)),
+                Some(("no identifier-like token in pattern", 3)),
+                "the commonest gate is reported first"
+            );
+        });
+    }
+
+    #[test]
+    fn stats_still_read_a_file_written_before_gated_fires_were_counted() {
+        // The format gained a column; a file already on disk must not be
+        // silently reported as zero.
+        crate::test_support::with_runar_home(|| {
+            let path = stats_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "old-session\t239\nother\t100\n").unwrap();
+
+            let st = hint_stats();
+            assert_eq!(st.emissions, 2);
+            assert_eq!(st.total_bytes, 339);
+            assert_eq!(st.sessions, 2);
+            assert_eq!(st.hit_rate(), Some(100), "no gated rows were recorded then");
+        });
+    }
+
+    #[test]
+    fn no_fires_yields_no_rate_rather_than_a_zero() {
+        crate::test_support::with_runar_home(|| {
+            let st = hint_stats();
+            assert_eq!(st.fires(), 0);
+            assert_eq!(st.hit_rate(), None, "0/0 must not read as 0%");
+            assert_eq!(st.bytes_per_session(), None);
         });
     }
 

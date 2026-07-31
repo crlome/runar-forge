@@ -218,6 +218,7 @@ pub async fn run(opts: DoctorOpts) -> Report {
     report
         .checks
         .push(check_code_graph(&CodeGraphStore::default_path()));
+    report.checks.push(check_search_hints());
 
     if !opts.db_only {
         report.checks.push(check_breaker_state());
@@ -881,6 +882,55 @@ const CODEGRAPH_MAX_PROJECTS: usize = 8;
 /// failure: an absent, stale or unreadable file means queries return nothing,
 /// not that the install is broken. It is never a silent pass either — the
 /// reason always names what is wrong and how to fix it.
+/// Report what the opt-in search-hint hook has actually cost.
+///
+/// The hook shipped with an agreed kill criterion — emit hit-rate under ~25%,
+/// or bytes per session in the tens of KB — and a criterion nobody can read is
+/// a criterion nobody applies.
+fn check_search_hints() -> Check {
+    let stats = crate::hint::hint_stats();
+    if stats.fires() == 0 {
+        return Check::skip(
+            "search hints",
+            "never fired — opt in with `runar setup claude-code --with-search-hints` \
+             (needs a crawl first)"
+                .to_string(),
+        );
+    }
+
+    let mut detail = format!("{} fire(s), {} emission(s)", stats.fires(), stats.emissions);
+    if let Some(rate) = stats.hit_rate() {
+        detail.push_str(&format!(", {rate}% hit rate"));
+    }
+    if let Some(bps) = stats.bytes_per_session() {
+        detail.push_str(&format!(
+            ", {} B total over {} session(s) (~{bps} B/session)",
+            stats.total_bytes, stats.sessions
+        ));
+    }
+    if let Some((reason, n)) = stats.gated.first() {
+        detail.push_str(&format!("; most gated: {reason} ({n})"));
+    }
+
+    // Below the agreed floor this is noise on every search, so say so rather
+    // than reporting a green line with a bad number inside it.
+    match stats.hit_rate() {
+        Some(rate) if rate < 25 && stats.fires() >= 50 => Check::skip(
+            "search hints",
+            format!(
+                "{detail} — below the 25% hit-rate the hook was kept on for; \
+                     consider `runar setup claude-code --no-search-hints`"
+            ),
+        ),
+        _ => Check::pass_with("search hints", detail),
+    }
+}
+
+/// Report the code graph without ever touching it.
+///
+/// Its absence is normal — it is built by `runar crawl`, and a project that has
+/// never been crawled simply has none — so nothing here is a failure. A schema
+/// mismatch is likewise not corruption: the next writer drops and rebuilds.
 fn check_code_graph(path: &Path) -> Check {
     let degraded =
         |detail: String| Check::skip("code graph", format!("{detail}; {CODEGRAPH_REMEDY}"));
