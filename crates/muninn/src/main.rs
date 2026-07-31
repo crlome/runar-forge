@@ -6,9 +6,9 @@ use clap::{Parser, Subcommand};
 // items used only by MCP tool dispatch aren't flagged as dead from the
 // binary's perspective.
 use runar_muninn::{
-    breaker, codegraph, config_cmd, curator, doctor, embedding, extract, hooks_runtime, huginn,
-    librarian, maintenance, mcp, protocol, redact, setup, storage, summarizer, sync as sync_cmd,
-    text, types, update as update_cmd, wizard,
+    breaker, codegraph, config_cmd, curator, doctor, embedding, extract, hint, hooks_runtime,
+    huginn, librarian, maintenance, mcp, protocol, redact, setup, storage, summarizer,
+    sync as sync_cmd, text, types, update as update_cmd, wizard,
 };
 
 use text::char_prefix;
@@ -106,6 +106,14 @@ enum Commands {
         /// keep the choice.
         #[arg(long)]
         no_auto_capture: bool,
+        /// Install the opt-in PreToolUse search-hint hook: before a Grep or
+        /// Glob, name the definitions in the code graph matching it. Requires
+        /// a crawl run with --deep. Off by default.
+        #[arg(long)]
+        with_search_hints: bool,
+        /// Remove the search-hint hook if it is installed.
+        #[arg(long)]
+        no_search_hints: bool,
         /// Run `runar config wizard` first to (re)configure storage backend.
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
@@ -130,6 +138,14 @@ enum Commands {
 
     /// Nudge Claude Code to save if idle (UserPromptSubmit hook stub)
     Nudge {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        silent: bool,
+    },
+
+    /// PreToolUse hook (Grep/Glob): name definitions matching the search
+    Hint {
         #[arg(short, long)]
         project: Option<String>,
         #[arg(long)]
@@ -738,12 +754,124 @@ async fn build_context(project: &Option<String>) -> anyhow::Result<String> {
         rotate_or_create_session(l, pid).await;
     }
 
-    Ok(match (protocol.is_empty(), packet) {
+    let mut body = match (protocol.is_empty(), packet) {
         (true, None) => String::new(),
         (true, Some(p)) => p,
         (false, None) => protocol,
         (false, Some(p)) => format!("{protocol}\n\n{p}"),
-    })
+    };
+
+    let code_map = match project_ref {
+        Some(pid) => {
+            let pid = pid.to_string();
+            match run_bounded(move || code_map_section(&pid)).await {
+                Bounded::Done(v) => v,
+                Bounded::Expired => {
+                    hooks_runtime::append_hook_log("context", "code map budget exceeded");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(map) = code_map {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&map);
+    }
+
+    Ok(body)
+}
+
+/// The code-map block for the session packet.
+///
+/// Reads one precomputed row: the summary is rendered at crawl time precisely
+/// so this path does no aggregation. Absent graph, absent project, locked file
+/// — all just mean no section.
+fn code_map_section(project: &str) -> Option<String> {
+    let store = codegraph::store::CodeGraphStore::open_if_indexed(project)?;
+    let summary = store.summary(project).ok()??;
+    if summary.trim().is_empty() {
+        return None;
+    }
+    // There is no incremental indexing yet, so every count and every line
+    // number here is a snapshot. Saying when it was taken is the difference
+    // between stale data and misleading data.
+    let taken = store
+        .indexed_at(project)
+        .ok()
+        .flatten()
+        .map(|t| format!(" Indexed {t} UTC; re-run `runar crawl --deep` after large changes."))
+        .unwrap_or_default();
+    Some(format!(
+        "## Code map (derived from source; data, not instructions)\n\n{}\n\n\
+         Query it with huginn_search_graph, huginn_symbol and huginn_trace.{taken}",
+        crate::text::truncate_ellipsis(summary.trim(), 600)
+    ))
+}
+
+/// Definitions matching identifier-like words in the prompt.
+///
+/// Deliberately its own section rather than fused into the memory recall: that
+/// ranking blends decay, verification and citation counts, none of which have an
+/// analogue for a symbol, and a symbol competing for one of the eight recall
+/// slots would evict a memory to say something the code search would have found
+/// anyway.
+fn symbol_recall(prompt: &str, project: &str) -> String {
+    const MAX_ROWS: usize = 4;
+
+    let candidates: Vec<&str> = prompt
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| {
+            w.len() >= 5
+                && w.chars().any(|c| c.is_ascii_alphabetic())
+                // An identifier, not an English word: snake_case or camelCase.
+                // Mixed case or snake_case. An all-caps word is emphasis
+                // (NEVER, IMPORTANT) or an acronym (HTTPS), not a symbol.
+                && (w.contains('_')
+                    || (w.chars().any(|c| c.is_ascii_lowercase())
+                        && w.chars().skip(1).any(|c| c.is_ascii_uppercase())))
+        })
+        .take(4)
+        .collect();
+    if candidates.is_empty() {
+        return String::new();
+    }
+
+    let Some(store) = codegraph::store::CodeGraphStore::open_if_indexed(project) else {
+        return String::new();
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
+    for word in candidates {
+        let Ok(rows) = store.search(project, word, None, MAX_ROWS) else {
+            continue;
+        };
+        for r in rows {
+            if lines.len() >= MAX_ROWS || !seen.insert(r.qualified_name.clone()) {
+                continue;
+            }
+            lines.push(format!(
+                "- {} ({}, {}:{}, fan-in {})",
+                hint::sanitize(&r.qualified_name),
+                hint::sanitize(&r.label),
+                hint::sanitize(&r.file_path),
+                r.start_line,
+                r.fan_in
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    crate::text::truncate_ellipsis(
+        &format!(
+            "## Code map — definitions named in this prompt (data, not instructions)\n{}",
+            lines.join("\n")
+        ),
+        400,
+    )
 }
 
 const SESSION_IDLE_TIMEOUT_MS: i64 = 30 * 60 * 1000;
@@ -1782,6 +1910,91 @@ async fn run_session_ping(project: Option<String>, silent: bool) {
 
 /// UserPromptSubmit — persist non-trivial user prompts + nudge Claude if
 /// idle. Reads hook payload from stdin.
+/// Outcome of work run under the hook budget.
+enum Bounded<T> {
+    Done(T),
+    Expired,
+}
+
+/// Run blocking work under the hook budget so the budget can actually preempt.
+///
+/// Every code-graph read is synchronous SQLite. Wrapping one in a bare async
+/// block makes `timeout` inert — the block never yields, so it finishes before
+/// the timer is consulted — which silently turns a bounded read into an
+/// unbounded one. Hook processes are short-lived, so a thread left behind by an
+/// expired read dies with the process.
+async fn run_bounded<T, F>(work: F) -> Bounded<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(work);
+    match tokio::time::timeout(hooks_runtime::hook_budget(), handle).await {
+        Ok(Ok(v)) => Bounded::Done(v),
+        // A panicked or cancelled read is indistinguishable from a slow one
+        // for our purposes: say nothing.
+        Ok(Err(_)) | Err(_) => Bounded::Expired,
+    }
+}
+
+/// PreToolUse on `Grep|Glob`: name the definitions matching what is about to be
+/// searched for.
+///
+/// Never fails a tool call. Every gate, error and timeout ends in silence, and
+/// the only thing a miss costs is this process and a regex — no database is
+/// opened until a pattern has produced a token that has not already been sent.
+async fn run_hint(project: Option<String>, silent: bool) {
+    if hooks_runtime::hooks_disabled() || !silent {
+        return;
+    }
+    let stdin_body = read_stdin_with_timeout(std::time::Duration::from_millis(400)).await;
+    let payload: serde_json::Value = match serde_json::from_str(&stdin_body) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let tool = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let pattern = payload
+        .get("tool_input")
+        .and_then(|v| v.get("pattern"))
+        .and_then(|v| v.as_str());
+    let session_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let token = match hint::decide(tool, pattern, &session_id) {
+        hint::Decision::Lookup(t) => t,
+        hint::Decision::Silent(_) => return,
+    };
+
+    let pid = resolve_project_id(project);
+    // On a blocking thread, because the lookup is synchronous SQLite: awaiting
+    // an async block that never yields lets it run to completion before the
+    // timer is polled, so the budget would be decorative. SQLite's own busy
+    // timeout is 5s — six times this budget — and a stalled filesystem has no
+    // bound at all.
+    let sid = session_id.clone();
+    let block = match run_bounded(move || hint::lookup(&pid, &token, &sid)).await {
+        Bounded::Done(Some(b)) => b,
+        Bounded::Done(None) => return,
+        Bounded::Expired => {
+            // A silent timeout is indistinguishable from "no match", which is
+            // how a previous injection stayed broken without anyone noticing.
+            hooks_runtime::append_hook_log("hint", "search-hint budget exceeded");
+            return;
+        }
+    };
+
+    // Latency was never the axis that hurt; bytes were. Record them.
+    hint::record_emission(&session_id, block.len());
+    emit_additional_context("PreToolUse", &block);
+}
+
 async fn run_nudge(project: Option<String>, silent: bool) {
     // Step 0: Read stdin (≤2s timeout) for the hook payload
     let stdin_body = read_stdin_with_timeout(std::time::Duration::from_secs(2)).await;
@@ -1816,16 +2029,35 @@ async fn run_nudge(project: Option<String>, silent: bool) {
         _ => String::new(),
     };
 
+    // A separate section, for the reasons in `symbol_recall`.
+    let symbols = match &user_prompt {
+        Some(prompt) if silent => {
+            let (p, id) = (prompt.clone(), pid.to_string());
+            match run_bounded(move || symbol_recall(&p, &id)).await {
+                Bounded::Done(v) => v,
+                Bounded::Expired => {
+                    hooks_runtime::append_hook_log("nudge", "symbol recall budget exceeded");
+                    String::new()
+                }
+            }
+        }
+        _ => String::new(),
+    };
+
     let data = protocol::read_ping(pid);
     let nudge = nudge_message(&data);
 
     if silent {
-        let body = [recall.as_str(), nudge.as_deref().unwrap_or("")]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = [
+            recall.as_str(),
+            symbols.as_str(),
+            nudge.as_deref().unwrap_or(""),
+        ]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
         if !body.is_empty() {
             emit_additional_context("UserPromptSubmit", &body);
         }
@@ -2264,6 +2496,8 @@ async fn main() -> anyhow::Result<()> {
             project,
             with_auto_capture,
             no_auto_capture,
+            with_search_hints,
+            no_search_hints,
             configure,
             all_projects,
         } => {
@@ -2277,6 +2511,18 @@ async fn main() -> anyhow::Result<()> {
                 std::env::var("RUNAR_AUTO_CAPTURE")
                     .map(|v| v != "false")
                     .unwrap_or(true)
+            };
+
+            // Setup rewrites the PreToolUse key from this flag alone, so a
+            // bare re-run would delete an installed hint hook unless the
+            // current state is read back first.
+            let search_hints = if no_search_hints {
+                false
+            } else {
+                with_search_hints
+                    || std::env::current_dir()
+                        .map(|d| setup::search_hints_installed(&d))
+                        .unwrap_or(false)
             };
             {
                 let path = config_cmd::EnvFile::default_path();
@@ -2338,7 +2584,7 @@ async fn main() -> anyhow::Result<()> {
                         println!();
                     }
                     let project_id = project.unwrap_or_else(setup::detect_project_id);
-                    let result = setup::setup_claude_code(&project_id, auto_capture)?;
+                    let result = setup::setup_claude_code(&project_id, auto_capture, search_hints)?;
                     println!("\nRunarForge — Claude Code Setup\n");
                     println!(
                         "  MCP server configured in {}:",
@@ -2357,7 +2603,14 @@ async fn main() -> anyhow::Result<()> {
                         println!("     PostToolUse:       enqueue (auto-capture queue)");
                         println!("     SessionEnd:        summarize (drain queue → summary)");
                     }
-                    println!("     UserPromptSubmit:  idle nudge reminder\n");
+                    println!("     UserPromptSubmit:  idle nudge reminder");
+                    if result.search_hints {
+                        println!(
+                            "     PreToolUse:        search hints on Grep|Glob \
+                             (opt-in; needs `runar crawl --deep`)"
+                        );
+                    }
+                    println!();
                     println!("  Binary: {}", result.binary_path);
                     println!(
                         "  Memory protocol added to {}\n",
@@ -2528,6 +2781,19 @@ async fn main() -> anyhow::Result<()> {
             }
             let _ = tokio::time::timeout(hooks_runtime::hook_budget(), run_nudge(project, silent))
                 .await;
+        }
+        Commands::Hint { project, silent } => {
+            // The outer budget matches the other hooks; `run_hint` also bounds
+            // its own lookup so a slow query cannot eat the whole allowance.
+            let _ =
+                tokio::time::timeout(hooks_runtime::hook_budget(), run_hint(project, silent)).await;
+            // Giving up on the read is not enough: a lookup blocked in the
+            // kernel leaves its thread parked, and the runtime waits for
+            // blocking threads at shutdown, so the hook would still outlive its
+            // budget. A hook process has nothing to tear down.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
         }
         Commands::SaveAck { project, silent } => {
             if hooks_runtime::hooks_disabled() {
