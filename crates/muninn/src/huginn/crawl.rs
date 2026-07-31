@@ -655,21 +655,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Seed the per-file entry directly so the assertion does not depend on
-        // where the importance scorer happens to place this fixture.
-        let file_key = "scout:file:rmp:src/gone.ts";
-        librarian
-            .propose(MemoryEntryInput {
-                title: "src/gone.ts".into(),
-                content: "placeholder".into(),
-                entry_type: EntryType::Context,
-                source: Some(MemorySource::Scout),
-                project_id: Some("rmp".into()),
-                topic_key: Some(file_key.into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let file_key = seed_file_entry(&librarian, "rmp", "src/gone.ts").await;
+        let file_key = file_key.as_str();
         assert!(librarian
             .get_by_topic_key(Some("rmp"), file_key)
             .await
@@ -750,13 +737,23 @@ mod tests {
         assert!(infer_project_root(&bare.path().join("loose.rs")).is_none());
     }
 
+    /// `FileEntry::relative_path` carries the platform separator, and topic
+    /// keys are compared as strings, so a fixture path has to be built the
+    /// same way the scanner builds one.
+    fn native(rel: &str) -> String {
+        rel.split('/')
+            .collect::<Vec<_>>()
+            .join(std::path::MAIN_SEPARATOR_STR)
+    }
+
     /// Seed a per-file entry so retirement assertions do not depend on where
     /// the importance scorer happens to place a fixture.
     async fn seed_file_entry(librarian: &Arc<MemoryLibrarian>, project: &str, rel: &str) -> String {
+        let rel = native(rel);
         let key = format!("scout:file:{project}:{rel}");
         librarian
             .propose(MemoryEntryInput {
-                title: rel.into(),
+                title: rel.clone(),
                 content: format!("placeholder for {rel}"),
                 entry_type: EntryType::Context,
                 source: Some(MemorySource::Scout),
