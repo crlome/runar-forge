@@ -398,6 +398,20 @@ impl CodeGraphStore {
         Ok(())
     }
 
+    /// When this project's graph was last built. Nothing indexes incrementally
+    /// yet, so anything read out of it is a snapshot of that moment.
+    pub fn indexed_at(&self, project: &str) -> Result<Option<String>> {
+        let db = self.lock()?;
+        Ok(db
+            .query_row(
+                "SELECT indexed_at FROM code_projects WHERE project = ?1",
+                params![project],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn summary(&self, project: &str) -> Result<Option<String>> {
         let db = self.lock()?;
         Ok(db

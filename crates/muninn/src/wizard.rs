@@ -121,7 +121,16 @@ pub fn run_wizard() -> anyhow::Result<WizardResult> {
         .interact()?;
 
     if ran_setup {
-        match setup::setup_claude_code(&project_id, false, false) {
+        match setup::setup_claude_code(
+            &project_id,
+            false,
+            // Read the installed choice back rather than rewriting it: setup
+            // regenerates the PreToolUse key from this flag, so passing a bare
+            // false here would uninstall a hook the user opted into.
+            std::env::current_dir()
+                .map(|d| setup::search_hints_installed(&d))
+                .unwrap_or(false),
+        ) {
             Ok(result) => {
                 println!("  MCP registered:  {}", result.claude_json_path.display());
                 println!("  Hooks written:   {}", result.settings_path.display());
