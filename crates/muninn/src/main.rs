@@ -65,6 +65,9 @@ enum Commands {
         /// Crawl mode: auto | full | incremental (default: auto)
         #[arg(long, default_value = "auto")]
         mode: String,
+        /// Also build the symbol-level code graph (definitions, calls, metrics)
+        #[arg(long)]
+        deep: bool,
     },
 
     /// Initialize RunarForge configuration
@@ -1905,6 +1908,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             project,
             mode,
+            deep,
         } => {
             let librarian = create_librarian().await?;
             let root = std::path::Path::new(&path).canonicalize()?;
@@ -1914,8 +1918,10 @@ async fn main() -> anyhow::Result<()> {
                 "Crawling {} (project: {project}, mode: {mode})...",
                 root.display()
             );
-            let result =
-                huginn::crawl_project_with_mode(&root, &project, &librarian, crawl_mode).await?;
+            let result = huginn::CrawlOrchestrator::new(&librarian, &project, crawl_mode, None)
+                .with_deep(deep)
+                .run(&root)
+                .await?;
 
             println!("\nCrawl complete:");
             println!("  Mode:            {:?}", result.effective_mode);
@@ -1929,6 +1935,15 @@ async fn main() -> anyhow::Result<()> {
             println!("  Tech debt:       {}", result.techdebt_markers);
             println!("  Entries saved:   {}", result.entries_saved);
             println!("  Entries retired: {}", result.entries_deprecated);
+            if let Some(cg) = &result.codegraph {
+                println!("\nCode graph:");
+                println!("  Symbols:         {}", cg.symbols);
+                println!("  Call edges:      {}", cg.edges);
+                println!("  Files parsed:    {}", cg.files_indexed + cg.files_partial);
+                println!("  Partial parses:  {}", cg.files_partial);
+                println!("  Not parseable:   {}", cg.files_skipped);
+                println!("  Unresolved calls:{}", cg.unresolved_calls);
+            }
             if matches!(result.effective_mode, huginn::CrawlMode::Incremental) {
                 println!(
                     "\nCross-file patterns and the architecture summary were left as the last\n\

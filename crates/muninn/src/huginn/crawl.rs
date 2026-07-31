@@ -48,6 +48,8 @@ pub struct CrawlResult {
     pub techdebt_markers: usize,
     pub effective_mode: CrawlMode,
     pub files_changed: usize,
+    /// Present only when the crawl was asked to build the code graph.
+    pub codegraph: Option<crate::codegraph::index::IndexOutcome>,
 }
 
 fn crawl_state_title(project_id: &str) -> String {
@@ -85,6 +87,7 @@ pub struct CrawlOrchestrator<'a> {
     project_id: String,
     mode: CrawlMode,
     focus: Option<String>,
+    deep: bool,
 }
 
 impl<'a> CrawlOrchestrator<'a> {
@@ -99,7 +102,16 @@ impl<'a> CrawlOrchestrator<'a> {
             project_id: project_id.into(),
             mode,
             focus,
+            deep: false,
         }
+    }
+
+    /// Also build the symbol-level code graph. Opt-in while it beds in, and
+    /// independent of the memory-entry pipeline: a codegraph failure is logged
+    /// and never fails the crawl.
+    pub fn with_deep(mut self, deep: bool) -> Self {
+        self.deep = deep;
+        self
     }
 
     pub async fn run(&self, root: &Path) -> StorageResult<CrawlResult> {
@@ -184,6 +196,16 @@ impl<'a> CrawlOrchestrator<'a> {
             .deprecate_removed(&prior_state, root, &scan.files)
             .await;
 
+        // Phase 2.7: Symbol-level code graph. Runs ahead of the no-change
+        // shortcut below because this slice always rebuilds the whole graph,
+        // so a first `--deep` run must not be skipped just because the memory
+        // entries are already current.
+        let codegraph = if self.deep {
+            self.index_codegraph(root, &scan.files)
+        } else {
+            None
+        };
+
         // Phase 3: Score importance over full graph
         let scores = ImportanceScorer::score_all(&graph);
 
@@ -211,6 +233,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 techdebt_markers: 0,
                 effective_mode,
                 files_changed: 0,
+                codegraph,
             });
         }
 
@@ -345,7 +368,48 @@ impl<'a> CrawlOrchestrator<'a> {
             techdebt_markers: techdebt_count,
             effective_mode,
             files_changed,
+            codegraph,
         })
+    }
+
+    fn index_codegraph(
+        &self,
+        root: &Path,
+        files: &[FileEntry],
+    ) -> Option<crate::codegraph::index::IndexOutcome> {
+        use crate::codegraph::{index, store::CodeGraphStore};
+
+        // Indexing replaces the project's whole graph, and a focused crawl has
+        // deliberately narrowed the inventory, so running it here would delete
+        // every definition outside the focus and then report full coverage of
+        // what remains.
+        if self.focus.is_some() {
+            tracing::warn!("focused crawl: skipping the code graph, which is whole-project");
+            return None;
+        }
+
+        let store = match CodeGraphStore::open_default() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "codegraph unavailable; skipping deep index");
+                return None;
+            }
+        };
+        match index::index_project(&store, &self.project_id, root, files) {
+            Ok(outcome) => {
+                tracing::info!(
+                    symbols = outcome.symbols,
+                    edges = outcome.edges,
+                    unresolved = outcome.unresolved_calls,
+                    "codegraph indexed"
+                );
+                Some(outcome)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "codegraph indexing failed");
+                None
+            }
+        }
     }
 
     /// Soft-delete the per-file entries of files that were present at the
@@ -576,6 +640,76 @@ mod tests {
             r3.files_changed, 1,
             "only the modified file should be in the change set"
         );
+    }
+
+    /// Not a `#[tokio::test]`: the codegraph path is a process-wide env var, so
+    /// it has to be set and restored around a runtime we own. Overriding it is
+    /// what keeps a regression in the focus guard from writing to the real
+    /// `~/.runar-forge/codegraph.db`.
+    #[test]
+    fn a_focused_deep_crawl_leaves_the_code_graph_alone() {
+        use crate::codegraph::store::CodeGraphStore;
+
+        let _guard = crate::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("cg.db");
+        let prev = std::env::var("RUNAR_CODEGRAPH_PATH").ok();
+        std::env::set_var("RUNAR_CODEGRAPH_PATH", &graph_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let root = tmp.path().join("proj");
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::create_dir_all(root.join("lib")).unwrap();
+            fs::write(
+                root.join("src/a.ts"),
+                "export function alpha() { return 1 }\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("lib/b.ts"),
+                "export function beta() { return 2 }\n",
+            )
+            .unwrap();
+
+            let librarian = test_librarian().await;
+            let full = CrawlOrchestrator::new(&librarian, "deepfocus", CrawlMode::Full, None)
+                .with_deep(true)
+                .run(&root)
+                .await
+                .unwrap();
+            let indexed = full.codegraph.expect("a deep crawl reports its index");
+            assert!(indexed.symbols >= 2, "got {indexed:?}");
+
+            let focused = CrawlOrchestrator::new(
+                &librarian,
+                "deepfocus",
+                CrawlMode::Full,
+                Some("src".to_string()),
+            )
+            .with_deep(true)
+            .run(&root)
+            .await
+            .unwrap();
+            assert!(
+                focused.codegraph.is_none(),
+                "a focused crawl must not touch the whole-project graph"
+            );
+
+            let store = CodeGraphStore::open(&graph_path).unwrap();
+            let cov = store.coverage("deepfocus").unwrap();
+            assert_eq!(
+                cov.symbols, indexed.symbols,
+                "the focused crawl replaced the graph with its subset"
+            );
+        });
+
+        match prev {
+            Some(v) => std::env::set_var("RUNAR_CODEGRAPH_PATH", v),
+            None => std::env::remove_var("RUNAR_CODEGRAPH_PATH"),
+        }
     }
 
     #[tokio::test]
