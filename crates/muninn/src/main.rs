@@ -6,13 +6,14 @@ use clap::{Parser, Subcommand};
 // items used only by MCP tool dispatch aren't flagged as dead from the
 // binary's perspective.
 use runar_muninn::{
-    breaker, config_cmd, curator, doctor, embedding, extract, hooks_runtime, huginn, librarian,
-    maintenance, mcp, protocol, redact, setup, storage, summarizer, sync as sync_cmd, text, types,
-    update as update_cmd, wizard,
+    breaker, codegraph, config_cmd, curator, doctor, embedding, extract, hooks_runtime, huginn,
+    librarian, maintenance, mcp, protocol, redact, setup, storage, summarizer, sync as sync_cmd,
+    text, types, update as update_cmd, wizard,
 };
 
 use text::char_prefix;
 
+use codegraph::store::{CodeGraphStore, Direction};
 use librarian::MemoryLibrarian;
 use storage::postgres::PostgresAdapter;
 use storage::sqlite::SqliteAdapter;
@@ -182,6 +183,12 @@ enum Commands {
         /// Filter by marker type: todo | fixme | hack | xxx | all (default: all)
         #[arg(long, default_value = "all")]
         r#type: String,
+    },
+
+    /// Query the symbol-level code graph built by `runar crawl --deep`
+    Graph {
+        #[command(subcommand)]
+        cmd: GraphCmd,
     },
 
     /// Ask the Curator a question about a project
@@ -483,6 +490,54 @@ enum ConfigAction {
 
     /// Interactive wizard for storage backend + connection details
     Wizard,
+}
+
+#[derive(Subcommand)]
+enum GraphCmd {
+    /// Full-text search over symbol names
+    Search {
+        /// Name or fragment to look for
+        query: String,
+        #[arg(short, long)]
+        project: String,
+        /// Restrict to one kind: function | method | class | interface |
+        /// trait | struct | enum | type | const | module
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, default_value = "12")]
+        limit: usize,
+    },
+
+    /// Show one definition with its immediate callers and callees
+    Symbol {
+        /// Bare name (`open`) or qualified name (`src/store.rs:Store.open`)
+        name: String,
+        #[arg(short, long)]
+        project: String,
+    },
+
+    /// Walk the call graph outward from a definition
+    Trace {
+        /// Bare or qualified name of the definition to start from
+        name: String,
+        #[arg(short, long)]
+        project: String,
+        /// Which way to walk: callers | callees
+        #[arg(long, default_value = "callers")]
+        direction: String,
+        /// Hops to follow (max 5)
+        #[arg(long, default_value = "2")]
+        depth: usize,
+        /// Cap on definitions returned
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Coverage for a project's graph, plus the stored session summary
+    Status {
+        #[arg(short, long)]
+        project: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1485,6 +1540,173 @@ async fn run_import(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Code graph (`runar graph`) ────────────────────────────────────
+
+/// Past this a trace stops answering a question and starts returning the
+/// whole connected component.
+const GRAPH_MAX_TRACE_DEPTH: usize = 5;
+
+/// The `--project` every graph subcommand carries.
+fn graph_project(cmd: &GraphCmd) -> &str {
+    match cmd {
+        GraphCmd::Search { project, .. }
+        | GraphCmd::Symbol { project, .. }
+        | GraphCmd::Trace { project, .. }
+        | GraphCmd::Status { project } => project,
+    }
+}
+
+/// The only thing a user can do about a missing or empty graph.
+fn graph_crawl_hint(project: &str) -> String {
+    format!("Run: runar crawl <path> --project {project} --deep")
+}
+
+fn graph_err(e: codegraph::store::Error) -> anyhow::Error {
+    anyhow::anyhow!("code graph: {e}")
+}
+
+/// The formatters terminate a populated block with a newline but an empty one
+/// without, so anything printed afterwards would otherwise run on.
+fn print_block(block: &str) {
+    println!("{}", block.trim_end_matches('\n'));
+}
+
+/// Terminal counterpart to the code-graph MCP tools. Synchronous: the store is
+/// plain SQLite, so none of this belongs in an await chain.
+fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
+    let project = graph_project(&cmd).to_string();
+
+    // Read-only, and existence checked first: the writable open creates the
+    // file and, on a schema mismatch, drops every project's graph to rebuild
+    // it. A query must never be the thing that discards the answer.
+    let path = CodeGraphStore::default_path();
+    if !path.exists() {
+        println!("No code graph yet — {} does not exist.", path.display());
+        println!("{}", graph_crawl_hint(&project));
+        return Ok(());
+    }
+    let store = CodeGraphStore::open_readonly(&path).map_err(graph_err)?;
+
+    match cmd {
+        GraphCmd::Search {
+            query,
+            label,
+            limit,
+            ..
+        } => {
+            let label = label
+                .as_deref()
+                .map(|raw| {
+                    codegraph::SymbolLabel::from_capture(&raw.to_lowercase())
+                        .map(codegraph::SymbolLabel::as_str)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unknown --label '{raw}' (function | method | class | \
+                                 interface | trait | struct | enum | type | const | module)"
+                            )
+                        })
+                })
+                .transpose()?;
+            let rows = store
+                .search(&project, &query, label, limit)
+                .map_err(graph_err)?;
+            print_block(&codegraph::format::symbols(&rows));
+            if rows.is_empty() {
+                println!("{}", graph_crawl_hint(&project));
+            }
+        }
+
+        GraphCmd::Symbol { name, .. } => {
+            let found = store.symbol(&project, &name, 8).map_err(graph_err)?;
+            match found.rows.as_slice() {
+                [] => {
+                    println!("No symbol matching '{name}' in project '{project}'.");
+                    println!("{}", graph_crawl_hint(&project));
+                }
+                [only] if found.total == 1 => {
+                    let callers = store
+                        .neighbors(only.id, Direction::Callers)
+                        .map_err(graph_err)?;
+                    let callees = store
+                        .neighbors(only.id, Direction::Callees)
+                        .map_err(graph_err)?;
+                    print_block(&codegraph::format::symbol_detail(only, &callers, &callees));
+                }
+                _ => {
+                    print_block(&codegraph::format::matches(&found));
+                    println!(
+                        "\n'{name}' is ambiguous — {} definitions match. \
+                         Re-run with one of the qualified names above.",
+                        found.total
+                    );
+                }
+            }
+        }
+
+        GraphCmd::Trace {
+            name,
+            direction,
+            depth,
+            limit,
+            ..
+        } => {
+            let direction = direction.to_lowercase();
+            let Some(dir) = Direction::parse(&direction) else {
+                anyhow::bail!("unknown --direction '{direction}' (use callers or callees)");
+            };
+            if depth > GRAPH_MAX_TRACE_DEPTH {
+                anyhow::bail!(
+                    "--depth {depth} is too deep (max {GRAPH_MAX_TRACE_DEPTH}); \
+                     past that a trace returns the whole connected component"
+                );
+            }
+            let found = store.symbol(&project, &name, 8).map_err(graph_err)?;
+            let Some(root) = found.first() else {
+                println!("No symbol matching '{name}' in project '{project}'.");
+                println!("{}", graph_crawl_hint(&project));
+                return Ok(());
+            };
+            // Tracing one of several same-named definitions would answer a
+            // question the user did not ask; the MCP tool refuses here too.
+            if found.total > 1 {
+                print_block(&codegraph::format::matches(&found));
+                println!(
+                    "\n'{name}' is ambiguous — {} definitions match. \
+                     Re-run with one of the qualified names above.",
+                    found.total
+                );
+                return Ok(());
+            }
+            println!(
+                "{} — {}:{}",
+                root.qualified_name, root.file_path, root.start_line
+            );
+            let reached = store.trace(root.id, dir, depth, limit).map_err(graph_err)?;
+            print_block(&codegraph::format::reached(&direction, &reached));
+        }
+
+        GraphCmd::Status { .. } => {
+            let cov = store.coverage(&project).map_err(graph_err)?;
+            print_block(&codegraph::format::coverage(&project, &cov));
+            if cov.files_total == 0 {
+                println!("{}", graph_crawl_hint(&project));
+            }
+            // Exactly what the SessionStart hook injects, so this is also how
+            // you check what a session will be told.
+            if let Some(summary) = store
+                .summary(&project)
+                .map_err(graph_err)?
+                .filter(|s| !s.trim().is_empty())
+            {
+                println!("\nSession summary");
+                print_block(&summary);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// PostToolUse (matcher: mcp__muninn__muninn_save) — update lastSave so the
 /// next nudge skips. Pure file IO, never reads DB. Must be fast + silent.
 fn run_save_ack(project: Option<String>, silent: bool) {
@@ -2470,6 +2692,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 println!();
             }
+        }
+        Commands::Graph { cmd } => {
+            run_graph(cmd)?;
         }
         Commands::Onboard { project, json } => {
             let librarian = create_librarian().await?;

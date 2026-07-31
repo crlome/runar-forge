@@ -152,11 +152,15 @@ pub fn index_project(
 
     let resolved = resolve(&facts, root);
     store.rebuild_edges(project, &resolved.edges)?;
-    outcome.edges = resolved.edges.len();
     for (path, count) in &resolved.unresolved {
         store.set_unresolved(project, path, *count)?;
         outcome.unresolved_calls += count;
     }
+
+    // Report what was stored, not what was resolved: two call sites on the
+    // same line to the same definition collapse into one edge, and a count
+    // that disagrees with the graph is a count nobody can check.
+    outcome.edges = store.coverage(project)?.edges;
 
     let summary = render_summary(store, project, &outcome)?;
     store.set_summary(project, &summary)?;
@@ -187,13 +191,8 @@ fn render_summary(store: &CodeGraphStore, project: &str, outcome: &IndexOutcome)
         outcome.symbols, outcome.edges, cov.files_total
     ));
     let parsed = cov.indexed + cov.partial;
-    if cov.files_total > 0 {
-        out.push_str(&format!(
-            " Parsed {}/{} ({}%).",
-            parsed,
-            cov.files_total,
-            parsed * 100 / cov.files_total
-        ));
+    if let Some(pct) = (parsed * 100).checked_div(cov.files_total) {
+        out.push_str(&format!(" Parsed {parsed}/{} ({pct}%).", cov.files_total));
     }
     if !cov.skipped_by_ext.is_empty() {
         let listed: Vec<String> = cov

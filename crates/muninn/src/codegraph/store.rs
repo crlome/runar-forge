@@ -522,6 +522,320 @@ impl CodeGraphStore {
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+
+    // ── Queries ────────────────────────────────────────────────────
+
+    /// Every project with a graph, oldest index first.
+    pub fn projects(&self) -> Result<Vec<String>> {
+        let db = self.lock()?;
+        let mut stmt = db.prepare("SELECT project FROM code_projects ORDER BY project")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The schema version the file on disk carries, if it has one.
+    pub fn stored_schema_version(&self) -> Result<Option<i64>> {
+        let db = self.lock()?;
+        Ok(db
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The version this build writes; a file carrying anything else is rebuilt.
+    pub fn expected_schema_version() -> i64 {
+        SCHEMA_VERSION
+    }
+
+    /// Full-text search over symbol names, ranked by BM25 and nudged toward the
+    /// kinds a question is usually about: someone searching a name wants the
+    /// function that bears it before the module that contains it.
+    pub fn search(
+        &self,
+        project: &str,
+        query: &str,
+        label: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SymbolRow>> {
+        let Some(match_expr) = crate::fts_query::build(query) else {
+            return Ok(Vec::new());
+        };
+        let db = self.lock()?;
+        let sql = format!(
+            "SELECT {COLS},
+                    bm25(code_symbols_fts) - CASE n.label
+                      WHEN 'Function' THEN 10.0 WHEN 'Method' THEN 10.0
+                      WHEN 'Class' THEN 5.0 WHEN 'Trait' THEN 5.0
+                      WHEN 'Struct' THEN 5.0 WHEN 'Interface' THEN 5.0
+                      WHEN 'Enum' THEN 5.0 ELSE 0.0 END AS score
+             FROM code_symbols_fts f
+             JOIN code_nodes n ON n.id = f.rowid
+             WHERE f.code_symbols_fts MATCH ?1 AND n.project = ?2
+               AND (?3 IS NULL OR n.label = ?3)
+             ORDER BY score, n.qualified_name
+             LIMIT ?4"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![match_expr, project, label, limit as i64],
+            row_to_symbol,
+        )?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Locate a definition by qualified name, then by bare name, then by
+    /// qualified-name suffix — so both `Store.open` and `open` find something.
+    ///
+    /// The suffix tier is anchored on a separator and escapes LIKE wildcards:
+    /// unanchored, `open` would match `reopen` and a needle containing `%`
+    /// would match everything.
+    pub fn symbol(&self, project: &str, needle: &str, limit: usize) -> Result<Matches> {
+        let db = self.lock()?;
+        let escaped = escape_like(needle);
+        for (clause, bind) in [
+            ("n.qualified_name = ?2", needle.to_string()),
+            ("n.name = ?2", needle.to_string()),
+            (
+                "(n.qualified_name LIKE '%:' || ?2 ESCAPE '\\' \
+                  OR n.qualified_name LIKE '%.' || ?2 ESCAPE '\\')",
+                escaped.clone(),
+            ),
+        ] {
+            let total: i64 = db.query_row(
+                &format!("SELECT COUNT(*) FROM code_nodes n WHERE n.project = ?1 AND {clause}"),
+                params![project, bind],
+                |r| r.get(0),
+            )?;
+            if total == 0 {
+                continue;
+            }
+            let sql = format!(
+                "SELECT {COLS} FROM code_nodes n
+                 WHERE n.project = ?1 AND {clause}
+                 ORDER BY n.qualified_name LIMIT ?3"
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let rows: Vec<SymbolRow> = stmt
+                .query_map(params![project, bind, limit as i64], row_to_symbol)?
+                .collect::<std::result::Result<_, _>>()?;
+            return Ok(Matches {
+                total: total as usize,
+                rows,
+            });
+        }
+        Ok(Matches::default())
+    }
+
+    /// One hop out from a definition along the call graph.
+    pub fn neighbors(&self, node_id: i64, dir: Direction) -> Result<Vec<Neighbor>> {
+        let db = self.lock()?;
+        self.neighbors_locked(&db, node_id, dir)
+    }
+
+    /// Restricted to CALLS. Inheritance and implementation edges are not call
+    /// hops, and `fan_in`/`fan_out` count only calls — a traversal that mixed
+    /// them would contradict the numbers printed beside it.
+    fn neighbors_locked(
+        &self,
+        db: &Connection,
+        node_id: i64,
+        dir: Direction,
+    ) -> Result<Vec<Neighbor>> {
+        let (own, other) = match dir {
+            Direction::Callees => ("source_id", "target_id"),
+            Direction::Callers => ("target_id", "source_id"),
+        };
+        let sql = format!(
+            "SELECT {COLS}, e.type, e.confidence, e.resolution, e.line
+             FROM code_edges e JOIN code_nodes n ON n.id = e.{other}
+             WHERE e.{own} = ?1 AND e.type = 'CALLS'
+             ORDER BY e.line, n.qualified_name"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map(params![node_id], |r| {
+            Ok(Neighbor {
+                symbol: row_to_symbol(r)?,
+                kind: r.get::<_, String>(COL_COUNT)?,
+                confidence: r.get::<_, Option<f64>>(COL_COUNT + 1)?,
+                resolution: r.get::<_, Option<String>>(COL_COUNT + 2)?,
+                line: r.get::<_, i64>(COL_COUNT + 3)? as u32,
+                depth: 1,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Breadth-first fan-out, nearest first. Bounded on both depth and total
+    /// nodes so a hub cannot turn one question into the whole graph.
+    pub fn trace(
+        &self,
+        node_id: i64,
+        dir: Direction,
+        max_depth: usize,
+        limit: usize,
+    ) -> Result<Reached> {
+        let db = self.lock()?;
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        seen.insert(node_id);
+        let mut frontier = vec![node_id];
+        let mut out: Vec<Neighbor> = Vec::new();
+
+        for depth in 1..=max_depth.max(1) {
+            let mut next = Vec::new();
+            for id in frontier.drain(..) {
+                for mut n in self.neighbors_locked(&db, id, dir)? {
+                    if !seen.insert(n.symbol.id) {
+                        continue;
+                    }
+                    n.depth = depth;
+                    next.push(n.symbol.id);
+                    out.push(n);
+                    // Stopping at the cap and exhausting the graph produce the
+                    // same list, so the difference has to be reported.
+                    if out.len() >= limit {
+                        return Ok(Reached {
+                            nodes: out,
+                            truncated: true,
+                        });
+                    }
+                }
+            }
+            if next.is_empty() {
+                return Ok(Reached {
+                    nodes: out,
+                    truncated: false,
+                });
+            }
+            frontier = next;
+        }
+        // The depth bound stopped the walk while a frontier remained.
+        Ok(Reached {
+            nodes: out,
+            truncated: true,
+        })
+    }
+}
+
+/// Definitions matching a lookup, plus how many there were before the limit.
+#[derive(Debug, Clone, Default)]
+pub struct Matches {
+    pub rows: Vec<SymbolRow>,
+    pub total: usize,
+}
+
+impl Matches {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// More definitions matched than were returned.
+    pub fn truncated(&self) -> bool {
+        self.total > self.rows.len()
+    }
+
+    pub fn first(&self) -> Option<&SymbolRow> {
+        self.rows.first()
+    }
+}
+
+/// The result of a bounded walk, and whether a bound cut it short.
+#[derive(Debug, Clone, Default)]
+pub struct Reached {
+    pub nodes: Vec<Neighbor>,
+    pub truncated: bool,
+}
+
+/// Escape the wildcards SQLite's LIKE recognises, so a needle containing `%`
+/// or `_` matches those characters instead of acting as a pattern.
+fn escape_like(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len());
+    for ch in needle.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Callers,
+    Callees,
+}
+
+impl Direction {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "callers" => Some(Direction::Callers),
+            "callees" => Some(Direction::Callees),
+            _ => None,
+        }
+    }
+}
+
+/// A definition as a query answers it, with the fan counts a caller wants.
+#[derive(Debug, Clone)]
+pub struct SymbolRow {
+    pub id: i64,
+    pub name: String,
+    pub qualified_name: String,
+    pub label: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub signature: String,
+    pub exported: bool,
+    pub metrics: SymbolMetrics,
+    pub fan_in: usize,
+    pub fan_out: usize,
+}
+
+/// A definition reached across one edge.
+#[derive(Debug, Clone)]
+pub struct Neighbor {
+    pub symbol: SymbolRow,
+    pub kind: String,
+    pub confidence: Option<f64>,
+    pub resolution: Option<String>,
+    pub line: u32,
+    pub depth: usize,
+}
+
+/// The column list every symbol query selects, so `row_to_symbol` can read
+/// them positionally and callers can append their own columns after.
+const COLS: &str = "n.id, n.name, n.qualified_name, n.label, n.file_path, n.start_line, \
+                    n.end_line, n.signature, n.exported, n.complexity, n.cognitive, \
+                    n.loop_depth, n.param_count, \
+                    (SELECT COUNT(*) FROM code_edges ce WHERE ce.target_id = n.id AND ce.type = 'CALLS'), \
+                    (SELECT COUNT(*) FROM code_edges ce WHERE ce.source_id = n.id AND ce.type = 'CALLS')";
+
+/// How many columns `COLS` selects; extra columns start here.
+const COL_COUNT: usize = 15;
+
+fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
+    Ok(SymbolRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        qualified_name: r.get(2)?,
+        label: r.get(3)?,
+        file_path: r.get(4)?,
+        start_line: r.get(5)?,
+        end_line: r.get(6)?,
+        signature: r.get(7)?,
+        exported: r.get::<_, i64>(8)? != 0,
+        metrics: SymbolMetrics {
+            complexity: r.get(9)?,
+            cognitive: r.get(10)?,
+            loop_depth: r.get(11)?,
+            param_count: r.get(12)?,
+        },
+        fan_in: r.get::<_, i64>(13)? as usize,
+        fan_out: r.get::<_, i64>(14)? as usize,
+    })
 }
 
 const SCHEMA: &str = r#"
@@ -814,6 +1128,258 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fts_hits(&s, "zarquon"), 1);
+    }
+
+    /// A small graph: `caller` calls `helper`, plus an unrelated `Widget.open`.
+    fn seeded() -> CodeGraphStore {
+        let s = store();
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        s.replace_file(
+            "p",
+            FileRecord {
+                path: "src/a.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &[
+                sym("src/a.rs", None, "parse_config", SymbolLabel::Function),
+                sym("src/a.rs", None, "helper", SymbolLabel::Function),
+                sym("src/a.rs", Some("Widget"), "open", SymbolLabel::Method),
+                sym("src/a.rs", None, "Widget", SymbolLabel::Struct),
+            ],
+        )
+        .unwrap();
+        s.rebuild_edges(
+            "p",
+            &[EdgeRecord {
+                source_qualified: "src/a.rs:parse_config".into(),
+                target_qualified: "src/a.rs:helper".into(),
+                kind: EdgeKind::Calls,
+                resolution: Some(Resolution::SameModule),
+                line: 7,
+            }],
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn search_finds_a_symbol_by_any_word_of_its_name() {
+        let s = seeded();
+        for term in ["parse_config", "parse", "config"] {
+            let hits = s.search("p", term, None, 10).unwrap();
+            assert!(
+                hits.iter().any(|r| r.name == "parse_config"),
+                "{term} found nothing"
+            );
+        }
+        assert!(s
+            .search("p", "nonexistent_zzz", None, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn search_can_be_narrowed_to_a_label_and_reports_fan_counts() {
+        let s = seeded();
+        let only_structs = s.search("p", "widget", Some("Struct"), 10).unwrap();
+        assert!(only_structs.iter().all(|r| r.label == "Struct"));
+
+        let helper = s
+            .search("p", "helper", None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "helper")
+            .expect("helper is indexed");
+        assert_eq!(helper.fan_in, 1, "helper is called once");
+        assert_eq!(helper.fan_out, 0);
+    }
+
+    #[test]
+    fn symbol_lookup_widens_from_exact_to_suffix() {
+        let s = seeded();
+        assert_eq!(s.symbol("p", "src/a.rs:helper", 5).unwrap().rows.len(), 1);
+        assert_eq!(s.symbol("p", "helper", 5).unwrap().rows.len(), 1);
+        // A container-qualified tail resolves through the suffix pass.
+        let by_suffix = s.symbol("p", "Widget.open", 5).unwrap();
+        assert_eq!(by_suffix.rows.len(), 1);
+        assert_eq!(by_suffix.rows[0].qualified_name, "src/a.rs:Widget.open");
+        assert!(s.symbol("p", "no_such_symbol", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn neighbors_read_both_directions() {
+        let s = seeded();
+        let caller = s.symbol("p", "parse_config", 1).unwrap().rows.remove(0);
+        let callee = s.symbol("p", "helper", 1).unwrap().rows.remove(0);
+
+        let out = s.neighbors(caller.id, Direction::Callees).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].symbol.name, "helper");
+        assert_eq!(out[0].resolution.as_deref(), Some("same_module"));
+
+        let inbound = s.neighbors(callee.id, Direction::Callers).unwrap();
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].symbol.name, "parse_config");
+        assert!(s
+            .neighbors(callee.id, Direction::Callees)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn trace_is_bounded_by_depth_and_never_revisits() {
+        let s = store();
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        // A cycle: a -> b -> c -> a. Without a visited set this never ends.
+        s.replace_file(
+            "p",
+            FileRecord {
+                path: "src/a.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &[
+                sym("src/a.rs", None, "a", SymbolLabel::Function),
+                sym("src/a.rs", None, "b", SymbolLabel::Function),
+                sym("src/a.rs", None, "c", SymbolLabel::Function),
+            ],
+        )
+        .unwrap();
+        let edge = |from: &str, to: &str| EdgeRecord {
+            source_qualified: format!("src/a.rs:{from}"),
+            target_qualified: format!("src/a.rs:{to}"),
+            kind: EdgeKind::Calls,
+            resolution: Some(Resolution::SameModule),
+            line: 1,
+        };
+        s.rebuild_edges("p", &[edge("a", "b"), edge("b", "c"), edge("c", "a")])
+            .unwrap();
+
+        let a = s.symbol("p", "src/a.rs:a", 1).unwrap().rows.remove(0);
+        let one = s.trace(a.id, Direction::Callees, 1, 50).unwrap().nodes;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].symbol.name, "b");
+        assert_eq!(one[0].depth, 1);
+
+        let deep = s.trace(a.id, Direction::Callees, 5, 50).unwrap().nodes;
+        assert_eq!(deep.len(), 2, "the cycle must not re-yield the origin");
+        assert_eq!(deep.iter().map(|n| n.depth).max(), Some(2));
+
+        let capped = s.trace(a.id, Direction::Callees, 5, 1).unwrap().nodes;
+        assert_eq!(capped.len(), 1, "the total cap has to hold");
+    }
+
+    #[test]
+    fn a_capped_lookup_still_reports_how_many_matched() {
+        // A count that is really the limit reads as the whole truth, and a
+        // model acts on it: it picks from the five it can see and never learns
+        // the other twenty-five exist.
+        let s = store();
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        let syms: Vec<SymbolRecord> = (0..30)
+            .map(|i| {
+                sym(
+                    "src/a.rs",
+                    Some(&format!("W{i:02}")),
+                    "new",
+                    SymbolLabel::Method,
+                )
+            })
+            .collect();
+        s.replace_file(
+            "p",
+            FileRecord {
+                path: "src/a.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &syms,
+        )
+        .unwrap();
+
+        let found = s.symbol("p", "new", 5).unwrap();
+        assert_eq!(found.rows.len(), 5);
+        assert_eq!(found.total, 30, "the true count has to survive the limit");
+        assert!(found.truncated());
+    }
+
+    #[test]
+    fn the_suffix_tier_is_anchored_and_escapes_wildcards() {
+        let s = seeded();
+        // `open` must not match by sitting inside another identifier.
+        s.replace_file(
+            "p",
+            FileRecord {
+                path: "src/b.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &[sym("src/b.rs", None, "reopen", SymbolLabel::Function)],
+        )
+        .unwrap();
+
+        let found = s.symbol("p", "Widget.open", 5).unwrap();
+        assert_eq!(found.total, 1);
+        assert_eq!(found.rows[0].qualified_name, "src/a.rs:Widget.open");
+
+        // A needle of pure wildcards must match nothing, not everything.
+        assert_eq!(s.symbol("p", "%", 5).unwrap().total, 0);
+        assert_eq!(s.symbol("p", "_pen", 5).unwrap().total, 0);
+    }
+
+    #[test]
+    fn traversal_follows_calls_only_and_reports_being_cut_short() {
+        let s = seeded();
+        // An IMPLEMENTS edge is not a call hop, and fan-in counts only calls.
+        s.rebuild_edges(
+            "p",
+            &[
+                EdgeRecord {
+                    source_qualified: "src/a.rs:parse_config".into(),
+                    target_qualified: "src/a.rs:helper".into(),
+                    kind: EdgeKind::Calls,
+                    resolution: Some(Resolution::SameModule),
+                    line: 7,
+                },
+                EdgeRecord {
+                    source_qualified: "src/a.rs:parse_config".into(),
+                    target_qualified: "src/a.rs:Widget".into(),
+                    kind: EdgeKind::Implements,
+                    resolution: None,
+                    line: 0,
+                },
+            ],
+        )
+        .unwrap();
+
+        let caller = s.symbol("p", "parse_config", 1).unwrap().rows.remove(0);
+        let out = s.neighbors(caller.id, Direction::Callees).unwrap();
+        assert_eq!(out.len(), 1, "only the CALLS edge is a callee");
+        assert_eq!(out[0].symbol.name, "helper");
+
+        let full = s.trace(caller.id, Direction::Callees, 3, 50).unwrap();
+        assert!(!full.truncated, "an exhausted walk is not truncated");
+        let capped = s.trace(caller.id, Direction::Callees, 3, 1).unwrap();
+        assert!(capped.truncated, "hitting the cap has to be visible");
+    }
+
+    #[test]
+    fn projects_and_schema_version_are_readable() {
+        let s = seeded();
+        assert_eq!(s.projects().unwrap(), vec!["p".to_string()]);
+        assert_eq!(
+            s.stored_schema_version().unwrap(),
+            Some(CodeGraphStore::expected_schema_version())
+        );
     }
 
     #[test]
