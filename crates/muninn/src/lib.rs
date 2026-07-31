@@ -6,6 +6,7 @@
 
 pub mod breaker;
 pub mod capture;
+pub mod codegraph;
 pub mod config_cmd;
 pub mod curator;
 pub mod debug;

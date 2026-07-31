@@ -1,0 +1,461 @@
+//! Definition and call-site extraction.
+//!
+//! Adding a language is meant to be data, not code: a [`LangSpec`] carries the
+//! tree-sitter queries and the handful of node-type names a generic walk needs,
+//! and everything below consumes them uniformly.
+
+mod spec_rust;
+mod spec_ts;
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
+
+use crate::huginn::graph::parsers::{make_parser, Lang};
+
+use super::metrics::measure;
+use super::{
+    qualified_name, EdgeKind, FileExtract, RawCall, RawImport, RawRelation, RawSymbol, SymbolLabel,
+};
+
+/// Per-language extraction rules.
+///
+/// Capture-name convention, relied on by the walker:
+/// - `@def.<label>` marks the *name* node of a definition; `<label>` parses via
+///   [`SymbolLabel::from_capture`].
+/// - `@def.body` optionally marks the node to measure for complexity.
+/// - `@def.params` optionally marks the parameter list.
+/// - `@call.name` marks a callee name; `@call.qualifier` its receiver.
+/// - `@import.source` marks a module path; `@import.name` a bound local name.
+/// - `@rel.subject` / `@rel.object` mark the two ends of an inherit/implement.
+pub struct LangSpec {
+    pub lang: Lang,
+    pub defs: &'static str,
+    pub calls: &'static str,
+    pub imports: &'static str,
+    pub relations: &'static str,
+    /// Node kinds that introduce a named container for the symbols inside them.
+    pub container_kinds: &'static [&'static str],
+    /// Field name holding a container's own name, tried in order.
+    pub container_name_fields: &'static [&'static str],
+    /// Node kinds counted as a branch for cyclomatic complexity.
+    pub branch_kinds: &'static [&'static str],
+    /// Node kinds counted as a loop.
+    pub loop_kinds: &'static [&'static str],
+    /// Whether a `relations` match should be read as Implements rather than
+    /// Inherits.
+    pub relation_kind: EdgeKind,
+}
+
+pub fn spec_for(lang: Lang) -> &'static LangSpec {
+    match lang {
+        Lang::Rust => spec_rust::SPEC,
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => spec_ts::spec_for(lang),
+        // Python and Go land in the next slice; until then they are recorded
+        // as an explicit coverage gap rather than silently producing nothing.
+        Lang::Python | Lang::Go => spec_ts::spec_for(Lang::TypeScript),
+    }
+}
+
+/// Languages this build can actually extract from. Anything else is reported
+/// as `skipped_lang` so the gap is counted.
+pub fn is_supported(lang: Lang) -> bool {
+    matches!(
+        lang,
+        Lang::Rust | Lang::TypeScript | Lang::Tsx | Lang::JavaScript
+    )
+}
+
+struct Compiled {
+    defs: Option<Query>,
+    calls: Option<Query>,
+    imports: Option<Query>,
+    relations: Option<Query>,
+}
+
+fn compiled(lang: Lang) -> &'static Compiled {
+    static CACHE: OnceLock<HashMap<Lang, Compiled>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        let mut m = HashMap::new();
+        for lang in [
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::JavaScript,
+            Lang::Python,
+            Lang::Go,
+        ] {
+            let spec = spec_for(lang);
+            let language = lang.language();
+            m.insert(
+                lang,
+                Compiled {
+                    defs: Query::new(&language, spec.defs).ok(),
+                    calls: Query::new(&language, spec.calls).ok(),
+                    imports: Query::new(&language, spec.imports).ok(),
+                    relations: Query::new(&language, spec.relations).ok(),
+                },
+            );
+        }
+        m
+    });
+    cache.get(&lang).expect("every Lang is compiled above")
+}
+
+/// Parse one file into definitions, call sites, imports and relations.
+pub fn extract_file(source: &str, lang: Lang, file_path: &str) -> FileExtract {
+    let spec = spec_for(lang);
+    let queries = compiled(lang);
+    let mut parser = make_parser(lang);
+    let tree: Tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => {
+            return FileExtract {
+                had_errors: true,
+                ..Default::default()
+            }
+        }
+    };
+    let bytes = source.as_bytes();
+    let root = tree.root_node();
+
+    let symbols = collect_symbols(&root, bytes, spec, queries, file_path);
+    let calls = collect_calls(&root, bytes, spec, queries, file_path, &symbols);
+    let imports = collect_imports(&root, bytes, queries);
+    let relations = collect_relations(&root, bytes, spec, queries);
+
+    FileExtract {
+        symbols,
+        calls,
+        imports,
+        relations,
+        had_errors: root.has_error(),
+    }
+}
+
+fn text<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
+    node.utf8_text(bytes).unwrap_or("")
+}
+
+/// First line of a node, trimmed and length-capped. Bodies never reach storage.
+fn signature_of(node: Node<'_>, bytes: &[u8]) -> String {
+    let raw = text(node, bytes);
+    let first = raw.lines().next().unwrap_or("").trim();
+    crate::text::truncate_ellipsis(first, 200)
+}
+
+/// Walk up to the nearest container node and read its name.
+///
+/// A container is never its own container: `trait Greeter` reaches `trait_item`
+/// through that node's own name field, and treating it as enclosing would name
+/// the trait `Greeter.Greeter`.
+fn container_of(node: Node<'_>, bytes: &[u8], spec: &LangSpec) -> Option<String> {
+    let mut cur = node.parent();
+    'outer: while let Some(n) = cur {
+        if spec.container_kinds.contains(&n.kind()) {
+            for field in spec.container_name_fields {
+                if let Some(name_node) = n.child_by_field_name(field) {
+                    if name_node.id() == node.id() {
+                        cur = n.parent();
+                        continue 'outer;
+                    }
+                    let name = base_type_name(text(name_node, bytes));
+                    if !name.is_empty() {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Strip type arguments so `impl<T> Foo<T>` contributes the same container name
+/// as the `Foo` definition itself; otherwise nothing would ever match it.
+fn base_type_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = trimmed.split('<').next().unwrap_or(trimmed).trim();
+    base.rsplit("::").next().unwrap_or(base).trim().to_string()
+}
+
+fn collect_symbols(
+    root: &Node<'_>,
+    bytes: &[u8],
+    spec: &LangSpec,
+    queries: &Compiled,
+    file_path: &str,
+) -> Vec<RawSymbol> {
+    let query = match &queries.defs {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<RawSymbol> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, bytes);
+
+    while let Some(m) = matches.next() {
+        let mut name_node: Option<Node<'_>> = None;
+        let mut label: Option<SymbolLabel> = None;
+        let mut body: Option<Node<'_>> = None;
+        let mut params: Option<Node<'_>> = None;
+
+        for cap in m.captures {
+            let cap_name = &query.capture_names()[cap.index as usize];
+            match cap_name.strip_prefix("def.") {
+                Some("body") => body = Some(cap.node),
+                Some("params") => params = Some(cap.node),
+                Some(suffix) => {
+                    if let Some(l) = SymbolLabel::from_capture(suffix) {
+                        name_node = Some(cap.node);
+                        label = Some(l);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        let (name_node, label) = match (name_node, label) {
+            (Some(n), Some(l)) => (n, l),
+            _ => continue,
+        };
+        let name = text(name_node, bytes).trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        // A method is a function that happens to sit inside a container; the
+        // query does not have to know the difference.
+        let container = container_of(name_node, bytes, spec);
+        let label = match (label, container.is_some()) {
+            (SymbolLabel::Function, true) => SymbolLabel::Method,
+            (l, _) => l,
+        };
+
+        let decl = name_node.parent().unwrap_or(name_node);
+        let metrics = measure(body, params, spec);
+
+        out.push(RawSymbol {
+            name,
+            label,
+            container,
+            start_line: decl.start_position().row as u32 + 1,
+            end_line: decl.end_position().row as u32 + 1,
+            signature: signature_of(decl, bytes),
+            exported: is_exported(decl, bytes),
+            metrics,
+        });
+    }
+
+    // Two queries can match the same declaration; identity is the qualified
+    // name, so collapse on it and keep the richer label.
+    out.sort_by(|a, b| {
+        qualified_name(file_path, a.container.as_deref(), &a.name)
+            .cmp(&qualified_name(file_path, b.container.as_deref(), &b.name))
+            .then(a.start_line.cmp(&b.start_line))
+    });
+    out.dedup_by(|a, b| {
+        qualified_name(file_path, a.container.as_deref(), &a.name)
+            == qualified_name(file_path, b.container.as_deref(), &b.name)
+    });
+    out
+}
+
+/// Visibility is a syntactic property in every language handled here.
+fn is_exported(decl: Node<'_>, bytes: &[u8]) -> bool {
+    let head = text(decl, bytes);
+    let head = head.lines().next().unwrap_or("");
+    if head.contains("pub ") || head.starts_with("pub(") {
+        return true;
+    }
+    let mut sib = decl.prev_sibling();
+    while let Some(n) = sib {
+        if n.kind() == "export_statement" {
+            return true;
+        }
+        sib = n.prev_sibling();
+    }
+    let mut cur = decl.parent();
+    while let Some(n) = cur {
+        if n.kind() == "export_statement" {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+fn collect_calls(
+    root: &Node<'_>,
+    bytes: &[u8],
+    spec: &LangSpec,
+    queries: &Compiled,
+    file_path: &str,
+    symbols: &[RawSymbol],
+) -> Vec<RawCall> {
+    let query = match &queries.calls {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, bytes);
+
+    while let Some(m) = matches.next() {
+        let mut callee: Option<Node<'_>> = None;
+        let mut qualifier: Option<String> = None;
+        for cap in m.captures {
+            match query.capture_names()[cap.index as usize] {
+                "call.name" => callee = Some(cap.node),
+                "call.qualifier" => {
+                    let q = text(cap.node, bytes).trim();
+                    if !q.is_empty() {
+                        qualifier = Some(q.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let callee_node = match callee {
+            Some(n) => n,
+            None => continue,
+        };
+        let name = text(callee_node, bytes).trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let line = callee_node.start_position().row as u32 + 1;
+        out.push(RawCall {
+            caller: enclosing_symbol(callee_node, bytes, spec, file_path, symbols),
+            callee: name,
+            qualifier,
+            line,
+        });
+    }
+    out
+}
+
+/// The definition a node sits inside, as a qualified name. Falls back to
+/// `None` for a call at file scope.
+fn enclosing_symbol(
+    node: Node<'_>,
+    bytes: &[u8],
+    spec: &LangSpec,
+    file_path: &str,
+    symbols: &[RawSymbol],
+) -> Option<String> {
+    let line = node.start_position().row as u32 + 1;
+    // The innermost definition whose line range covers this node.
+    symbols
+        .iter()
+        .filter(|s| s.start_line <= line && line <= s.end_line)
+        .min_by_key(|s| s.end_line - s.start_line)
+        .map(|s| qualified_name(file_path, s.container.as_deref(), &s.name))
+        .or_else(|| container_of(node, bytes, spec).map(|c| qualified_name(file_path, None, &c)))
+}
+
+fn collect_imports(root: &Node<'_>, bytes: &[u8], queries: &Compiled) -> Vec<RawImport> {
+    let query = match &queries.imports {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, bytes);
+
+    while let Some(m) = matches.next() {
+        let mut source: Option<String> = None;
+        let mut names: Vec<String> = Vec::new();
+        for cap in m.captures {
+            let raw = text(cap.node, bytes)
+                .trim()
+                .trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+            if raw.is_empty() {
+                continue;
+            }
+            match query.capture_names()[cap.index as usize] {
+                "import.source" => source = Some(raw.to_string()),
+                "import.name" => names.push(raw.to_string()),
+                _ => {}
+            }
+        }
+        let Some(source) = source else { continue };
+        if names.is_empty() {
+            // A whole-module import still binds the trailing segment.
+            if let Some(last) = source.rsplit(['/', ':']).find(|s| !s.is_empty()) {
+                names.push(last.to_string());
+            }
+        }
+        for local_name in names {
+            out.push(RawImport {
+                local_name,
+                source: source.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn collect_relations(
+    root: &Node<'_>,
+    bytes: &[u8],
+    spec: &LangSpec,
+    queries: &Compiled,
+) -> Vec<RawRelation> {
+    let query = match &queries.relations {
+        Some(q) => q,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, bytes);
+
+    while let Some(m) = matches.next() {
+        let mut subject = None;
+        let mut object = None;
+        for cap in m.captures {
+            let value = text(cap.node, bytes).trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            match query.capture_names()[cap.index as usize] {
+                "rel.subject" => subject = Some(value),
+                "rel.object" => object = Some(value),
+                _ => {}
+            }
+        }
+        if let (Some(subject), Some(object)) = (subject, object) {
+            out.push(RawRelation {
+                subject,
+                object,
+                kind: spec.relation_kind,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A query that fails to compile silently yields nothing at runtime, so
+    /// grammar drift has to fail here instead.
+    #[test]
+    fn every_spec_query_compiles() {
+        for lang in [Lang::Rust, Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+            let spec = spec_for(lang);
+            let language = lang.language();
+            for (what, src) in [
+                ("defs", spec.defs),
+                ("calls", spec.calls),
+                ("imports", spec.imports),
+                ("relations", spec.relations),
+            ] {
+                Query::new(&language, src)
+                    .unwrap_or_else(|e| panic!("{lang:?} {what} query failed to compile: {e}"));
+            }
+        }
+    }
+}

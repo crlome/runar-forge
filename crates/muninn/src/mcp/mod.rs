@@ -1129,11 +1129,12 @@ async fn tool_huginn_crawl(
         .map(CrawlMode::parse)
         .unwrap_or(CrawlMode::Auto);
     let focus = args.get("focus").and_then(|v| v.as_str()).map(String::from);
+    let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let root = std::path::Path::new(project_path)
         .canonicalize()
         .map_err(|e| format!("invalid path: {e}"))?;
-    let orchestrator = CrawlOrchestrator::new(librarian, project_id, mode, focus);
+    let orchestrator = CrawlOrchestrator::new(librarian, project_id, mode, focus).with_deep(deep);
     let result = orchestrator.run(&root).await.map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
@@ -1148,6 +1149,15 @@ async fn tool_huginn_crawl(
         "techDebtMarkers": result.techdebt_markers,
         "entriesSaved": result.entries_saved,
         "entriesDeprecated": result.entries_deprecated,
+        "codeGraph": result.codegraph.as_ref().map(|cg| serde_json::json!({
+            "symbols": cg.symbols,
+            "edges": cg.edges,
+            "filesParsed": cg.files_indexed + cg.files_partial,
+            "filesPartial": cg.files_partial,
+            "filesNotParseable": cg.files_skipped,
+            "filesErrored": cg.files_errored,
+            "unresolvedCalls": cg.unresolved_calls,
+        })),
     })
     .to_string())
 }
@@ -1707,6 +1717,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "projectId": { "type": "string", "description": "Project identifier (used as namespace)" },
                     "mode": { "type": "string", "enum": ["full", "incremental", "auto"], "description": "Crawl mode (default: auto)" },
                     "focus": { "type": "string", "description": "Optional subpath to focus crawl on" },
+                    "deep": { "type": "boolean", "description": "Also build the symbol-level code graph: definitions, call edges and per-function complexity (default: false)" },
                 },
                 "required": ["projectPath", "projectId"],
                 "additionalProperties": false,

@@ -48,6 +48,8 @@ pub struct CrawlResult {
     pub techdebt_markers: usize,
     pub effective_mode: CrawlMode,
     pub files_changed: usize,
+    /// Present only when the crawl was asked to build the code graph.
+    pub codegraph: Option<crate::codegraph::index::IndexOutcome>,
 }
 
 fn crawl_state_title(project_id: &str) -> String {
@@ -85,6 +87,7 @@ pub struct CrawlOrchestrator<'a> {
     project_id: String,
     mode: CrawlMode,
     focus: Option<String>,
+    deep: bool,
 }
 
 impl<'a> CrawlOrchestrator<'a> {
@@ -99,7 +102,16 @@ impl<'a> CrawlOrchestrator<'a> {
             project_id: project_id.into(),
             mode,
             focus,
+            deep: false,
         }
+    }
+
+    /// Also build the symbol-level code graph. Opt-in while it beds in, and
+    /// independent of the memory-entry pipeline: a codegraph failure is logged
+    /// and never fails the crawl.
+    pub fn with_deep(mut self, deep: bool) -> Self {
+        self.deep = deep;
+        self
     }
 
     pub async fn run(&self, root: &Path) -> StorageResult<CrawlResult> {
@@ -184,6 +196,16 @@ impl<'a> CrawlOrchestrator<'a> {
             .deprecate_removed(&prior_state, root, &scan.files)
             .await;
 
+        // Phase 2.7: Symbol-level code graph. Runs ahead of the no-change
+        // shortcut below because this slice always rebuilds the whole graph,
+        // so a first `--deep` run must not be skipped just because the memory
+        // entries are already current.
+        let codegraph = if self.deep {
+            self.index_codegraph(root, &scan.files)
+        } else {
+            None
+        };
+
         // Phase 3: Score importance over full graph
         let scores = ImportanceScorer::score_all(&graph);
 
@@ -211,6 +233,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 techdebt_markers: 0,
                 effective_mode,
                 files_changed: 0,
+                codegraph,
             });
         }
 
@@ -345,7 +368,39 @@ impl<'a> CrawlOrchestrator<'a> {
             techdebt_markers: techdebt_count,
             effective_mode,
             files_changed,
+            codegraph,
         })
+    }
+
+    fn index_codegraph(
+        &self,
+        root: &Path,
+        files: &[FileEntry],
+    ) -> Option<crate::codegraph::index::IndexOutcome> {
+        use crate::codegraph::{index, store::CodeGraphStore};
+
+        let store = match CodeGraphStore::open_default() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "codegraph unavailable; skipping deep index");
+                return None;
+            }
+        };
+        match index::index_project(&store, &self.project_id, root, files) {
+            Ok(outcome) => {
+                tracing::info!(
+                    symbols = outcome.symbols,
+                    edges = outcome.edges,
+                    unresolved = outcome.unresolved_calls,
+                    "codegraph indexed"
+                );
+                Some(outcome)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "codegraph indexing failed");
+                None
+            }
+        }
     }
 
     /// Soft-delete the per-file entries of files that were present at the
