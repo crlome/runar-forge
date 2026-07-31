@@ -72,6 +72,12 @@ enum Commands {
         /// Skip the symbol-level code graph (definitions, calls, metrics).
         #[arg(long)]
         no_deep: bool,
+        /// Restrict the crawl to a subdirectory. Cross-file patterns, the
+        /// architecture summary and the code graph are whole-project, so a
+        /// focused crawl leaves all three as the last unfocused crawl built
+        /// them rather than rewriting them from a fragment.
+        #[arg(long)]
+        focus: Option<String>,
     },
 
     /// Initialize RunarForge configuration
@@ -1972,7 +1978,10 @@ async fn run_hint(project: Option<String>, silent: bool) {
 
     let token = match hint::decide(tool, pattern, &session_id) {
         hint::Decision::Lookup(t) => t,
-        hint::Decision::Silent(_) => return,
+        hint::Decision::Silent(reason) => {
+            hint::record_gated(reason);
+            return;
+        }
     };
 
     let pid = resolve_project_id(project);
@@ -1984,11 +1993,15 @@ async fn run_hint(project: Option<String>, silent: bool) {
     let sid = session_id.clone();
     let block = match run_bounded(move || hint::lookup(&pid, &token, &sid)).await {
         Bounded::Done(Some(b)) => b,
-        Bounded::Done(None) => return,
+        Bounded::Done(None) => {
+            hint::record_gated("no match in the graph");
+            return;
+        }
         Bounded::Expired => {
             // A silent timeout is indistinguishable from "no match", which is
             // how a previous injection stayed broken without anyone noticing.
             hooks_runtime::append_hook_log("hint", "search-hint budget exceeded");
+            hint::record_gated("budget exceeded");
             return;
         }
     };
@@ -2367,11 +2380,13 @@ async fn main() -> anyhow::Result<()> {
             mode,
             deep,
             no_deep,
+            focus,
         } => {
             // `--deep` is kept as an accepted no-op so existing scripts and
             // docs keep working now that it is the default.
             let _ = deep;
             let deep = !no_deep;
+            let focused = focus.is_some();
             let librarian = create_librarian().await?;
             let root = std::path::Path::new(&path).canonicalize()?;
 
@@ -2380,7 +2395,7 @@ async fn main() -> anyhow::Result<()> {
                 "Crawling {} (project: {project}, mode: {mode})...",
                 root.display()
             );
-            let result = huginn::CrawlOrchestrator::new(&librarian, &project, crawl_mode, None)
+            let result = huginn::CrawlOrchestrator::new(&librarian, &project, crawl_mode, focus)
                 .with_deep(deep)
                 .run(&root)
                 .await?;
@@ -2409,10 +2424,18 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Not parseable:   {}", cg.files_skipped);
                 println!("  Unresolved calls:{}", cg.unresolved_calls);
             }
-            if matches!(result.effective_mode, huginn::CrawlMode::Incremental) {
+            if !result.whole_project_entries_refreshed {
                 println!(
                     "\nCross-file patterns and the architecture summary were left as the last\n\
-                     full crawl produced them. Run with --mode full to refresh them."
+                     unfocused full crawl produced them — they describe the whole project, \
+                     so {}.",
+                    // A focused crawl already passed --mode full, so telling it
+                    // to use --mode full would be advice it cannot act on.
+                    if focused {
+                        "re-run without --focus to refresh them"
+                    } else {
+                        "run with --mode full to refresh them"
+                    }
                 );
             }
         }

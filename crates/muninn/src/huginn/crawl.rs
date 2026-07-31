@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::librarian::MemoryLibrarian;
 use crate::storage::StorageResult;
-use crate::types::{EntryType, MemoryEntryInput, MemorySource};
+use crate::types::{EntryType, ListFilters, MemoryEntry, MemoryEntryInput, MemorySource};
 
 use super::analysis::{
     arch_summarizer, file_analyzer, memory_entry_generator, pattern_extractor, techdebt,
@@ -48,6 +48,11 @@ pub struct CrawlResult {
     pub techdebt_markers: usize,
     pub effective_mode: CrawlMode,
     pub files_changed: usize,
+    /// False when this crawl deliberately left the cross-file patterns and the
+    /// architecture summary as an earlier crawl built them. Only an unfocused
+    /// full crawl regenerates them, so this is what the CLI note about them
+    /// should be gated on — `effective_mode` alone misses the focused case.
+    pub whole_project_entries_refreshed: bool,
     /// Present only when the crawl was asked to build the code graph.
     pub codegraph: Option<crate::codegraph::index::IndexOutcome>,
 }
@@ -190,9 +195,18 @@ impl<'a> CrawlOrchestrator<'a> {
             };
         let files_changed = analysis_set.as_ref().map(|s| s.len()).unwrap_or(file_count);
         let incremental = matches!(effective_mode, CrawlMode::Incremental);
+        let focused = self.focus.is_some();
+        // Cross-file patterns and the architecture summary are whole-project
+        // artifacts living under stable topic keys. An incremental crawl
+        // narrows `scan.files` to the change set and a focus filter narrows it
+        // to a subtree; either way phase 4 sees a fragment, and regenerating
+        // from a fragment supersedes the complete version with a partial one.
+        // The focused case is pre-existing rather than introduced by the
+        // incremental work, but it is the same defect.
+        let whole_project = !incremental && !focused;
 
         // Phase 2.6: Retire entries for files that no longer exist
-        let entries_deprecated = self
+        let mut entries_deprecated = self
             .deprecate_removed(&prior_state, root, &scan.files)
             .await;
 
@@ -233,6 +247,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 techdebt_markers: 0,
                 effective_mode,
                 files_changed: 0,
+                whole_project_entries_refreshed: whole_project,
                 codegraph,
             });
         }
@@ -258,53 +273,82 @@ impl<'a> CrawlOrchestrator<'a> {
         let (deep, medium, light, skipped) = tally(&analyses);
         tracing::info!(deep, medium, light, skipped, "analysis complete");
 
-        // Phase 5: Cross-file patterns. Full crawls only — a pattern entry
-        // names every file that matched, so regenerating one from the changed
-        // subset would supersede the complete version with a shorter list.
-        let patterns = if incremental {
-            Vec::new()
-        } else {
+        // Phase 5: Cross-file patterns. Unfocused full crawls only — a pattern
+        // entry names every file that matched, so regenerating one from a
+        // subset (the incremental change set, or a focus subtree) would
+        // supersede the complete version with a shorter list.
+        let patterns = if whole_project {
             pattern_extractor::extract(&analyses)
+        } else {
+            Vec::new()
         };
         tracing::info!(patterns = patterns.len(), "patterns extracted");
 
-        // Phase 6: Aggregate tech debt across all files (not just deep)
+        // Phase 6: Aggregate tech debt across all files (not just deep).
+        // `scanned_for_debt` records the files whose text this pass actually
+        // ran the marker extractor over. That, and not "was in the scan", is
+        // what licenses phase 8.5 to retire a marker-less file's entry: a file
+        // we never read proves nothing about whether its TODOs are still there.
         let mut all_techdebt: Vec<TechDebtMarker> = Vec::new();
+        let mut scanned_for_debt: HashSet<&str> = HashSet::new();
         for a in &analyses {
-            if let AnalysisBody::Deep(d) = &a.body {
-                all_techdebt.extend(d.tech_debt_markers.iter().cloned());
-            }
-        }
-        // For medium/light files we didn't scan; pull techdebt by scanning head
-        for a in &analyses {
-            if matches!(a.body, AnalysisBody::Medium(_) | AnalysisBody::Light(_)) {
-                let abs = root.join(&a.file_path);
-                if let Ok(content) = fs::read_to_string(&abs) {
-                    all_techdebt.extend(techdebt::extract(&content, &a.file_path));
+            match &a.body {
+                AnalysisBody::Deep(d) => {
+                    // Markdown at Deep/Medium depth takes the heading-structure
+                    // path, which never fills `tech_debt_markers`. An empty list
+                    // there means "not looked for", not "none left".
+                    if !is_markdown(&a.file_path) {
+                        scanned_for_debt.insert(a.file_path.as_str());
+                    }
+                    all_techdebt.extend(d.tech_debt_markers.iter().cloned());
                 }
+                // Medium/light files were not read by the analyzer; pull
+                // techdebt by scanning them here.
+                AnalysisBody::Medium(_) | AnalysisBody::Light(_) => {
+                    let abs = root.join(&a.file_path);
+                    if let Ok(content) = fs::read_to_string(&abs) {
+                        scanned_for_debt.insert(a.file_path.as_str());
+                        all_techdebt.extend(techdebt::extract(&content, &a.file_path));
+                    }
+                }
+                AnalysisBody::Skip => {}
             }
         }
         let techdebt_count = all_techdebt.len();
 
-        // Phase 7: Architecture summary. Full crawls only, for the same
-        // supersession reason as the patterns above — it counts and classifies
-        // the whole inventory, which an incremental crawl has not analyzed.
-        let summary = if incremental {
-            None
-        } else {
+        // Phase 7: Architecture summary. Unfocused full crawls only, for the
+        // same supersession reason as the patterns above — it counts and
+        // classifies the whole inventory, which neither an incremental crawl
+        // nor a focused one has analyzed.
+        let summary = if whole_project {
             Some(arch_summarizer::summarize(
                 &self.project_id,
                 &analyses,
                 &patterns,
                 &all_techdebt,
             ))
+        } else {
+            None
         };
 
         // Phase 8: Save entries — per-file + patterns + techdebt + summary
         let mut saved = 0usize;
 
+        // `.sql` files fan out into one entry per declared table. Recording
+        // the keys as they go by is what lets phase 8.6 spot the orphans; a
+        // failed propose still counts, because a key we tried to write is not
+        // evidence that an older copy of it is stale.
+        let table_prefix = format!("scout:table:{}:", self.project_id);
+        let mut table_keys_written: HashSet<String> = HashSet::new();
         for a in &analyses {
             for input in memory_entry_generator::file_entries(a, &self.project_id) {
+                let table_key = input
+                    .topic_key
+                    .as_deref()
+                    .filter(|k| k.starts_with(&table_prefix));
+                if let Some(key) = table_key {
+                    table_keys_written.insert(key.to_string());
+                }
                 if self.librarian.propose(input).await.is_ok() {
                     saved += 1;
                 }
@@ -346,6 +390,30 @@ impl<'a> CrawlOrchestrator<'a> {
             }
         }
 
+        // Phase 8.5: Retire the tech-debt entries of files this pass read and
+        // found clean. Runs in every mode — the candidate set is bounded by
+        // what was actually read, so an incremental crawl considers its change
+        // set and a focused crawl its subtree.
+        entries_deprecated += self
+            .deprecate_clean_techdebt(&scanned_for_debt, &all_techdebt)
+            .await;
+
+        // Phase 8.6: Retire per-table entries no `.sql` file declares anymore.
+        // Whole-project only: the test for an orphan is "absent from every key
+        // this crawl wrote", which is only a fair test when the crawl analyzed
+        // the whole inventory.
+        if whole_project {
+            entries_deprecated += self
+                .deprecate_orphan_tables(
+                    &prior_state,
+                    root,
+                    &analyses,
+                    &table_prefix,
+                    &table_keys_written,
+                )
+                .await;
+        }
+
         // Phase 9: Persist crawl state (always — captures snapshot of HEAD + hashes)
         let state = git::build_state(root, &self.project_id, &scan.files);
         if self.save_state(&state).await.is_err() {
@@ -368,6 +436,7 @@ impl<'a> CrawlOrchestrator<'a> {
             techdebt_markers: techdebt_count,
             effective_mode,
             files_changed,
+            whole_project_entries_refreshed: whole_project,
             codegraph,
         })
     }
@@ -411,6 +480,171 @@ impl<'a> CrawlOrchestrator<'a> {
                 None
             }
         }
+    }
+
+    /// Every live entry of `entry_type` in this project whose topic key starts
+    /// with `prefix`, read in pages. One paged scan rather than a topic-key
+    /// lookup per candidate file: on a full crawl that would be one round trip
+    /// per source file, thousands of them, to retire a handful of entries.
+    ///
+    /// Returns nothing at all on a read error rather than the pages that did
+    /// arrive — callers decide what to retire by set difference, and a list
+    /// that silently stops early is indistinguishable from a complete one.
+    async fn live_entries_under(&self, entry_type: EntryType, prefix: &str) -> Vec<MemoryEntry> {
+        const PAGE: usize = 500;
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = match self
+                .librarian
+                .list(ListFilters {
+                    entry_type: Some(entry_type),
+                    project_id: Some(self.project_id.clone()),
+                    limit: Some(PAGE),
+                    offset: Some(offset),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(%prefix, error = %e, "listing entries for retirement failed");
+                    return Vec::new();
+                }
+            };
+            let fetched = page.len();
+            for entry in page {
+                let under_prefix = entry
+                    .topic_key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with(prefix));
+                if under_prefix {
+                    out.push(entry);
+                }
+            }
+            if fetched < PAGE {
+                return out;
+            }
+            offset += PAGE;
+        }
+    }
+
+    /// Retire the tech-debt entries of files this crawl read and found clean.
+    /// `memory_entry_generator::techdebt_entries` only emits for files that
+    /// HAVE markers, so without this a file whose last TODO was deleted keeps
+    /// a live `scout:techdebt:` entry claiming debt that is gone.
+    ///
+    /// Candidates are the files whose text this pass ran the extractor over,
+    /// minus the ones that produced markers — a set proportional to what
+    /// changed, intersected against one paged read of the entries that exist.
+    /// That containment is also the focus guard: a focused crawl never reads a
+    /// file outside its subtree, so it can never retire one.
+    async fn deprecate_clean_techdebt(
+        &self,
+        scanned: &HashSet<&str>,
+        markers: &[TechDebtMarker],
+    ) -> usize {
+        let with_markers: HashSet<&str> = markers.iter().map(|m| m.file_path.as_str()).collect();
+        let clean: HashSet<&str> = scanned.difference(&with_markers).copied().collect();
+        if clean.is_empty() {
+            return 0;
+        }
+
+        let prefix = format!("scout:techdebt:{}:", self.project_id);
+        let live = self.live_entries_under(EntryType::TechDebt, &prefix).await;
+        let mut deprecated = 0usize;
+        for entry in live {
+            let is_clean = entry
+                .topic_key
+                .as_deref()
+                .and_then(|k| k.strip_prefix(prefix.as_str()))
+                .is_some_and(|path| clean.contains(path));
+            if is_clean && self.librarian.deprecate(entry.id).await.is_ok() {
+                deprecated += 1;
+            }
+        }
+
+        if deprecated > 0 {
+            tracing::info!(
+                deprecated,
+                "retired tech debt for files with no markers left"
+            );
+        }
+        deprecated
+    }
+
+    /// Retire `scout:table:` entries that no `.sql` file declares anymore,
+    /// including the ones orphaned when a `.sql` file is deleted outright.
+    /// `deprecate_removed` cannot reach those: it knows the path that vanished,
+    /// and the table names that path used to declare vanished with it, so it
+    /// has no key to look up and nowhere to learn one. Nothing else records the
+    /// mapping either — a table entry carries its defining path only inside its
+    /// rendered prose, never in a tag or in the crawl state.
+    ///
+    /// What is left is a set difference: a crawl that examined every `.sql`
+    /// file the project has knows the complete set of keys that should exist,
+    /// so anything live outside `written` is an orphan. Completeness is the
+    /// entire argument, so it is checked rather than assumed, twice:
+    ///
+    /// * a `.sql` file in this scan that carries no `sql_analysis` was not
+    ///   examined — today that is *every* `.sql` file, because `.sql` is not a
+    ///   `Lang`, so a `.sql` file is never a dependency-graph node, never gets
+    ///   an importance score, and always analyzes at Skip. That makes this
+    ///   reconciliation reach exactly one real case for now: the last `.sql`
+    ///   file in a project going away. It generalizes the day `.sql` files get
+    ///   scored;
+    /// * a `.sql` file the previous crawl recorded, gone from this scan but
+    ///   still on disk, was hidden rather than deleted — the scanner drops
+    ///   symlinks, files past its size cap and newly ignored paths, and a
+    ///   million-line schema dump is exactly the kind of file it drops.
+    async fn deprecate_orphan_tables(
+        &self,
+        prior_state: &Option<CrawlState>,
+        root: &Path,
+        analyses: &[FileAnalysisResult],
+        prefix: &str,
+        written: &HashSet<String>,
+    ) -> usize {
+        let unexamined = analyses
+            .iter()
+            .any(|a| is_sql(&a.file_path) && a.sql_analysis.is_none());
+        if unexamined {
+            tracing::info!("a .sql file went unexamined; leaving per-table entries alone");
+            return 0;
+        }
+
+        let in_scan: HashSet<&str> = analyses.iter().map(|a| a.file_path.as_str()).collect();
+        let hidden = prior_state.as_ref().is_some_and(|state| {
+            state.file_hashes.keys().any(|path| {
+                is_sql(path) && !in_scan.contains(path.as_str()) && root.join(path).exists()
+            })
+        });
+        if hidden {
+            tracing::info!("a .sql file dropped out of the scan but is still on disk; leaving per-table entries alone");
+            return 0;
+        }
+
+        let live = self
+            .live_entries_under(EntryType::Architecture, prefix)
+            .await;
+        let mut deprecated = 0usize;
+        for entry in live {
+            let orphaned = entry
+                .topic_key
+                .as_deref()
+                .is_some_and(|k| !written.contains(k));
+            if orphaned && self.librarian.deprecate(entry.id).await.is_ok() {
+                deprecated += 1;
+            }
+        }
+
+        if deprecated > 0 {
+            tracing::info!(
+                deprecated,
+                "retired per-table entries no .sql file declares"
+            );
+        }
+        deprecated
     }
 
     /// Soft-delete the per-file entries of files that were present at the
@@ -515,6 +749,21 @@ impl<'a> CrawlOrchestrator<'a> {
         self.librarian.propose(input).await?;
         Ok(())
     }
+}
+
+/// Exactly the extensions `file_analyzer` routes through the markdown
+/// short-circuit — the reason a Deep body for one of these carries no
+/// tech-debt markers.
+fn is_markdown(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".mdx")
+}
+
+/// Matches `memory_entry_generator::file_entries`, which decides whether to fan
+/// a file out into per-table entries on the lowercased suffix rather than on
+/// `FileEntry::extension` — the scanner does not normalize the case.
+fn is_sql(path: &str) -> bool {
+    path.to_lowercase().ends_with(".sql")
 }
 
 fn tally(analyses: &[FileAnalysisResult]) -> (usize, usize, usize, usize) {
@@ -899,6 +1148,398 @@ mod tests {
             .await
             .unwrap();
         key
+    }
+
+    /// Seed a per-table entry the way `huginn_recrawl_file` produces one — it
+    /// forces Deep depth, whereas a crawl cannot reach one at all: `.sql` is
+    /// not a `Lang`, so a `.sql` file is never a dependency-graph node, never
+    /// gets scored, and always analyzes at Skip.
+    async fn seed_table_entry(
+        librarian: &Arc<MemoryLibrarian>,
+        project: &str,
+        qualified: &str,
+        declared_in: &str,
+    ) -> String {
+        let declared_in = native(declared_in);
+        let key = format!("scout:table:{project}:{qualified}");
+        librarian
+            .propose(MemoryEntryInput {
+                title: format!("Table: {qualified}"),
+                content: format!("# Table `{qualified}`\n\nDefined in `{declared_in}`.\n"),
+                entry_type: EntryType::Architecture,
+                source: Some(MemorySource::Scout),
+                project_id: Some(project.into()),
+                topic_key: Some(key.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        key
+    }
+
+    /// Every live pattern entry keyed by topic key, so "the focused crawl left
+    /// them alone" can be asserted without knowing which detectors fired.
+    async fn pattern_snapshot(
+        librarian: &Arc<MemoryLibrarian>,
+        project: &str,
+    ) -> std::collections::BTreeMap<String, (uuid::Uuid, String)> {
+        librarian
+            .list(ListFilters {
+                entry_type: Some(EntryType::Pattern),
+                project_id: Some(project.to_string()),
+                limit: Some(200),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.topic_key.unwrap_or_default(), (e.id, e.content)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn focused_full_crawl_leaves_patterns_and_the_summary_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/auth")).unwrap();
+        fs::create_dir_all(root.join("lib/auth")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "import { AuthService } from './auth/auth.service'\n\
+             export function bootstrap() { return new AuthService() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/auth/auth.service.ts"),
+            "import jwt from 'jsonwebtoken'\n\
+             export class AuthService {\n  sign() { return jwt.sign({}, 's') }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/auth/auth.guard.ts"),
+            "export class AuthGuard {\n  canActivate(ctx: any) { return true }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/auth/auth.middleware.ts"),
+            "export function authMiddleware(req: any, res: any, next: any) { next() }\n",
+        )
+        .unwrap();
+        // Outside the focus on purpose: dropping this file shortens the auth
+        // pattern's file list and changes the summary's counts, which is what
+        // makes a regenerated whole-project entry observably partial. Three
+        // auth files remain inside `src`, so the detector still clears its
+        // confidence floor and would rewrite the entry if it were allowed to.
+        fs::write(
+            root.join("lib/auth/auth.strategy.service.ts"),
+            "export class JwtStrategy {\n  validate(p: any) { return p }\n}\n",
+        )
+        .unwrap();
+
+        let librarian = test_librarian().await;
+        let arch_key = "scout:arch:focusarch";
+
+        let full = CrawlOrchestrator::new(&librarian, "focusarch", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        assert!(full.whole_project_entries_refreshed);
+        assert!(
+            full.patterns_found >= 1,
+            "fixture must produce a cross-file pattern to protect"
+        );
+        let after_full = librarian
+            .get_by_topic_key(Some("focusarch"), arch_key)
+            .await
+            .unwrap()
+            .expect("a full crawl writes an architecture summary");
+        let patterns_after_full = pattern_snapshot(&librarian, "focusarch").await;
+        assert!(!patterns_after_full.is_empty());
+
+        let focused = CrawlOrchestrator::new(
+            &librarian,
+            "focusarch",
+            CrawlMode::Full,
+            Some("src".to_string()),
+        )
+        .run(root)
+        .await
+        .unwrap();
+
+        assert!(
+            !focused.whole_project_entries_refreshed,
+            "a focused crawl must report that it left the whole-project entries alone"
+        );
+        assert_eq!(
+            focused.patterns_found, 0,
+            "a focused crawl must not emit cross-file patterns"
+        );
+        let after_focus = librarian
+            .get_by_topic_key(Some("focusarch"), arch_key)
+            .await
+            .unwrap()
+            .expect("summary must survive a focused crawl");
+        assert_eq!(
+            after_focus.id, after_full.id,
+            "a focused crawl superseded the whole-project architecture summary"
+        );
+        assert_eq!(after_focus.content, after_full.content);
+        assert_eq!(
+            pattern_snapshot(&librarian, "focusarch").await,
+            patterns_after_full,
+            "a focused crawl rewrote the cross-file patterns from a fragment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_lost_its_last_marker_stops_claiming_tech_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/auth")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "import { AuthService } from './auth/auth.service'\n\
+             // TODO: wire middleware\n\
+             export function bootstrap() { return new AuthService() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/auth/auth.service.ts"),
+            "export class AuthService {\n  login() { return true }\n}\n",
+        )
+        .unwrap();
+
+        let librarian = test_librarian().await;
+        let key = format!("scout:techdebt:debtp:{}", native("src/main.ts"));
+
+        let first = CrawlOrchestrator::new(&librarian, "debtp", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        assert!(first.techdebt_markers >= 1, "fixture must produce a marker");
+        assert!(
+            librarian
+                .get_by_topic_key(Some("debtp"), &key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the TODO must produce a tech-debt entry for the next crawl to retire"
+        );
+
+        // The file stays; only its last marker goes.
+        fs::write(
+            root.join("src/main.ts"),
+            "import { AuthService } from './auth/auth.service'\n\
+             export function bootstrap() { return new AuthService() }\n",
+        )
+        .unwrap();
+        let second = CrawlOrchestrator::new(&librarian, "debtp", CrawlMode::Incremental, None)
+            .run(root)
+            .await
+            .unwrap();
+
+        assert!(second.files_changed > 0);
+        assert!(
+            second.entries_deprecated >= 1,
+            "the marker-less file's tech-debt entry should have been retired"
+        );
+        assert!(
+            librarian
+                .get_by_topic_key(Some("debtp"), &key)
+                .await
+                .unwrap()
+                .is_none(),
+            "entry still claims debt the file no longer has"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_focused_crawl_leaves_tech_debt_outside_its_focus_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "export function boot() { return 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("lib/legacy.service.ts"),
+            "// FIXME: rewrite this\nexport class Legacy {}\n",
+        )
+        .unwrap();
+
+        let librarian = test_librarian().await;
+        let key = format!(
+            "scout:techdebt:outfocus:{}",
+            native("lib/legacy.service.ts")
+        );
+
+        CrawlOrchestrator::new(&librarian, "outfocus", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        assert!(
+            librarian
+                .get_by_topic_key(Some("outfocus"), &key)
+                .await
+                .unwrap()
+                .is_some(),
+            "fixture must produce a tech-debt entry outside the focus"
+        );
+
+        // The marker goes, but a crawl focused on `src` never reads that file,
+        // so it has no grounds to conclude anything about its debt.
+        fs::write(
+            root.join("lib/legacy.service.ts"),
+            "export class Legacy {}\n",
+        )
+        .unwrap();
+        let focused = CrawlOrchestrator::new(
+            &librarian,
+            "outfocus",
+            CrawlMode::Full,
+            Some("src".to_string()),
+        )
+        .run(root)
+        .await
+        .unwrap();
+        assert_eq!(
+            focused.entries_deprecated, 0,
+            "a focused crawl retired an entry for a file it never read"
+        );
+        assert!(
+            librarian
+                .get_by_topic_key(Some("outfocus"), &key)
+                .await
+                .unwrap()
+                .is_some(),
+            "focused crawl retired tech debt outside its focus"
+        );
+
+        // An unfocused crawl does read it, and only then retires it.
+        let full = CrawlOrchestrator::new(&librarian, "outfocus", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        assert!(full.entries_deprecated >= 1);
+        assert!(
+            librarian
+                .get_by_topic_key(Some("outfocus"), &key)
+                .await
+                .unwrap()
+                .is_none(),
+            "entry still claims debt the file no longer has"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_table_entries_die_with_the_last_sql_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "export function boot() { return 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("migrations/001_init.sql"),
+            "CREATE TABLE users (\n  id SERIAL PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
+        )
+        .unwrap();
+
+        let librarian = test_librarian().await;
+        CrawlOrchestrator::new(&librarian, "sqlp", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        let table_key =
+            seed_table_entry(&librarian, "sqlp", "users", "migrations/001_init.sql").await;
+
+        // A `.sql` file is still present and this crawl did not examine it, so
+        // its tables are unexamined rather than orphaned. Retiring here would
+        // wipe every table the project knows about.
+        let unchanged = CrawlOrchestrator::new(&librarian, "sqlp", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged.entries_deprecated, 0,
+            "tables of a `.sql` file that is still there must survive"
+        );
+        assert!(librarian
+            .get_by_topic_key(Some("sqlp"), &table_key)
+            .await
+            .unwrap()
+            .is_some());
+
+        // With the declaring file gone, nothing can declare `users` anymore.
+        fs::remove_file(root.join("migrations/001_init.sql")).unwrap();
+        let after_delete = CrawlOrchestrator::new(&librarian, "sqlp", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+
+        assert!(
+            after_delete.entries_deprecated >= 1,
+            "the deleted migration's table entry should have been retired"
+        );
+        assert!(
+            librarian
+                .get_by_topic_key(Some("sqlp"), &table_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "per-table entry outlived the .sql file that declared it"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_table_entries_survive_a_sql_file_the_scanner_stopped_seeing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "export function boot() { return 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("migrations/001_init.sql"),
+            "CREATE TABLE users (\n  id SERIAL PRIMARY KEY\n);\n",
+        )
+        .unwrap();
+
+        let librarian = test_librarian().await;
+        CrawlOrchestrator::new(&librarian, "bigsql", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        let table_key =
+            seed_table_entry(&librarian, "bigsql", "users", "migrations/001_init.sql").await;
+
+        // Past the scanner's 1 MiB cap: absent from the scan, still on disk.
+        // "No .sql file in the inventory" now means "none we could see", which
+        // is not evidence that anything was deleted.
+        fs::write(root.join("migrations/001_init.sql"), "x".repeat(1_048_577)).unwrap();
+        let r = CrawlOrchestrator::new(&librarian, "bigsql", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.entries_deprecated, 0,
+            "a .sql file that outgrew the scanner still exists and still declares its tables"
+        );
+        assert!(librarian
+            .get_by_topic_key(Some("bigsql"), &table_key)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
