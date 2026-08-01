@@ -36,8 +36,20 @@ questions by assembling context from memory.
   primary and a remote PG as the team store; `runar sync push|pull`
   drains the outbox and pulls deltas.
 - **MCP server.** `runar mcp-muninn` speaks the Model Context
-  Protocol over stdio (and optionally HTTP). 26 tools exposed
-  under `muninn_*`, `huginn_*`, `curator_*`.
+  Protocol over stdio. 28 tools exposed
+  under `muninn_*` (13), `huginn_*` (10), `curator_*` (5).
+- **Symbol-level code graph.** `runar crawl` extracts definitions, call
+  sites and per-function complexity into a dedicated `codegraph.db`
+  (Rust, TypeScript/JS, Python, Go), then resolves calls into edges
+  through a confidence-ranked tier chain. Query it with
+  `runar graph search|symbol|trace|status` or the `huginn_search_graph`
+  / `huginn_symbol` / `huginn_trace` MCP tools. An edge is evidence or
+  it is absent: unmatched calls are counted, never attached to a
+  plausible-looking definition.
+- **A code view for humans.** `runar graph serve` opens a browser on
+  localhost; `runar graph export` writes the same interface to a single
+  HTML file that works offline. No bundler, no CDN, no vendored
+  JavaScript, and no new dependency — see [Code view](#code-view).
 - **Tiered memory.** Entries graduate through 4 layers based on age,
   citation count, verification, and confidence; `runar gc` enforces
   retention.
@@ -128,6 +140,60 @@ runar setup windsurf    # prints MCP config for manual paste
 
 ---
 
+## Code view
+
+Every other surface on the graph targets an agent. This one targets you.
+
+```bash
+runar graph serve                 # opens a browser on 127.0.0.1
+runar graph export -p myproject   # one self-contained HTML file
+```
+
+Two altitudes of one tool, with a toggle between them. Selecting a symbol never
+changes altitude — clicking a tower shows you its card where it stands.
+
+### City
+
+Directories are blocks, symbols are buildings, height is cyclomatic complexity,
+so the thing most likely to hurt you is the tallest thing on screen. Selecting
+one arcs its calls across the city; the dash pattern is the resolver's own
+confidence tier, so a weak guess looks like one.
+
+![The City view: directory blocks, symbols as buildings sized by complexity, with the selected symbol's calls arcing across them](docs/img/graph-city.png)
+
+Only symbols that *have* complexity get a building — on a large codebase most
+symbols are fields and type declarations, and drawing them buries the towers
+that matter. The header always states what was drawn against what exists.
+
+### Symbol
+
+Search on the left, the neighbourhood in the middle, the definition on the
+right. Never the whole graph: one symbol's callers and callees, and a click
+moves you to any of them.
+
+![The Symbol view: a search list, one symbol's callers and callees, and its definition card](docs/img/graph-symbol.png)
+
+Note the card shows **call sites** and **distinct callers** separately. They are
+different questions, and on real code they differ by a factor of three or more —
+a function called ten times from one test is not a hub.
+
+### Projects
+
+One `codegraph.db` holds every project you have crawled. Served, the switcher
+reads it live.
+
+![The project switcher: three projects with symbol, edge and file counts](docs/img/graph-projects.png)
+
+> Screenshots are taken against generated fixtures, not real code —
+> see `tools/fixtures/demo_graph.py`.
+
+**On `serve` and safety.** It binds `127.0.0.1` only, puts a 128-bit random
+token in the URL path so a page you visit cannot reach it by guessing the port,
+validates the `Host` header against DNS rebinding, answers `GET` only, and
+opens the store read-only. No CORS headers are sent.
+
+---
+
 ## CLI reference
 
 | Command                      | Purpose                                                                         |
@@ -141,7 +207,14 @@ runar setup windsurf    # prints MCP config for manual paste
 | `runar search <query>`       | CLI-side semantic search; `--limit`.                                           |
 | `runar save <title> <body>`  | Save a memory entry from the shell. `--project`, `--type`, `--tags`, `--topic-key`. |
 | `runar stats`                | Memory system statistics (entries by type, sessions, layers).                  |
-| `runar crawl [<path>]`       | Crawl a project. `--project`, `--mode auto|full|incremental`.                  |
+| `runar crawl [<path>]`       | Crawl a project. `--project`, `--mode auto|full|incremental`. Builds the symbol graph by default; `--no-deep` skips it. |
+| `runar graph search <query>` | Full-text search over symbol names. `--project`, `--label`, `--limit`.         |
+| `runar graph symbol <name>`  | Definition site, signature, metrics and one-hop callers/callees. `--project`.  |
+| `runar graph trace <name>`   | Walk the call graph. `--direction callers|callees`, `--depth` (max 5), `--limit`. |
+| `runar graph status`         | Symbol-graph coverage: files indexed, skipped by language, symbols, edges, unresolved calls. |
+| `runar graph serve`          | Open the code view on localhost. `--project`, `--port` (0 = pick one), `--no-open`. |
+| `runar graph export`         | Write the code view to one self-contained HTML file. `--project`, `--output`.  |
+| `runar hint`                 | PreToolUse `Grep|Glob` search hints from the symbol graph. `--silent` for hook use; opt in via `setup claude-code --with-search-hints`. |
 | `runar architecture`         | Latest architecture summary for a project.                                     |
 | `runar techdebt`             | List TODO/FIXME/HACK/XXX markers. `--type`.                                    |
 | `runar ask <question>`       | Curator Q&A from the CLI. `--project`.                                         |
@@ -200,7 +273,10 @@ with the package they belong to.
 | `huginn_status`       | Crawl status + entry breakdown for a project.                       |
 | `huginn_architecture` | Latest architecture summary.                                        |
 | `huginn_techdebt`     | TODO/FIXME/HACK/XXX entries from the crawler.                       |
-| `huginn_recrawl_file` | Re-analyze a single file after editing.                             |
+| `huginn_recrawl_file` | Re-analyze a single file after editing (memory entry + symbol graph). |
+| `huginn_search_graph` | Full-text search over symbol names, ranked, with an optional label filter. |
+| `huginn_symbol`       | One symbol: definition site, signature, metrics, one-hop callers and callees. |
+| `huginn_trace`        | Walk callers or callees from a symbol, or find a path between two.  |
 | `huginn_benchmark`    | Memory-quality benchmark (deterministic scoring).                   |
 | `huginn_skills`       | Static skills/best-practices reference.                             |
 
@@ -273,7 +349,7 @@ Config lives at `~/.runar-forge/.env`. Edit via `runar config set <KEY> <VAL>`.
 | `RUNAR_PASSIVE_LEARNING`     | unset   | Set to `true` to enable `runar extract` rule-based capture.               |
 | `RUNAR_SAVE_PROMPTS`         | unset   | Persist captured prompts (otherwise scrubbed).                            |
 | `RUNAR_DEBUG`                | unset   | Enable internal debug log (`muninn_debug` MCP tool).                      |
-| `RUNAR_API_KEY`              | unset   | Optional shared secret guarding the HTTP MCP transport.                   |
+| `RUNAR_API_KEY`              | unset   | Reserved; not read by any current code path.                              |
 | `RUNAR_UPDATE_MANIFEST_URL`  | unset   | Override the release manifest URL for `runar update`.                     |
 
 `docs/HOW_TO_USE_IT.md` covers each subsystem in depth.
