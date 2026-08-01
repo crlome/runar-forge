@@ -4,6 +4,7 @@
 //! tree-sitter queries and the handful of node-type names a generic walk needs,
 //! and everything below consumes them uniformly.
 
+mod spec_go;
 mod spec_rust;
 mod spec_ts;
 
@@ -26,6 +27,10 @@ use super::{
 ///   [`SymbolLabel::from_capture`].
 /// - `@def.body` optionally marks the node to measure for complexity.
 /// - `@def.params` optionally marks the parameter list.
+/// - `@def.receiver` optionally names the container directly, for languages
+///   where a method is not written inside the type it belongs to. Go declares
+///   `func (s *Server) Handle()` at file scope, so walking ancestors finds
+///   nothing; the receiver type is a sibling field of the declaration.
 /// - `@call.name` marks a callee name; `@call.qualifier` its receiver.
 /// - `@import.source` marks a module path; `@import.name` a bound local name.
 /// - `@rel.subject` / `@rel.object` mark the two ends of an inherit/implement.
@@ -46,15 +51,20 @@ pub struct LangSpec {
     /// Whether a `relations` match should be read as Implements rather than
     /// Inherits.
     pub relation_kind: EdgeKind,
+    /// Whether an initial capital is what makes a name visible outside its
+    /// module. True for Go, where there is no `pub` or `export` keyword to
+    /// look for and the identifier itself carries the visibility.
+    pub capitalized_names_are_exported: bool,
 }
 
 pub fn spec_for(lang: Lang) -> &'static LangSpec {
     match lang {
         Lang::Rust => spec_rust::SPEC,
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => spec_ts::spec_for(lang),
-        // Python and Go land in the next slice; until then they are recorded
-        // as an explicit coverage gap rather than silently producing nothing.
-        Lang::Python | Lang::Go => spec_ts::spec_for(Lang::TypeScript),
+        Lang::Go => spec_go::SPEC,
+        // Python lands in the next slice; until then it is recorded as an
+        // explicit coverage gap rather than silently producing nothing.
+        Lang::Python => spec_ts::spec_for(Lang::TypeScript),
     }
 }
 
@@ -63,7 +73,7 @@ pub fn spec_for(lang: Lang) -> &'static LangSpec {
 pub fn is_supported(lang: Lang) -> bool {
     matches!(
         lang,
-        Lang::Rust | Lang::TypeScript | Lang::Tsx | Lang::JavaScript
+        Lang::Rust | Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Go
     )
 }
 
@@ -208,12 +218,14 @@ fn collect_symbols(
         let mut label: Option<SymbolLabel> = None;
         let mut body: Option<Node<'_>> = None;
         let mut params: Option<Node<'_>> = None;
+        let mut receiver: Option<Node<'_>> = None;
 
         for cap in m.captures {
             let cap_name = &query.capture_names()[cap.index as usize];
             match cap_name.strip_prefix("def.") {
                 Some("body") => body = Some(cap.node),
                 Some("params") => params = Some(cap.node),
+                Some("receiver") => receiver = Some(cap.node),
                 Some(suffix) => {
                     if let Some(l) = SymbolLabel::from_capture(suffix) {
                         name_node = Some(cap.node);
@@ -234,8 +246,14 @@ fn collect_symbols(
         }
 
         // A method is a function that happens to sit inside a container; the
-        // query does not have to know the difference.
-        let container = container_of(name_node, bytes, spec);
+        // query does not have to know the difference. Where the language writes
+        // the container beside the declaration instead of around it, an
+        // explicit receiver capture supplies it and the ancestor walk — which
+        // would find the file and stop — is not consulted.
+        let container = receiver
+            .map(|n| base_type_name(text(n, bytes)))
+            .filter(|c| !c.is_empty())
+            .or_else(|| container_of(name_node, bytes, spec));
         let label = match (label, container.is_some()) {
             (SymbolLabel::Function, true) => SymbolLabel::Method,
             (l, _) => l,
@@ -244,6 +262,7 @@ fn collect_symbols(
         let decl = name_node.parent().unwrap_or(name_node);
         let metrics = measure(body, params, spec);
 
+        let exported = is_exported(decl, bytes, &name, spec);
         out.push(RawSymbol {
             name,
             label,
@@ -251,7 +270,7 @@ fn collect_symbols(
             start_line: decl.start_position().row as u32 + 1,
             end_line: decl.end_position().row as u32 + 1,
             signature: signature_of(decl, bytes),
-            exported: is_exported(decl, bytes),
+            exported,
             metrics,
         });
     }
@@ -276,7 +295,13 @@ fn collect_symbols(
 /// statement boundary — scanning preceding siblings instead would mark every
 /// declaration after the file's first `export` as exported, and walking all
 /// ancestors would do the same to anything nested inside an exported function.
-fn is_exported(decl: Node<'_>, bytes: &[u8]) -> bool {
+///
+/// Go states visibility in the name itself, so there is no keyword to find and
+/// the name is the whole test.
+fn is_exported(decl: Node<'_>, bytes: &[u8], name: &str, spec: &LangSpec) -> bool {
+    if spec.capitalized_names_are_exported {
+        return name.chars().next().is_some_and(char::is_uppercase);
+    }
     let head = text(decl, bytes).lines().next().unwrap_or("");
     let head = head.split('=').next().unwrap_or(head);
     if head.contains("pub ") || head.contains("pub(") {
@@ -495,9 +520,32 @@ mod tests {
 
     /// A query that fails to compile silently yields nothing at runtime, so
     /// grammar drift has to fail here instead.
+    ///
+    /// Driven off `is_supported` rather than a hand-written list, because a
+    /// hand-written list is exactly how a newly added language gets shipped
+    /// without ever being checked.
+    ///
+    /// Only supported languages are asserted. An unsupported one borrows
+    /// another language's spec, and that spec does *not* compile against the
+    /// borrowed grammar — Python's does not — but nothing extracts from it
+    /// either: `is_supported` gates the call, and the file is counted as
+    /// `skipped_lang`. Requiring it to compile would assert something the
+    /// system never relies on.
     #[test]
     fn every_spec_query_compiles() {
-        for lang in [Lang::Rust, Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+        let all = [
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::JavaScript,
+            Lang::Python,
+            Lang::Go,
+        ];
+        assert!(
+            all.iter().copied().filter(|l| is_supported(*l)).count() >= 5,
+            "a supported language dropped out of the compilation check"
+        );
+        for lang in all.into_iter().filter(|l| is_supported(*l)) {
             let spec = spec_for(lang);
             let language = lang.language();
             for (what, src) in [

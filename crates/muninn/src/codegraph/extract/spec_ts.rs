@@ -237,6 +237,7 @@ const fn spec(lang: Lang, defs: &'static str, relations: &'static str) -> LangSp
         branch_kinds: BRANCH_KINDS,
         loop_kinds: LOOP_KINDS,
         relation_kind: EdgeKind::Inherits,
+        capitalized_names_are_exported: false,
     }
 }
 
