@@ -31,8 +31,15 @@ const RANK_LIMIT: usize = 14;
 
 /// The module a file belongs to: its parent directory, or a marker for files
 /// sitting at the project root.
+///
+/// Both separators, because `file_path` is stored as the scanner produced it —
+/// `relative_path` comes from `to_string_lossy()`, so a Windows crawl writes
+/// backslashes. Splitting on `/` alone would find no parent there and collapse
+/// every symbol in the project into a single district, silently, with no error
+/// anywhere. Forward-slash fixtures pass on every platform, which is exactly
+/// why this needs its own test.
 fn module_of(path: &str) -> &str {
-    match path.rfind('/') {
+    match path.rfind(['/', '\\']) {
         Some(i) => &path[..i],
         None => "(root)",
     }
@@ -288,6 +295,67 @@ mod tests {
         assert!(ids.contains(&e["t"].as_i64().unwrap()));
         assert_eq!(e["r"], "import_map");
         assert_eq!(e["c"], 0.95);
+    }
+
+    /// A crawl on Windows stores backslashes, so a `/`-only split would put
+    /// every symbol in "(root)" and flatten the whole city into one block —
+    /// with nothing failing anywhere to say so.
+    #[test]
+    fn a_windows_path_still_finds_its_module() {
+        assert_eq!(module_of(r"src\ingest\reader.ts"), r"src\ingest");
+        assert_eq!(
+            module_of(r"crates\muninn\src\main.rs"),
+            r"crates\muninn\src"
+        );
+        assert_eq!(module_of(r"top.rs"), "(root)");
+
+        let mixed = vec![
+            ViewNode {
+                id: 1,
+                name: "a".into(),
+                qualified_name: "a".into(),
+                label: "Function".into(),
+                file_path: r"src\ingest\reader.ts".into(),
+                start_line: 1,
+                end_line: 2,
+                signature: String::new(),
+                exported: true,
+                metrics: SymbolMetrics::default(),
+                call_sites_in: 0,
+                callers: 0,
+                call_sites_out: 0,
+                callees: 0,
+            },
+            ViewNode {
+                id: 2,
+                name: "b".into(),
+                qualified_name: "b".into(),
+                label: "Function".into(),
+                file_path: r"src\api\routes.ts".into(),
+                start_line: 1,
+                end_line: 2,
+                signature: String::new(),
+                exported: true,
+                metrics: SymbolMetrics::default(),
+                call_sites_in: 0,
+                callers: 0,
+                call_sites_out: 0,
+                callees: 0,
+            },
+        ];
+        let mods = modules_json(&mixed);
+        let labels: Vec<&str> = mods
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            2,
+            "backslash paths collapsed into one district"
+        );
+        assert!(labels.contains(&r"src\ingest") && labels.contains(&r"src\api"));
     }
 
     #[test]
