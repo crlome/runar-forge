@@ -192,12 +192,6 @@ static UUID_VALUE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
-/// A whole value that is a function call: `get_token()`, `cfg.read()`. The
-/// shape is required rather than merely containing a `(`, which allowed
-/// anything with a stray paren — `api_key=secret(x` — through untouched.
-static FUNCTION_CALL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_.:]*\(.*\)$").unwrap());
-
 /// Values that look like references or placeholders rather than secrets.
 ///
 /// A bare UUID stays allowlisted deliberately. UUIDs are overwhelmingly
@@ -210,7 +204,14 @@ fn value_allowlisted(value: &str) -> bool {
     GIT_SHA.is_match(value)
         || UUID_VALUE.is_match(value)
         || value.starts_with('$') // env interpolation: $VAR / ${VAR}
-        || FUNCTION_CALL.is_match(value) // function call in code: get_token()
+        // A `(` means the value is code. Requiring a whole well-formed call
+        // instead was tried and reverted: measured against a 17k-entry corpus
+        // it redacted 16 code fragments — `z.string(),`, `Some(format!(`,
+        // `` `${prefix}` ``, calls captured mid-argument — and zero secrets.
+        // The hole it closed (`api_key=secret(x`) is not a real credential
+        // shape: every format in WHOLE_MATCH is drawn from base64, hex or
+        // url-safe base64, none of which contain a parenthesis.
+        || value.contains('(')
         || (value.starts_with('<') && value.ends_with('>')) // <your-token>
         || value.starts_with("[REDACTED") // already redacted by an earlier pattern
         || (value.matches('/').count() >= 2 && PATHLIKE.is_match(value)) // keys/deploy/id
@@ -272,11 +273,22 @@ pub fn redact_secrets(input: &str) -> (String, Vec<SecretHit>) {
         let mut n = 0usize;
         text = URL_CREDENTIALS
             .replace_all(&text, |caps: &regex::Captures| {
+                // The marker this rule writes is itself a legal password as far
+                // as the pattern is concerned, so without this the rule matches
+                // its own output forever: `runar scrub` re-reported and
+                // rewrote the same rows on every run and the count could never
+                // reach zero. The keyed-secret branch has always had the same
+                // guard via `value_allowlisted`.
+                if caps[2].starts_with("[REDACTED") {
+                    return caps[0].to_string();
+                }
                 n += 1;
                 format!("://{}:[REDACTED:url-credentials]@", &caps[1])
             })
             .into_owned();
-        *counts.entry("url-credentials").or_insert(0) += n;
+        if n > 0 {
+            *counts.entry("url-credentials").or_insert(0) += n;
+        }
     }
 
     if BEARER_HEADER.is_match(&text) {
@@ -629,18 +641,37 @@ mod tests {
         }
     }
 
-    /// The old rule allowlisted any value containing `(`, so a secret with a
-    /// stray paren was kept verbatim.
+    /// Code fragments assigned to secret-ish names, all taken from a real
+    /// corpus where a stricter whole-call rule redacted every one of them and
+    /// no actual secret. A parenthesis means the value is code: no credential
+    /// format in `WHOLE_MATCH` — base64, hex, url-safe base64 — contains one.
     #[test]
-    fn only_whole_function_calls_are_allowlisted() {
-        let (out, _) = redact_secrets("api_key=secret(x9Kq2mNp8vRt4wLs");
-        assert!(out.contains("[REDACTED:keyed-secret]"), "{out}");
-
-        for kept in ["token = get_token()", "api_key=cfg.read()"] {
-            let (out, hits) = redact_secrets(kept);
-            assert_eq!(out, kept, "a real function call was redacted");
-            assert_eq!(total_hits(&hits), 0);
+    fn code_fragments_assigned_to_secret_names_survive() {
+        let cases = [
+            "OPENAI_API_KEY: z.string(),",
+            "token = get_token()",
+            "api_key=cfg.read()",
+            "refresh_token = getServerSession(req)",
+            "topic_key: Some(format!(",
+            "password: decrypt(raw)",
+        ];
+        for case in cases {
+            let (out, hits) = redact_secrets(case);
+            assert_eq!(out, case, "code was redacted: {case}");
+            assert_eq!(total_hits(&hits), 0, "hits for: {case}");
         }
+    }
+
+    /// The rule used to match the marker it had just written, so every `runar
+    /// scrub` re-reported and rewrote the same rows and the count could never
+    /// reach zero.
+    #[test]
+    fn url_credential_redaction_is_idempotent() {
+        let (once, hits) = redact_secrets("postgres://muninn:hunter2secret@10.0.0.5/db");
+        assert_eq!(total_hits(&hits), 1);
+        let (twice, hits2) = redact_secrets(&once);
+        assert_eq!(twice, once, "second pass changed already-redacted text");
+        assert_eq!(total_hits(&hits2), 0, "second pass reported a fresh hit");
     }
 
     #[test]
