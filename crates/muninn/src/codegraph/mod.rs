@@ -11,6 +11,7 @@ pub mod index;
 pub mod metrics;
 pub mod resolve;
 pub mod store;
+pub mod view;
 
 /// What kind of definition a symbol is. Stored as a string so the query layer
 /// can boost by it without a join.

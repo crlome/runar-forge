@@ -624,6 +624,140 @@ impl CodeGraphStore {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Every project with a graph, plus what the switcher needs to name it.
+    pub fn project_rows(&self) -> Result<Vec<ProjectRow>> {
+        let db = self.lock()?;
+        let mut stmt = db.prepare(
+            "SELECT p.project, p.root, p.indexed_at,
+                    (SELECT COUNT(*) FROM code_nodes n WHERE n.project = p.project),
+                    (SELECT COUNT(*) FROM code_edges e WHERE e.project = p.project),
+                    (SELECT COUNT(*) FROM code_files f WHERE f.project = p.project)
+             FROM code_projects p
+             ORDER BY p.project",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ProjectRow {
+                project: r.get(0)?,
+                root: r.get(1)?,
+                indexed_at: r.get(2)?,
+                symbols: r.get::<_, i64>(3)? as usize,
+                edges: r.get::<_, i64>(4)? as usize,
+                files: r.get::<_, i64>(5)? as usize,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every definition in a project, for a view that draws the whole thing.
+    ///
+    /// Deliberately does not reuse `COLS`: its two correlated `COUNT(*)`
+    /// subqueries are evaluated per row, which is fine under a `LIMIT 12` and
+    /// quadratic over a whole project. The fan counts come from two grouped
+    /// scans of `code_edges` instead, merged here — O(N + E) rather than
+    /// O(N × E).
+    ///
+    /// Both counts are reported for each direction, because they are different
+    /// questions: `call_sites` counts edges, `callers` counts distinct
+    /// definitions. On this repository's own graph they differ by up to 3.6×,
+    /// and a hub ranking built on the first alone just rewards repetitive tests.
+    pub fn all_nodes(&self, project: &str) -> Result<Vec<ViewNode>> {
+        let db = self.lock()?;
+
+        let mut fan = std::collections::HashMap::<i64, [usize; 4]>::new();
+        let mut tally = |sql: &str, slot: usize| -> Result<()> {
+            let mut stmt = db.prepare(sql)?;
+            let rows = stmt.query_map(params![project], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            for row in rows {
+                let (id, sites, distinct) = row?;
+                let e = fan.entry(id).or_insert([0; 4]);
+                e[slot] = sites;
+                e[slot + 1] = distinct;
+            }
+            Ok(())
+        };
+        tally(
+            "SELECT target_id, COUNT(*), COUNT(DISTINCT source_id) FROM code_edges
+             WHERE project = ?1 AND type = 'CALLS' GROUP BY target_id",
+            0,
+        )?;
+        tally(
+            "SELECT source_id, COUNT(*), COUNT(DISTINCT target_id) FROM code_edges
+             WHERE project = ?1 AND type = 'CALLS' GROUP BY source_id",
+            2,
+        )?;
+
+        let mut stmt = db.prepare(
+            "SELECT id, name, qualified_name, label, file_path, start_line, end_line,
+                    signature, exported, complexity, cognitive, loop_depth, param_count
+             FROM code_nodes WHERE project = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![project], |r| {
+            let id: i64 = r.get(0)?;
+            Ok(ViewNode {
+                id,
+                name: r.get(1)?,
+                qualified_name: r.get(2)?,
+                label: r.get(3)?,
+                file_path: r.get(4)?,
+                start_line: r.get(5)?,
+                end_line: r.get(6)?,
+                signature: r.get(7)?,
+                exported: r.get::<_, i64>(8)? != 0,
+                metrics: SymbolMetrics {
+                    complexity: r.get(9)?,
+                    cognitive: r.get(10)?,
+                    loop_depth: r.get(11)?,
+                    param_count: r.get(12)?,
+                },
+                call_sites_in: 0,
+                callers: 0,
+                call_sites_out: 0,
+                callees: 0,
+            })
+        })?;
+
+        let mut out: Vec<ViewNode> = rows.collect::<std::result::Result<_, _>>()?;
+        for n in &mut out {
+            if let Some(c) = fan.get(&n.id) {
+                n.call_sites_in = c[0];
+                n.callers = c[1];
+                n.call_sites_out = c[2];
+                n.callees = c[3];
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every resolved edge in a project, keyed by the node ids `all_nodes`
+    /// reports. Includes the non-CALLS kinds, which no other read path returns:
+    /// a view that silently dropped INHERITS/IMPLEMENTS would be claiming the
+    /// graph knows less than it does.
+    pub fn all_edges(&self, project: &str) -> Result<Vec<ViewEdge>> {
+        let db = self.lock()?;
+        let mut stmt = db.prepare(
+            "SELECT source_id, target_id, type, confidence, resolution, line
+             FROM code_edges WHERE project = ?1
+             ORDER BY source_id, target_id",
+        )?;
+        let rows = stmt.query_map(params![project], |r| {
+            Ok(ViewEdge {
+                source: r.get(0)?,
+                target: r.get(1)?,
+                kind: r.get(2)?,
+                confidence: r.get(3)?,
+                resolution: r.get(4)?,
+                line: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// The schema version the file on disk carries, if it has one.
     pub fn stored_schema_version(&self) -> Result<Option<i64>> {
         let db = self.lock()?;
@@ -1019,6 +1153,55 @@ pub struct SymbolRow {
     pub metrics: SymbolMetrics,
     pub fan_in: usize,
     pub fan_out: usize,
+}
+
+/// A project with a graph, as the switcher lists it.
+#[derive(Debug, Clone)]
+pub struct ProjectRow {
+    pub project: String,
+    pub root: String,
+    pub indexed_at: String,
+    pub symbols: usize,
+    pub edges: usize,
+    pub files: usize,
+}
+
+/// A definition as the graph view needs it.
+///
+/// Carries `id`, which `SymbolRow` also has but `format::symbol_json` drops —
+/// the view keys its edges on it, so it cannot be omitted here.
+#[derive(Debug, Clone)]
+pub struct ViewNode {
+    pub id: i64,
+    pub name: String,
+    pub qualified_name: String,
+    pub label: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub signature: String,
+    pub exported: bool,
+    pub metrics: SymbolMetrics,
+    /// Incoming CALLS edges. Repeated calls from one definition count once each.
+    pub call_sites_in: usize,
+    /// Distinct definitions that call this one.
+    pub callers: usize,
+    /// Outgoing CALLS edges.
+    pub call_sites_out: usize,
+    /// Distinct definitions this one calls.
+    pub callees: usize,
+}
+
+/// One resolved edge, keyed by `ViewNode::id` at both ends.
+#[derive(Debug, Clone)]
+pub struct ViewEdge {
+    pub source: i64,
+    pub target: i64,
+    pub kind: String,
+    /// `None` for kinds the resolver does not score, e.g. IMPLEMENTS.
+    pub confidence: Option<f64>,
+    pub resolution: Option<String>,
+    pub line: u32,
 }
 
 /// A definition reached across one edge.
@@ -1431,6 +1614,175 @@ mod tests {
         )
         .unwrap();
         s
+    }
+
+    /// Two call sites from ONE definition are two edges but one caller. The
+    /// view reports both because they answer different questions, and
+    /// conflating them is what makes a hub ranking reward repetitive tests.
+    #[test]
+    fn all_nodes_separates_call_sites_from_distinct_callers() {
+        let s = store();
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        s.replace_file(
+            "p",
+            FileRecord {
+                path: "src/a.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &[
+                sym("src/a.rs", None, "hot", SymbolLabel::Function),
+                sym("src/a.rs", None, "caller_one", SymbolLabel::Function),
+                sym("src/a.rs", None, "caller_two", SymbolLabel::Function),
+            ],
+            RawFacts::default(),
+        )
+        .unwrap();
+        // caller_one calls hot twice (two lines), caller_two calls it once.
+        s.rebuild_edges(
+            "p",
+            &[
+                EdgeRecord {
+                    source_qualified: "src/a.rs:caller_one".into(),
+                    target_qualified: "src/a.rs:hot".into(),
+                    kind: EdgeKind::Calls,
+                    resolution: Some(Resolution::SameModule),
+                    line: 3,
+                },
+                EdgeRecord {
+                    source_qualified: "src/a.rs:caller_one".into(),
+                    target_qualified: "src/a.rs:hot".into(),
+                    kind: EdgeKind::Calls,
+                    resolution: Some(Resolution::SameModule),
+                    line: 9,
+                },
+                EdgeRecord {
+                    source_qualified: "src/a.rs:caller_two".into(),
+                    target_qualified: "src/a.rs:hot".into(),
+                    kind: EdgeKind::Calls,
+                    resolution: Some(Resolution::SameModule),
+                    line: 4,
+                },
+            ],
+        )
+        .unwrap();
+
+        let nodes = s.all_nodes("p").unwrap();
+        let hot = nodes.iter().find(|n| n.name == "hot").unwrap();
+        assert_eq!(hot.call_sites_in, 3, "three edges point at hot");
+        assert_eq!(hot.callers, 2, "but only two definitions call it");
+
+        let one = nodes.iter().find(|n| n.name == "caller_one").unwrap();
+        assert_eq!(one.call_sites_out, 2, "caller_one calls hot from two lines");
+        assert_eq!(one.callees, 1, "and both reach the same definition");
+
+        let two = nodes.iter().find(|n| n.name == "caller_two").unwrap();
+        assert_eq!((two.call_sites_out, two.callees), (1, 1));
+    }
+
+    /// `all_edges` is the only read path that returns the non-CALLS kinds, so
+    /// a view built on it must not quietly lose them.
+    #[test]
+    fn all_edges_keeps_every_kind_and_its_confidence() {
+        let s = store();
+        s.begin_project("p", Path::new("/tmp/p"), true).unwrap();
+        s.replace_file(
+            "p",
+            FileRecord {
+                path: "src/a.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &[
+                sym("src/a.rs", None, "Widget", SymbolLabel::Struct),
+                sym("src/a.rs", None, "Draw", SymbolLabel::Trait),
+                sym("src/a.rs", None, "run", SymbolLabel::Function),
+                sym("src/a.rs", None, "helper", SymbolLabel::Function),
+            ],
+            RawFacts::default(),
+        )
+        .unwrap();
+        s.rebuild_edges(
+            "p",
+            &[
+                EdgeRecord {
+                    source_qualified: "src/a.rs:run".into(),
+                    target_qualified: "src/a.rs:helper".into(),
+                    kind: EdgeKind::Calls,
+                    resolution: Some(Resolution::SameModule),
+                    line: 2,
+                },
+                EdgeRecord {
+                    source_qualified: "src/a.rs:Widget".into(),
+                    target_qualified: "src/a.rs:Draw".into(),
+                    kind: EdgeKind::Implements,
+                    resolution: None,
+                    line: 5,
+                },
+            ],
+        )
+        .unwrap();
+
+        let edges = s.all_edges("p").unwrap();
+        assert_eq!(edges.len(), 2, "IMPLEMENTS was dropped");
+
+        let calls = edges.iter().find(|e| e.kind == "CALLS").unwrap();
+        assert_eq!(calls.confidence, Some(0.9), "same_module scores 0.90");
+        assert_eq!(calls.resolution.as_deref(), Some("same_module"));
+
+        let implements = edges.iter().find(|e| e.kind == "IMPLEMENTS").unwrap();
+        assert!(
+            implements.confidence.is_none(),
+            "an unscored kind must stay None, not default to a number"
+        );
+
+        // Both ends must be keyed on ids `all_nodes` also reports.
+        let ids: std::collections::HashSet<i64> =
+            s.all_nodes("p").unwrap().iter().map(|n| n.id).collect();
+        for e in &edges {
+            assert!(ids.contains(&e.source) && ids.contains(&e.target));
+        }
+    }
+
+    #[test]
+    fn project_rows_carry_root_and_counts() {
+        let s = seeded();
+        let rows = s.project_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project, "p");
+        assert_eq!(rows[0].root, "/tmp/p");
+        assert_eq!(rows[0].symbols, 4);
+        assert_eq!(rows[0].edges, 1);
+        assert!(!rows[0].indexed_at.is_empty());
+    }
+
+    #[test]
+    fn bulk_reads_are_scoped_to_one_project() {
+        let s = seeded();
+        s.begin_project("other", Path::new("/tmp/other"), true)
+            .unwrap();
+        s.replace_file(
+            "other",
+            FileRecord {
+                path: "src/z.rs",
+                lang: Some("rust"),
+                content_hash: "h",
+                status: FileStatus::Indexed,
+                detail: None,
+            },
+            &[sym("src/z.rs", None, "zeta", SymbolLabel::Function)],
+            RawFacts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(s.all_nodes("p").unwrap().len(), 4);
+        assert_eq!(s.all_nodes("other").unwrap().len(), 1);
+        assert_eq!(s.all_edges("other").unwrap().len(), 0);
+        assert_eq!(s.project_rows().unwrap().len(), 2);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -562,6 +563,28 @@ enum GraphCmd {
     Status {
         #[arg(short, long)]
         project: String,
+    },
+
+    /// Write the code view to one self-contained HTML file
+    Export {
+        #[arg(short, long)]
+        project: String,
+        /// Where to write it. Defaults to `<project>-graph.html` here.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Serve the code view on localhost, with live data and a project switcher
+    Serve {
+        /// Which project to open first. Defaults to the largest graph.
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Port to bind. 0 (the default) asks the OS for a free one.
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Print the URL instead of opening a browser.
+        #[arg(long)]
+        no_open: bool,
     },
 }
 
@@ -1683,13 +1706,16 @@ async fn run_import(path: &str) -> anyhow::Result<()> {
 /// whole connected component.
 const GRAPH_MAX_TRACE_DEPTH: usize = 5;
 
-/// The `--project` every graph subcommand carries.
-fn graph_project(cmd: &GraphCmd) -> &str {
+/// The `--project` a graph subcommand carries. `serve` is the one that may
+/// arrive without one, because its whole point is switching between them.
+fn graph_project(cmd: &GraphCmd) -> Option<&str> {
     match cmd {
         GraphCmd::Search { project, .. }
         | GraphCmd::Symbol { project, .. }
         | GraphCmd::Trace { project, .. }
-        | GraphCmd::Status { project } => project,
+        | GraphCmd::Status { project }
+        | GraphCmd::Export { project, .. } => Some(project),
+        GraphCmd::Serve { project, .. } => project.as_deref(),
     }
 }
 
@@ -1710,8 +1736,8 @@ fn print_block(block: &str) {
 
 /// Terminal counterpart to the code-graph MCP tools. Synchronous: the store is
 /// plain SQLite, so none of this belongs in an await chain.
-fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
-    let project = graph_project(&cmd).to_string();
+async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
+    let project = graph_project(&cmd).unwrap_or_default().to_string();
 
     // Read-only, and existence checked first: the writable open creates the
     // file and, on a schema mismatch, drops every project's graph to rebuild
@@ -1719,7 +1745,14 @@ fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
     let path = CodeGraphStore::default_path();
     if !path.exists() {
         println!("No code graph yet — {} does not exist.", path.display());
-        println!("{}", graph_crawl_hint(&project));
+        println!(
+            "{}",
+            graph_crawl_hint(if project.is_empty() {
+                "<project>"
+            } else {
+                &project
+            })
+        );
         return Ok(());
     }
     let store = CodeGraphStore::open_readonly(&path).map_err(graph_err)?;
@@ -1820,6 +1853,60 @@ fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
             );
             let reached = store.trace(root.id, dir, depth, limit).map_err(graph_err)?;
             print_block(&codegraph::format::reached(&direction, &reached));
+        }
+
+        GraphCmd::Export { output, .. } => {
+            let cov = store.coverage(&project).map_err(graph_err)?;
+            if cov.symbols == 0 {
+                println!("Project '{project}' has no symbols in the code graph.");
+                println!("{}", graph_crawl_hint(&project));
+                return Ok(());
+            }
+            let data = codegraph::view::payload(&store, &project).map_err(graph_err)?;
+            let html = codegraph::view::page(&format!("{project} — runar graph"), Some(&data));
+
+            let path = output.unwrap_or_else(|| PathBuf::from(format!("{project}-graph.html")));
+            std::fs::write(&path, &html)
+                .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+
+            println!(
+                "Wrote {} — {} symbols, {} edges, {:.1} MB.",
+                path.display(),
+                cov.symbols,
+                cov.edges,
+                html.len() as f64 / 1_048_576.0
+            );
+            println!("Open it in a browser; it needs no server and works offline.");
+        }
+
+        GraphCmd::Serve { port, no_open, .. } => {
+            let known = store.project_rows().map_err(graph_err)?;
+            if known.is_empty() {
+                println!("No project has a code graph yet.");
+                println!("{}", graph_crawl_hint("<project>"));
+                return Ok(());
+            }
+
+            let server = codegraph::view::serve::Server::bind(store, port).await?;
+            let url = server.url();
+
+            println!("runar graph — {} project(s)", known.len());
+            for p in &known {
+                println!("  {:<28} {:>7} symbols  {}", p.project, p.symbols, p.root);
+            }
+            println!();
+            println!("  {url}");
+            println!();
+            // Say what the token is for: a reader who does not know will treat
+            // it as noise and paste the bare port somewhere.
+            println!("Bound to 127.0.0.1 only. The path carries a one-time token,");
+            println!("so a page you visit cannot reach this server by guessing the port.");
+            println!("Press Ctrl-C to stop.");
+
+            if !no_open {
+                codegraph::view::serve::open_browser(&url);
+            }
+            server.serve().await?;
         }
 
         GraphCmd::Status { .. } => {
@@ -2994,7 +3081,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Graph { cmd } => {
-            run_graph(cmd)?;
+            run_graph(cmd).await?;
         }
         Commands::Onboard { project, json } => {
             let librarian = create_librarian().await?;
