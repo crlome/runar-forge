@@ -109,6 +109,55 @@ static WHOLE_MATCH: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
             Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
                 .unwrap(),
         ),
+        // Vendor-prefixed keys. Each of these is self-identifying, so it is
+        // recognisable on its own and does not need to sit right of an
+        // `API_KEY=` the way an unprefixed value does. For a memory system
+        // living inside Claude Code, `sk-ant-` is the likeliest credential of
+        // all and was previously caught only when assigned to a named key.
+        (
+            "anthropic-key",
+            Regex::new(r"\bsk-ant-[A-Za-z0-9_-]{16,}").unwrap(),
+        ),
+        (
+            "openai-key",
+            Regex::new(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{16,}").unwrap(),
+        ),
+        // Legacy unprefixed OpenAI keys. The charset excludes `-`, so this
+        // cannot swallow any of the `sk-<vendor>-` forms above.
+        (
+            "openai-key",
+            Regex::new(r"\bsk-[A-Za-z0-9]{32,}\b").unwrap(),
+        ),
+        (
+            "google-api-key",
+            Regex::new(r"\bAIza[0-9A-Za-z_-]{35}").unwrap(),
+        ),
+        (
+            "gitlab-token",
+            Regex::new(r"\bglpat-[0-9A-Za-z_-]{20,}").unwrap(),
+        ),
+        (
+            "sendgrid-key",
+            Regex::new(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}").unwrap(),
+        ),
+        ("npm-token", Regex::new(r"\bnpm_[A-Za-z0-9]{36}\b").unwrap()),
+        (
+            "slack-app-token",
+            Regex::new(r"\bxapp-[0-9]-[A-Za-z0-9_-]{10,}").unwrap(),
+        ),
+        // The path segment is the credential: anyone holding the URL can post.
+        (
+            "slack-webhook",
+            Regex::new(r"https://hooks\.slack\.com/services/[A-Za-z0-9_/-]{10,}").unwrap(),
+        ),
+        (
+            "stripe-key",
+            Regex::new(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b").unwrap(),
+        ),
+        (
+            "huggingface-token",
+            Regex::new(r"\bhf_[A-Za-z0-9]{30,}\b").unwrap(),
+        ),
     ]
 });
 
@@ -143,12 +192,25 @@ static UUID_VALUE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// A whole value that is a function call: `get_token()`, `cfg.read()`. The
+/// shape is required rather than merely containing a `(`, which allowed
+/// anything with a stray paren — `api_key=secret(x` — through untouched.
+static FUNCTION_CALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_.:]*\(.*\)$").unwrap());
+
 /// Values that look like references or placeholders rather than secrets.
+///
+/// A bare UUID stays allowlisted deliberately. UUIDs are overwhelmingly
+/// identifiers — session ids, row ids, trace ids — and this predicate only runs
+/// on values already sitting right of a secret-ish key name, which is exactly
+/// where `session_token=<uuid>` appears and means "which session", not "the
+/// bearer". Redacting them would strip a large amount of legitimately useful
+/// context to catch a credential format nobody issues.
 fn value_allowlisted(value: &str) -> bool {
     GIT_SHA.is_match(value)
         || UUID_VALUE.is_match(value)
         || value.starts_with('$') // env interpolation: $VAR / ${VAR}
-        || value.contains('(') // function call in code: get_token()
+        || FUNCTION_CALL.is_match(value) // function call in code: get_token()
         || (value.starts_with('<') && value.ends_with('>')) // <your-token>
         || value.starts_with("[REDACTED") // already redacted by an earlier pattern
         || (value.matches('/').count() >= 2 && PATHLIKE.is_match(value)) // keys/deploy/id
@@ -250,6 +312,21 @@ pub fn redact_secrets(input: &str) -> (String, Vec<SecretHit>) {
         .map(|(kind, count)| SecretHit { kind, count })
         .collect();
     (text, hits)
+}
+
+/// Redact in place, returning the number of hits.
+///
+/// Exists so the write paths that cannot go through `propose` — session
+/// creation, the session-summary entry, a caller-supplied topic key — scrub
+/// with the same call rather than each re-deriving the pattern. Every one of
+/// those was previously unscrubbed.
+pub fn scrub(text: &mut String) -> usize {
+    let (clean, hits) = redact_secrets(text);
+    let total: usize = hits.iter().map(|h| h.count).sum();
+    if total > 0 {
+        *text = clean;
+    }
+    total
 }
 
 /// Recursively redact every string leaf of a JSON value (hook payloads carry
@@ -465,6 +542,117 @@ mod tests {
         let (out, hits) = redact_secrets(&format!("JWT_ACCESS_SECRET={jwt}"));
         assert!(out.contains("JWT_ACCESS_SECRET=[REDACTED:jwt]"), "{out}");
         assert_eq!(total_hits(&hits), 1, "{hits:?}");
+    }
+
+    /// Fixtures are assembled at runtime rather than written as literals.
+    /// A well-formed key in the source is a well-formed key as far as any
+    /// secret scanner is concerned — GitHub push protection rejects the push —
+    /// and splitting the prefix from the body defeats that without weakening
+    /// what the regex actually sees, which is the joined string.
+    fn fake(prefix: &str, body: &str) -> String {
+        format!("{prefix}{body}")
+    }
+
+    /// The motivating case for the vendor-prefix rules: a bare key in prose,
+    /// with no `API_KEY=` to its left. Before these patterns every one of
+    /// these survived verbatim.
+    #[test]
+    fn vendor_prefixed_keys_are_caught_bare_in_prose() {
+        const BODY: &str = "x7Kq2mNp8vRt4wLs9dFg1hJk3nBc5yZa0eQu6iOp";
+        let cases = [
+            ("anthropic-key", fake("sk-ant-", &format!("api03-{BODY}"))),
+            ("openai-key", fake("sk-proj-", BODY)),
+            (
+                "openai-key",
+                fake("sk-", "Ab3dEf6gHi9jKl2mNo5pQr8sTu1vWx4yZa7bCd0eFg3hIj6k"),
+            ),
+            (
+                "google-api-key",
+                fake("AIza", "SyD3xK9mNp2vRt5wLs8dFg1hJk4nBc7yZaQ"),
+            ),
+            ("gitlab-token", fake("glpat-", "x7Kq2mNp8vRt4wLs9dFg")),
+            (
+                "sendgrid-key",
+                fake(
+                    "SG.",
+                    "x7Kq2mNp8vRt4wLs9dFg1h.Jk3nBc5yZa0eQu6iOp2rSt4uVw7xYz1a",
+                ),
+            ),
+            (
+                "npm-token",
+                fake("npm_", "x7Kq2mNp8vRt4wLs9dFg1hJk3nBc5yZa0eQu"),
+            ),
+            (
+                "slack-app-token",
+                fake("xapp-", "1-A012BCDEF-1234567890-abcdef0123456789"),
+            ),
+            (
+                "slack-webhook",
+                fake(
+                    "https://hooks.slack.com/",
+                    "services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
+                ),
+            ),
+            ("stripe-key", fake("sk_", "live_x7Kq2mNp8vRt4wLs9dFg1hJk")),
+            (
+                "huggingface-token",
+                fake("hf_", "x7Kq2mNp8vRt4wLs9dFg1hJk3nBc5yZa0e"),
+            ),
+        ];
+        for (kind, secret) in cases {
+            let input = format!("deploy uses {secret} for auth");
+            let (out, hits) = redact_secrets(&input);
+            assert!(
+                out.contains(&format!("[REDACTED:{kind}]")),
+                "{kind} not redacted in {input:?} -> {out:?}"
+            );
+            assert!(!out.contains(&secret), "{kind} survived verbatim: {out:?}");
+            assert!(total_hits(&hits) >= 1, "no hit recorded for {kind}");
+        }
+    }
+
+    /// Prose that merely starts the same way must survive, or every mention of
+    /// these vendors becomes unreadable.
+    #[test]
+    fn vendor_prefixes_do_not_eat_ordinary_prose() {
+        let cases = [
+            "the sk-ant- prefix marks an Anthropic key",
+            "AIza is the Google prefix",
+            "set npm_config_registry in .npmrc",
+            "read the docs at https://hooks.slack.com/services",
+            "sk-proj- keys replaced the legacy ones",
+        ];
+        for case in cases {
+            let (out, hits) = redact_secrets(case);
+            assert_eq!(out, case, "prose was redacted: {case}");
+            assert_eq!(total_hits(&hits), 0, "hits for prose: {case}");
+        }
+    }
+
+    /// The old rule allowlisted any value containing `(`, so a secret with a
+    /// stray paren was kept verbatim.
+    #[test]
+    fn only_whole_function_calls_are_allowlisted() {
+        let (out, _) = redact_secrets("api_key=secret(x9Kq2mNp8vRt4wLs");
+        assert!(out.contains("[REDACTED:keyed-secret]"), "{out}");
+
+        for kept in ["token = get_token()", "api_key=cfg.read()"] {
+            let (out, hits) = redact_secrets(kept);
+            assert_eq!(out, kept, "a real function call was redacted");
+            assert_eq!(total_hits(&hits), 0);
+        }
+    }
+
+    #[test]
+    fn scrub_reports_and_rewrites_in_place() {
+        let secret = fake("sk-ant-", "api03-x7Kq2mNp8vRt4wLs9dFg1hJk3nBc5yZa");
+        let mut s = format!("ship with {secret}");
+        assert_eq!(scrub(&mut s), 1);
+        assert!(!s.contains(&secret), "{s}");
+
+        let mut clean = "nothing to see".to_string();
+        assert_eq!(scrub(&mut clean), 0);
+        assert_eq!(clean, "nothing to see");
     }
 
     #[test]

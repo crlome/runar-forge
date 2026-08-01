@@ -121,6 +121,13 @@ impl MemoryLibrarian {
                 secret_hits += n;
             }
         }
+        // The topic key is caller-supplied on the MCP save path and is stored
+        // and returned verbatim, so a secret pasted into it outlived the
+        // scrubbing of every other field. Only the *derived* key was clean,
+        // because that one is built from an already-redacted title.
+        if let Some(ref mut key) = input.topic_key {
+            secret_hits += crate::redact::scrub(key);
+        }
         if secret_hits > 0 && !input.tags.iter().any(|t| t == "redacted:secret") {
             input.tags.push("redacted:secret".to_string());
         }
@@ -219,6 +226,14 @@ impl MemoryLibrarian {
     // ── Sessions ───────────────────────────────────────────────
 
     pub async fn propose_session(&self, input: SessionInput) -> StorageResult<Session> {
+        // Straight to storage, so it scrubs here. The goal is model- or
+        // caller-supplied free text — "set up deploys with sk-ant-…" is an
+        // ordinary thing to write — and it is persisted on the session row and
+        // replayed into the next session's context packet.
+        let mut input = input;
+        if let Some(ref mut goal) = input.goal {
+            crate::redact::scrub(goal);
+        }
         let ns = self.ns(input.project_id.as_deref()).to_string();
         self.storage.create_session(input, &ns).await
     }
@@ -308,15 +323,22 @@ impl MemoryLibrarian {
         } else {
             "session-end"
         };
+        // `pid` reaches both the title and a tag, and a project id is just a
+        // caller-supplied string. The summary body is already scrubbed above;
+        // these two were not, because this path never goes through `propose`.
+        let mut title = format!("Session summary — {pid}");
+        let mut pid_tag = pid.to_string();
+        crate::redact::scrub(&mut title);
+        crate::redact::scrub(&mut pid_tag);
         let _ = self
             .storage
             .save(
                 MemoryEntryInput {
-                    title: format!("Session summary — {pid}"),
+                    title,
                     content,
                     entry_type: EntryType::Session,
                     source: Some(MemorySource::System),
-                    tags: vec!["session-summary".into(), tag.into(), pid.into()],
+                    tags: vec!["session-summary".into(), tag.into(), pid_tag],
                     project_id: project_id.map(|s| s.to_string()),
                     ..Default::default()
                 },
@@ -2638,5 +2660,117 @@ Here's a summary of what we did.\n\
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    /// A representative bare credential, assembled at runtime: written as a
+    /// literal it is a well-formed key to any secret scanner, and GitHub push
+    /// protection rejects the push. The regex sees the joined string either
+    /// way.
+    fn leak() -> String {
+        format!("{}{}", "sk-ant-", "api03-x7Kq2mNp8vRt4wLs9dFg1hJk3nBc5yZa")
+    }
+
+    /// A caller-supplied topic key reached storage verbatim: `propose` scrubbed
+    /// the title, content and tags but never the key, and the key is stored,
+    /// FTS-adjacent and echoed back in the save response.
+    #[tokio::test]
+    async fn a_secret_in_a_caller_supplied_topic_key_is_scrubbed() {
+        let leak = leak();
+        let lib = test_librarian().await;
+        lib.propose(MemoryEntryInput {
+            title: "deploy notes".into(),
+            content: "body".into(),
+            topic_key: Some(format!("auth:{leak}")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let all = lib
+            .list(ListFilters {
+                limit: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let key = all[0].topic_key.clone().expect("topic key was stored");
+        assert!(!key.contains(&leak), "secret survived in topic key: {key}");
+        assert!(key.contains("[REDACTED:anthropic-key]"), "{key}");
+    }
+
+    /// The session goal went straight to `storage.create_session` unscrubbed,
+    /// and it is replayed into the next session's context packet.
+    #[tokio::test]
+    async fn a_secret_in_a_session_goal_is_scrubbed() {
+        let leak = leak();
+        let lib = test_librarian().await;
+        lib.propose_session(SessionInput {
+            goal: Some(format!("wire up deploys with {leak}")),
+            project_id: Some("p".into()),
+            tool: None,
+        })
+        .await
+        .unwrap();
+
+        let session = lib
+            .get_active_session(Some("p"))
+            .await
+            .unwrap()
+            .expect("session exists");
+        let goal = session.goal.expect("goal stored");
+        assert!(!goal.contains(&leak), "secret survived in goal: {goal}");
+        assert!(goal.contains("[REDACTED:anthropic-key]"), "{goal}");
+    }
+
+    /// The session-summary entry bypasses `propose` entirely, so its title and
+    /// tags — both built from the caller-supplied project id — were never
+    /// scrubbed even though the summary body was.
+    #[tokio::test]
+    async fn a_secret_in_the_session_summary_title_is_scrubbed() {
+        let leak = leak();
+        let lib = test_librarian().await;
+        let session = lib
+            .propose_session(SessionInput {
+                goal: None,
+                project_id: Some(format!("proj-{leak}")),
+                tool: None,
+            })
+            .await
+            .unwrap();
+        lib.end_session(
+            session.id,
+            SessionSummary {
+                summary: "done".into(),
+                ..Default::default()
+            },
+            Some(&format!("proj-{leak}")),
+        )
+        .await
+        .unwrap();
+
+        // Project entries live in namespace == project_id, so the read has to
+        // name it or it looks at the default namespace and finds nothing.
+        let entries = lib
+            .list(ListFilters {
+                project_id: Some(format!("proj-{leak}")),
+                limit: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let summary = entries
+            .iter()
+            .find(|e| e.entry_type == EntryType::Session)
+            .expect("session summary entry");
+        assert!(
+            !summary.title.contains(&leak),
+            "secret survived in title: {}",
+            summary.title
+        );
+        assert!(
+            !summary.tags.iter().any(|t| t.contains(&leak)),
+            "secret survived in tags: {:?}",
+            summary.tags
+        );
     }
 }
