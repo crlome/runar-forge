@@ -678,8 +678,66 @@ fn resolve_import(source: &str, from: &str, project_root: &Path) -> Option<Strin
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
             resolve_relative_module(source, Path::new(from), project_root)
         }
-        Lang::Python | Lang::Go => None,
+        Lang::Python => resolve_python_module(source, Path::new(from), project_root),
+        // A Go import path is rooted at the module path in `go.mod`, not at any
+        // directory the scanner knows, so it needs that file read before it can
+        // name a project file. Left unresolved rather than guessed.
+        Lang::Go => None,
     }
+}
+
+/// `a.b` and `.sibling` resolved to the file that holds the named module.
+///
+/// A leading dot counts one package level: `.x` is beside the importing file
+/// and `..x` is one directory up, matching the language. An absolute path is
+/// tried from the project root and from the importing file's own package, since
+/// a project may or may not put its packages under a `src`-style directory.
+fn resolve_python_module(source: &str, from: &Path, project_root: &Path) -> Option<String> {
+    let from_abs = project_root.join(from);
+    let from_dir = from_abs.parent()?;
+
+    let dots = source.chars().take_while(|c| *c == '.').count();
+    let rest: Vec<&str> = source[dots..]
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if dots > 0 {
+        // `from . import x` is the importing file's own package; each extra dot
+        // climbs one more.
+        let mut dir = from_dir.to_path_buf();
+        for _ in 1..dots {
+            dir = dir.parent()?.to_path_buf();
+        }
+        bases.push(dir);
+    } else {
+        bases.push(project_root.to_path_buf());
+        bases.push(from_dir.to_path_buf());
+    }
+
+    for base in bases {
+        let mut dir = base;
+        for seg in rest.iter().take(rest.len().saturating_sub(1)) {
+            dir.push(seg);
+        }
+        // The last segment may name the module or an item inside it, so both
+        // readings are tried before giving up.
+        let candidates = match rest.last() {
+            Some(last) => vec![
+                dir.join(format!("{last}.py")),
+                dir.join(last).join("__init__.py"),
+                dir.join("__init__.py"),
+            ],
+            None => vec![dir.join("__init__.py")],
+        };
+        for candidate in candidates {
+            if candidate.is_file() {
+                return relativize(&candidate, project_root);
+            }
+        }
+    }
+    None
 }
 
 /// `crate::a::b::C`, `super::x` and `self::x` resolved to the file that holds
@@ -1694,6 +1752,106 @@ mod tests {
             format!("{}:helper", native("src/b.rs"))
         );
         assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    #[test]
+    fn a_python_package_import_resolves_to_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "app/main.py");
+        touch(root, "a/b.py");
+
+        let main = native("app/main.py");
+        let files = vec![
+            FileFacts {
+                path: main.clone(),
+                extract: FileExtract {
+                    symbols: vec![func("run")],
+                    calls: vec![call(&format!("{main}:run"), "helper", None)],
+                    imports: vec![RawImport {
+                        local_name: "helper".to_string(),
+                        source: "a.b".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            },
+            facts(&native("a/b.py"), vec![func("helper")], vec![]),
+            // A second `helper` makes the unique-name tier ambiguous, so an
+            // edge can only have come from the import map.
+            facts(&native("app/other.py"), vec![func("helper")], vec![]),
+        ];
+
+        let out = resolve(&files, root);
+        assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
+        assert_eq!(
+            out.edges[0].target_qualified,
+            format!("{}:helper", native("a/b.py"))
+        );
+        assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    /// `from . import x` means the importing file's own package, not the top of
+    /// the project — the distinction the leading dot exists to make.
+    #[test]
+    fn a_relative_python_import_is_resolved_beside_the_importing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "pkg/main.py");
+        touch(root, "pkg/sibling.py");
+        // A same-named module at the project root must not win.
+        touch(root, "sibling.py");
+
+        let main = native("pkg/main.py");
+        let files = vec![
+            FileFacts {
+                path: main.clone(),
+                extract: FileExtract {
+                    symbols: vec![func("run")],
+                    calls: vec![call(&format!("{main}:run"), "go", None)],
+                    imports: vec![RawImport {
+                        local_name: "go".to_string(),
+                        source: ".sibling".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            },
+            facts(&native("pkg/sibling.py"), vec![func("go")], vec![]),
+            facts(&native("sibling.py"), vec![func("go")], vec![]),
+        ];
+
+        let out = resolve(&files, root);
+        assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
+        assert_eq!(
+            out.edges[0].target_qualified,
+            format!("{}:go", native("pkg/sibling.py")),
+            "the relative import reached outside its own package"
+        );
+    }
+
+    /// A third-party import names no project file, and must not be pinned to a
+    /// same-named local module.
+    #[test]
+    fn a_third_party_python_import_stays_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "app/main.py");
+
+        let main = native("app/main.py");
+        let files = vec![FileFacts {
+            path: main.clone(),
+            extract: FileExtract {
+                symbols: vec![func("run")],
+                calls: vec![call(&format!("{main}:run"), "loads", None)],
+                imports: vec![RawImport {
+                    local_name: "loads".to_string(),
+                    source: "json".to_string(),
+                }],
+                ..Default::default()
+            },
+        }];
+
+        let out = resolve(&files, root);
+        assert!(out.edges.is_empty(), "got {:?}", out.edges);
     }
 
     /// A binary, an example or an integration test reaches its own library by
