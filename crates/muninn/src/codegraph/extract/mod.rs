@@ -5,6 +5,7 @@
 //! and everything below consumes them uniformly.
 
 mod spec_go;
+mod spec_py;
 mod spec_rust;
 mod spec_ts;
 
@@ -62,9 +63,7 @@ pub fn spec_for(lang: Lang) -> &'static LangSpec {
         Lang::Rust => spec_rust::SPEC,
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => spec_ts::spec_for(lang),
         Lang::Go => spec_go::SPEC,
-        // Python lands in the next slice; until then it is recorded as an
-        // explicit coverage gap rather than silently producing nothing.
-        Lang::Python => spec_ts::spec_for(Lang::TypeScript),
+        Lang::Python => spec_py::SPEC,
     }
 }
 
@@ -73,7 +72,7 @@ pub fn spec_for(lang: Lang) -> &'static LangSpec {
 pub fn is_supported(lang: Lang) -> bool {
     matches!(
         lang,
-        Lang::Rust | Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Go
+        Lang::Rust | Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Go | Lang::Python
     )
 }
 
@@ -544,9 +543,14 @@ mod tests {
             Lang::Python,
             Lang::Go,
         ];
+        // Every language in the list is supported today, so any dropping out
+        // of `is_supported` is a decision to stop extracting from it and must
+        // be made deliberately rather than by editing a match arm. A `>=`
+        // threshold does not catch that: removing one still clears it.
+        let unsupported: Vec<_> = all.iter().copied().filter(|l| !is_supported(*l)).collect();
         assert!(
-            all.iter().copied().filter(|l| is_supported(*l)).count() >= 5,
-            "a supported language dropped out of the compilation check"
+            unsupported.is_empty(),
+            "language(s) dropped out of extraction: {unsupported:?}"
         );
         for lang in all.into_iter().filter(|l| is_supported(*l)) {
             let spec = spec_for(lang);
