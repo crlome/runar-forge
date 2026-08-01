@@ -243,6 +243,10 @@ pub enum Resolution {
     UniqueName,
     /// A qualified call whose method name exists on exactly one container.
     Suffix,
+    /// The name is declared on one trait and otherwise defined only by types
+    /// that implement it, so every candidate is the same method and the trait
+    /// declaration is its identity.
+    TraitMethod,
 }
 
 impl Resolution {
@@ -252,6 +256,11 @@ impl Resolution {
             Resolution::SameModule => 0.90,
             Resolution::UniqueName => 0.75,
             Resolution::Suffix => 0.55,
+            // Stronger than the suffix tier, which picks one of several
+            // genuinely different methods, and weaker than a unique name, which
+            // has no rival definition at all. Here the rivals exist but are
+            // provably the same method under a different impl.
+            Resolution::TraitMethod => 0.70,
         }
     }
 
@@ -261,6 +270,7 @@ impl Resolution {
             Resolution::SameModule => "same_module",
             Resolution::UniqueName => "unique_name",
             Resolution::Suffix => "suffix",
+            Resolution::TraitMethod => "trait_method",
         }
     }
 }

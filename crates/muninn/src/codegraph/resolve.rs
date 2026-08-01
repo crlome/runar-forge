@@ -112,6 +112,10 @@ struct Index<'a> {
     imports: HashMap<&'a str, HashMap<&'a str, String>>,
     /// Names of types that can own methods, for the suffix tier.
     containers: HashSet<&'a str>,
+    /// Trait name -> the type names that implement it, from the `Implements`
+    /// relations the extractor already records. Names rather than resolved
+    /// paths, because that is what a container is spelled as.
+    implementors: HashMap<&'a str, HashSet<&'a str>>,
     project_root: PathBuf,
 }
 
@@ -128,6 +132,7 @@ impl<'a> Index<'a> {
         let mut defs_by_name: HashMap<&str, Vec<(&FileFacts, &RawSymbol)>> = HashMap::new();
         let mut defs_by_file: HashMap<&str, Vec<&RawSymbol>> = HashMap::new();
         let mut containers: HashSet<&str> = HashSet::new();
+        let mut implementors: HashMap<&str, HashSet<&str>> = HashMap::new();
         let mut imports: HashMap<&str, HashMap<&str, String>> = HashMap::new();
         let mut seen: HashMap<ImportKey, Option<String>> = HashMap::new();
 
@@ -143,6 +148,15 @@ impl<'a> Index<'a> {
                     .push(sym);
                 if sym.label.is_container() {
                     containers.insert(sym.name.as_str());
+                }
+            }
+
+            for rel in &file.extract.relations {
+                if rel.kind == EdgeKind::Implements {
+                    implementors
+                        .entry(rel.subject.as_str())
+                        .or_default()
+                        .insert(rel.object.as_str());
                 }
             }
 
@@ -169,6 +183,7 @@ impl<'a> Index<'a> {
             defs_by_file,
             imports,
             containers,
+            implementors,
         }
     }
 
@@ -367,22 +382,80 @@ impl<'a> Index<'a> {
                     .get(from.path.as_str())
                     .is_some_and(|defs| defs.iter().any(|s| s.name == owner))
         };
-        let (file, sym) = only(
-            self.defs_by_name
-                .get(name)?
+        let candidates: Vec<_> = self
+            .defs_by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|(_, s)| {
+                is_callable(s)
+                    && s.container
+                        .as_deref()
+                        .is_some_and(|owner| self.containers.contains(owner) && visible(owner))
+            })
+            .collect();
+
+        if let Some((file, sym)) = only(candidates.iter().copied()) {
+            return Some((
+                qualified_name(&file.path, sym.container.as_deref(), &sym.name),
+                Resolution::Suffix,
+            ));
+        }
+        self.collapse_to_trait(&candidates)
+    }
+
+    /// Several candidates that are all the *same* method.
+    ///
+    /// A trait method is declared once and defined again by every implementor,
+    /// so a call through `dyn Trait` looks ambiguous to a tier that only counts
+    /// definitions — which is why these were dropped. They are not ambiguous:
+    /// the declaration is the method's identity and the implementations are
+    /// reachable from it through the `Implements` edges.
+    ///
+    /// Every other candidate must implement the trait, not merely coexist with
+    /// it. A wrapper that delegates — `MemoryLibrarian::update_session` calling
+    /// `MemoryStorage::update_session` — declares a genuinely different method
+    /// that happens to share the name, and a call on the wrapper means the
+    /// wrapper. Requiring the relation keeps those honestly unresolved instead
+    /// of silently picking the trait.
+    fn collapse_to_trait(
+        &self,
+        candidates: &[(&'a FileFacts, &'a RawSymbol)],
+    ) -> Option<(String, Resolution)> {
+        let declared = only(
+            candidates
                 .iter()
-                .copied()
-                .filter(|(_, s)| {
-                    is_callable(s)
-                        && s.container
-                            .as_deref()
-                            .is_some_and(|owner| self.containers.contains(owner) && visible(owner))
-                }),
+                .filter(|(_, s)| s.container.as_deref().is_some_and(|c| self.is_trait(c))),
         )?;
+        let trait_name = declared.1.container.as_deref()?;
+        let impls = self.implementors.get(trait_name)?;
+
+        let all_implement = candidates.iter().all(|(_, s)| {
+            let Some(owner) = s.container.as_deref() else {
+                return false;
+            };
+            owner == trait_name || impls.contains(owner)
+        });
+        if !all_implement {
+            return None;
+        }
         Some((
-            qualified_name(&file.path, sym.container.as_deref(), &sym.name),
-            Resolution::Suffix,
+            qualified_name(
+                &declared.0.path,
+                declared.1.container.as_deref(),
+                &declared.1.name,
+            ),
+            Resolution::TraitMethod,
         ))
+    }
+
+    /// Whether a container name belongs to a trait, which is what makes one
+    /// candidate a declaration and the rest implementations of it.
+    fn is_trait(&self, name: &str) -> bool {
+        self.defs_by_name.get(name).is_some_and(|defs| {
+            defs.iter()
+                .any(|(_, s)| matches!(s.label, SymbolLabel::Trait | SymbolLabel::Interface))
+        })
     }
 
     /// The tier chain, first match wins, over the symbols `keep` admits.
@@ -995,6 +1068,108 @@ mod tests {
     /// The Method half is the control: it proves the shape resolves at all, so
     /// the Field half is failing for the intended reason and not because the
     /// fixture never reached the suffix tier.
+    /// A call through `dyn Trait` looks ambiguous to a tier that counts
+    /// definitions — the trait declares the method and every implementor
+    /// defines it again — but all the candidates are the same method, and the
+    /// declaration is its identity.
+    #[test]
+    fn a_trait_method_collapses_to_its_declaration() {
+        let files = vec![facts(
+            "a.rs",
+            vec![
+                func("caller"),
+                sym("Store", SymbolLabel::Trait, None),
+                sym("save", SymbolLabel::Method, Some("Store")),
+                sym("Sqlite", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Sqlite")),
+                sym("Postgres", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Postgres")),
+            ],
+            vec![call("a.rs:caller", "save", Some("backend"))],
+        )];
+        let mut files = files;
+        files[0].extract.relations = vec![
+            RawRelation {
+                subject: "Store".into(),
+                object: "Sqlite".into(),
+                kind: EdgeKind::Implements,
+            },
+            RawRelation {
+                subject: "Store".into(),
+                object: "Postgres".into(),
+                kind: EdgeKind::Implements,
+            },
+        ];
+
+        let out = resolve(&files, nowhere());
+        let calls: Vec<_> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].target_qualified, "a.rs:Store.save");
+        assert_eq!(calls[0].resolution, Some(Resolution::TraitMethod));
+    }
+
+    /// The guard that keeps the rule honest. A wrapper that delegates to a
+    /// trait declares a genuinely different method that happens to share the
+    /// name, so a call could mean either and neither is evidence.
+    #[test]
+    fn a_wrapper_sharing_the_name_keeps_the_call_unresolved() {
+        let mut files = vec![facts(
+            "a.rs",
+            vec![
+                func("caller"),
+                sym("Store", SymbolLabel::Trait, None),
+                sym("save", SymbolLabel::Method, Some("Store")),
+                sym("Sqlite", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Sqlite")),
+                // Delegates to the trait; does not implement it.
+                sym("Librarian", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Librarian")),
+            ],
+            vec![call("a.rs:caller", "save", Some("thing"))],
+        )];
+        files[0].extract.relations = vec![RawRelation {
+            subject: "Store".into(),
+            object: "Sqlite".into(),
+            kind: EdgeKind::Implements,
+        }];
+
+        let out = resolve(&files, nowhere());
+        let calls: Vec<_> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert!(calls.is_empty(), "a wrapper call was guessed: {calls:?}");
+    }
+
+    /// Sharing a name with a trait is not enough on its own: without the
+    /// implements relation these are two unrelated methods.
+    #[test]
+    fn an_unrelated_type_is_not_collapsed_into_a_trait() {
+        let files = vec![facts(
+            "a.rs",
+            vec![
+                func("caller"),
+                sym("Render", SymbolLabel::Trait, None),
+                sym("render", SymbolLabel::Method, Some("Render")),
+                sym("Report", SymbolLabel::Struct, None),
+                sym("render", SymbolLabel::Method, Some("Report")),
+            ],
+            vec![call("a.rs:caller", "render", Some("doc"))],
+        )];
+        let out = resolve(&files, nowhere());
+        let calls: Vec<_> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert!(calls.is_empty(), "collapsed without evidence: {calls:?}");
+    }
+
     #[test]
     fn a_field_is_never_a_call_target() {
         let build = |label: SymbolLabel| {
