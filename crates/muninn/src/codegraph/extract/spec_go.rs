@@ -92,6 +92,8 @@ const DEFS: &str = r#"
   name: (field_identifier) @def.function
   parameters: (parameter_list) @def.params)
 
+(field_declaration name: (field_identifier) @def.field)
+
 (type_spec
   name: (type_identifier) @def.struct
   type: (struct_type))
@@ -378,6 +380,31 @@ func helper(n int) int {
             !out.calls.iter().any(|c| c.callee == "Map"),
             "ambiguous conversion syntax was recorded as a call: {:?}",
             out.calls
+        );
+    }
+
+    #[test]
+    fn struct_fields_are_labelled_and_take_their_type_as_container() {
+        let out = extracted();
+        let port = out
+            .symbols
+            .iter()
+            .find(|s| s.name == "port")
+            .expect("field port");
+        assert_eq!(port.label, SymbolLabel::Field);
+        assert_eq!(port.container.as_deref(), Some("Server"));
+    }
+
+    /// An embedded field has no name, so it produces a relation and never a
+    /// Field symbol — the two queries must not both claim it.
+    #[test]
+    fn an_embedded_field_is_not_a_field_symbol() {
+        let out = extracted();
+        assert!(
+            !out.symbols
+                .iter()
+                .any(|s| s.name == "Base" && s.label == SymbolLabel::Field),
+            "embedding was also recorded as a field"
         );
     }
 

@@ -17,7 +17,9 @@ pub static SPEC: &LangSpec = &LangSpec {
     // `mod_item` is deliberately absent: it introduces a namespace, not a
     // receiver, and the walker turns every function with a container into a
     // Method.
-    container_kinds: &["impl_item", "trait_item"],
+    // `struct_item` and `union_item` are here only so a field takes its owning
+    // type as container; they hold no functions, so nothing else is affected.
+    container_kinds: &["impl_item", "trait_item", "struct_item", "union_item"],
     // `impl_item` has no `name`; its own identity is the implementing type, so
     // `type` is tried first and `trait_item` falls through to `name`.
     container_name_fields: &["type", "name"],
@@ -54,6 +56,8 @@ const DEFS: &str = r#"
 (enum_item name: (type_identifier) @def.enum)
 (trait_item name: (type_identifier) @def.trait)
 (type_item name: (type_identifier) @def.type)
+(field_declaration name: (field_identifier) @def.field)
+
 (const_item name: (identifier) @def.const)
 (static_item name: (identifier) @def.const)
 (mod_item name: (identifier) @def.module)
@@ -308,6 +312,28 @@ fn helper(n: u32) -> u32 {
     fn inherent_impl_yields_no_relation() {
         let out = extract_file("struct Foo; impl Foo { fn a(&self) {} }", Lang::Rust, PATH);
         assert!(out.relations.is_empty());
+    }
+
+    #[test]
+    fn struct_fields_are_labelled_and_take_their_type_as_container() {
+        let out = extracted();
+        let n = out.symbols.iter().find(|s| s.name == "n").expect("field n");
+        assert_eq!(n.label, SymbolLabel::Field);
+        assert_eq!(n.container.as_deref(), Some("Foo"));
+    }
+
+    /// `struct_item` joined `container_kinds` only so a field knows its type.
+    /// If that also started renaming the struct itself, every qualified name
+    /// for `Foo` would become `Foo.Foo` and nothing would resolve.
+    #[test]
+    fn adding_struct_as_a_container_does_not_rename_the_struct() {
+        let out = extracted();
+        let foo = out
+            .symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.label == SymbolLabel::Struct)
+            .expect("Foo");
+        assert!(foo.container.is_none(), "{:?}", foo.container);
     }
 
     #[test]

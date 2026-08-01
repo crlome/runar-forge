@@ -94,6 +94,12 @@ const DEFS_TS: &str = concat!(
       parameters: (formal_parameters) @def.params
       body: (_) @def.body)
   ])
+
+(public_field_definition
+  name: [(property_identifier) (private_property_identifier)] @def.field)
+
+(property_signature
+  name: [(property_identifier) (private_property_identifier)] @def.field)
 "#
 );
 
@@ -487,5 +493,42 @@ export class Widget extends Base {
     fn a_non_require_call_is_not_read_as_an_import() {
         let ex = extract_file("const conf = load('./m');\n", Lang::JavaScript, "f.js");
         assert!(ex.imports.is_empty(), "{:?}", ex.imports);
+    }
+
+    /// A class field bound to an arrow function matches the callable pattern
+    /// *and* the field pattern. Both produce the same qualified name, so the
+    /// dedup has to keep the callable one — it is the reading that carries a
+    /// body, parameters and metrics, and the one a call resolves against.
+    #[test]
+    fn a_field_holding_an_arrow_function_stays_callable() {
+        let ex = extract_file(
+            "class Widget {\n  count = 0;\n  handle = (e: Event) => { return e; };\n}\n",
+            Lang::TypeScript,
+            "w.ts",
+        );
+        let handle: Vec<_> = ex.symbols.iter().filter(|s| s.name == "handle").collect();
+        assert_eq!(handle.len(), 1, "duplicate symbol: {handle:?}");
+        assert_eq!(handle[0].label, SymbolLabel::Method);
+        assert_eq!(handle[0].container.as_deref(), Some("Widget"));
+
+        let count = ex
+            .symbols
+            .iter()
+            .find(|s| s.name == "count")
+            .expect("plain field");
+        assert_eq!(count.label, SymbolLabel::Field);
+        assert_eq!(count.container.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn interface_members_are_fields() {
+        let ex = extract_file(
+            "interface Shape {\n  area: number;\n}\n",
+            Lang::TypeScript,
+            "s.ts",
+        );
+        let area = ex.symbols.iter().find(|s| s.name == "area").expect("area");
+        assert_eq!(area.label, SymbolLabel::Field);
+        assert_eq!(area.container.as_deref(), Some("Shape"));
     }
 }

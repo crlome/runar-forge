@@ -438,8 +438,17 @@ impl<'a> Index<'a> {
 /// Modules cannot be called and constants are not call targets, yet both share
 /// their names with extremely common methods (`push`, `write`, `len`), so
 /// leaving them in the candidate set makes the weak tiers manufacture edges.
+///
+/// Fields are the same case and a worse one: `self.handler`, `s.write`,
+/// `c.next` are ordinary field names, and a struct has far more fields than
+/// methods, so admitting them would give the unique-name and suffix tiers a
+/// large pool of plausible wrong answers. A call through a field reaches
+/// whatever the field holds, which the graph does not know.
 fn is_callable(sym: &RawSymbol) -> bool {
-    !matches!(sym.label, SymbolLabel::Module | SymbolLabel::Const)
+    !matches!(
+        sym.label,
+        SymbolLabel::Module | SymbolLabel::Const | SymbolLabel::Field
+    )
 }
 
 /// Methods that the standard library puts on nearly every type.
@@ -881,6 +890,45 @@ mod tests {
         assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
         assert_eq!(out.edges[0].target_qualified, format!("{idx}:run_index"));
         assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    /// Fields share names with methods constantly (`write`, `next`, `handler`)
+    /// and a project has far more of them than methods, so admitting them to
+    /// the candidate set hands the weak tiers a large pool of wrong answers.
+    /// A call through a field reaches whatever the field holds, which the
+    /// graph cannot see, so the honest result is no edge.
+    ///
+    /// The Method half is the control: it proves the shape resolves at all, so
+    /// the Field half is failing for the intended reason and not because the
+    /// fixture never reached the suffix tier.
+    #[test]
+    fn a_field_is_never_a_call_target() {
+        let build = |label: SymbolLabel| {
+            vec![facts(
+                "a.rs",
+                vec![
+                    func("caller"),
+                    sym("Widget", SymbolLabel::Struct, None),
+                    sym("handler", label, Some("Widget")),
+                ],
+                vec![call("a.rs:caller", "handler", Some("w"))],
+            )]
+        };
+
+        let control = resolve(&build(SymbolLabel::Method), nowhere());
+        assert_eq!(
+            control.edges.len(),
+            1,
+            "control: a method on a visible type should resolve"
+        );
+
+        let out = resolve(&build(SymbolLabel::Field), nowhere());
+        assert!(
+            out.edges.is_empty(),
+            "a call resolved to a field: {:?}",
+            out.edges
+        );
+        assert_eq!(out.unresolved.get("a.rs"), Some(&1));
     }
 
     #[test]
