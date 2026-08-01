@@ -555,6 +555,9 @@ fn resolve_rust_module(source: &str, from: &Path, project_root: &Path) -> Option
         .collect();
     let first = *segments.first()?;
 
+    // Whether the path is known to be first-party, which is what licenses the
+    // fallback to the module's own file below.
+    let mut self_named = false;
     let (base, rest) = match first {
         "crate" => (crate_src_root(&from_abs, project_root)?, &segments[1..]),
         // The file's own directory, not `<stem>/`: a name written `self::x` is
@@ -573,6 +576,16 @@ fn resolve_rust_module(source: &str, from: &Path, project_root: &Path) -> Option
             }
             (dir, &segments[levels..])
         }
+        // A crate naming *itself*. A binary, an example or an integration test
+        // reaches its own library through the package name rather than
+        // `crate::` — `use runar_muninn::hooks_runtime` — and without this the
+        // entire library looks external from those files, so every call they
+        // make into it resolves to nothing. That is not an edge case here:
+        // `main.rs` is the largest file in this project.
+        _ if crate_lib_name(&from_abs, project_root).as_deref() == Some(first) => {
+            self_named = true;
+            (crate_src_root(&from_abs, project_root)?, &segments[1..])
+        }
         // Either a 2015-edition path rooted at the crate, or another crate.
         // Only the first can name a file here, and an unmatched one stays
         // unresolved rather than being pinned to a same-named local module.
@@ -588,10 +601,13 @@ fn resolve_rust_module(source: &str, from: &Path, project_root: &Path) -> Option
         }
     }
 
-    // Only a keyword-rooted path is known to be first-party, so only it may
-    // fall back to the module's own file (an item declared in an inline `mod`,
-    // or in `lib.rs`/`mod.rs` directly).
-    if matches!(first, "crate" | "super" | "self") {
+    // Only a path known to be first-party may fall back to the module's own
+    // file (an item declared in an inline `mod`, or in `lib.rs`/`mod.rs`
+    // directly). For `use <own_crate>::{a, b}` that fallback is the whole
+    // point: the source is the crate name alone, so there are no segments left
+    // to name a file with, and the answer is the crate root — from which the
+    // caller's `module_candidates` finds `a.rs` beside it.
+    if self_named || matches!(first, "crate" | "super" | "self") {
         for candidate in module_file_candidates(&base) {
             if candidate.is_file() {
                 return relativize(&candidate, project_root);
@@ -648,6 +664,84 @@ fn is_module_root_file(path: &Path) -> bool {
 /// The `src/` of the nearest enclosing Cargo package, which is what `crate::`
 /// is rooted at in a workspace. The walk stops at the project root so a
 /// `Cargo.toml` above the crawl can never pull paths outside it.
+/// The library name of the crate owning `from_abs`, as another file inside the
+/// same crate would spell it in a `use`.
+///
+/// Cargo derives it from `[lib] name` when present and otherwise from the
+/// package name with dashes turned into underscores, so `runar-muninn` is
+/// imported as `runar_muninn`. Read rather than guessed: inferring "an unknown
+/// first segment might be this crate" would bind `tokio::fs` to a project
+/// `src/fs.rs`.
+///
+/// Memoized on the manifest directory — this is consulted once per distinct
+/// import path per directory, and a workspace crawl has many of both.
+fn crate_lib_name(from_abs: &Path, project_root: &Path) -> Option<String> {
+    use std::sync::{LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, Option<String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let manifest_dir = {
+        let mut dir = from_abs.parent();
+        loop {
+            let d = dir?;
+            if d.join("Cargo.toml").is_file() {
+                break d.to_path_buf();
+            }
+            if d == project_root {
+                return None;
+            }
+            dir = d.parent();
+        }
+    };
+
+    if let Ok(cache) = CACHE.lock() {
+        if let Some(hit) = cache.get(&manifest_dir) {
+            return hit.clone();
+        }
+    }
+
+    let name = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|toml| lib_name_from_manifest(&toml));
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(manifest_dir, name.clone());
+    }
+    name
+}
+
+/// `[lib] name` wins over `[package] name`; dashes become underscores.
+///
+/// Parsed by hand rather than with a TOML crate: only two keys matter, and the
+/// section a key sits in is the whole of the logic.
+fn lib_name_from_manifest(toml: &str) -> Option<String> {
+    let mut section = "";
+    let mut package: Option<String> = None;
+    let mut lib: Option<String> = None;
+    for line in toml.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            section = line.trim_matches(['[', ']']);
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            continue;
+        }
+        match section {
+            "package" => package = Some(value.to_string()),
+            "lib" => lib = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    lib.or(package).map(|n| n.replace('-', "_"))
+}
+
 fn crate_src_root(from_abs: &Path, project_root: &Path) -> Option<PathBuf> {
     let mut dir = from_abs.parent();
     while let Some(d) = dir {
@@ -1235,6 +1329,113 @@ mod tests {
             format!("{}:helper", native("src/b.rs"))
         );
         assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    /// A binary, an example or an integration test reaches its own library by
+    /// the package name rather than `crate::`, and until that was recognised
+    /// the whole library looked external from those files — so every call they
+    /// made into it resolved to nothing. `main.rs` is usually the largest file
+    /// in a crate, which is what made this worth chasing.
+    #[test]
+    fn a_crate_importing_itself_by_package_name_resolves_like_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"my-tool\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        touch(root, "src/lib.rs");
+        touch(root, "src/main.rs");
+        touch(root, "src/hooks.rs");
+
+        let main = native("src/main.rs");
+        let files = vec![
+            FileFacts {
+                path: main.clone(),
+                extract: FileExtract {
+                    symbols: vec![func("run")],
+                    // `hooks::append(..)` — module-qualified, the shape a binary
+                    // uses after `use my_tool::{hooks};`.
+                    calls: vec![call(&format!("{main}:run"), "append", Some("hooks"))],
+                    imports: vec![RawImport {
+                        local_name: "hooks".to_string(),
+                        // The dash in the package name becomes an underscore.
+                        source: "my_tool".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            },
+            facts(&native("src/hooks.rs"), vec![func("append")], vec![]),
+        ];
+
+        let out = resolve(&files, root);
+        assert_eq!(out.edges.len(), 1, "got {:?}", out.edges);
+        assert_eq!(
+            out.edges[0].target_qualified,
+            format!("{}:append", native("src/hooks.rs"))
+        );
+        assert_eq!(out.edges[0].resolution, Some(Resolution::ImportMap));
+    }
+
+    /// The dangerous half of the rule above. The crate name is read from the
+    /// manifest rather than inferred from "an unknown first segment", because
+    /// inferring it would bind any third-party module to a same-named project
+    /// file — here `tokio::fs` to `src/fs.rs`.
+    #[test]
+    fn another_crates_module_is_not_bound_to_a_same_named_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"my-tool\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        touch(root, "src/main.rs");
+        touch(root, "src/fs.rs");
+
+        let main = native("src/main.rs");
+        let files = vec![
+            FileFacts {
+                path: main.clone(),
+                extract: FileExtract {
+                    symbols: vec![func("run")],
+                    calls: vec![call(&format!("{main}:run"), "read", Some("fs"))],
+                    imports: vec![RawImport {
+                        local_name: "fs".to_string(),
+                        source: "tokio".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            },
+            facts(&native("src/fs.rs"), vec![func("read")], vec![]),
+        ];
+
+        let out = resolve(&files, root);
+        assert!(
+            out.edges.is_empty(),
+            "a third-party module was bound to a project file: {:?}",
+            out.edges
+        );
+    }
+
+    #[test]
+    fn lib_section_name_wins_over_the_package_name() {
+        assert_eq!(
+            lib_name_from_manifest("[package]\nname = \"my-tool\"\n[lib]\nname = \"mylib\"\n")
+                .as_deref(),
+            Some("mylib")
+        );
+        assert_eq!(
+            lib_name_from_manifest("[package]\nname = \"my-tool\"\n").as_deref(),
+            Some("my_tool"),
+            "dashes become underscores the way cargo does it"
+        );
+        assert_eq!(
+            lib_name_from_manifest("[dependencies]\nname = \"not-a-package\"\n"),
+            None,
+            "a name outside [package]/[lib] is some dependency's key"
+        );
     }
 
     /// Two files in one directory writing the same `use` must not share an
