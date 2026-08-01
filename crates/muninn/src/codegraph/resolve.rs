@@ -205,6 +205,31 @@ impl<'a> Index<'a> {
             return self.member_of(Some(&from.path), owner, callee, Resolution::SameModule);
         }
 
+        // `self.storage.save(..)` — the receiver is a field of the enclosing
+        // type, and a field's declared type is written down. Reading it is not
+        // inference, which is why this is allowed to decide where the name-only
+        // tiers are not.
+        if let Some(field) = qualifier
+            .strip_prefix("self.")
+            .or_else(|| qualifier.strip_prefix("this."))
+        {
+            // One level only. `self.a.b.c()` needs the type of `self.a.b`,
+            // which means resolving a member of a type this layer has not
+            // established, so it stays with the name-only chain. The lookup
+            // below would miss a dotted name anyway; this states the intent and
+            // saves the work.
+            if !field.contains('.') {
+                if let Some(owner) = caller
+                    .and_then(container_of_qualified)
+                    .and_then(|enclosing| self.field_type(enclosing, field))
+                {
+                    if let Some(hit) = self.member_of(None, &owner, callee, Resolution::FieldType) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+
         if qualifier.contains("::") || qualifier.starts_with('.') {
             if let Some(target) = resolve_import(qualifier, &from.path, &self.project_root) {
                 if let Some(sym) = self
@@ -322,10 +347,19 @@ impl<'a> Index<'a> {
         }
 
         let (file, sym) = only(candidates.iter().copied().filter(|(_, s)| owned(s)))?;
-        let _ = tier;
+        // A caller that named a file was hypothesising about where the member
+        // lives, and reaching here means the hypothesis was wrong, so the tier
+        // drops. A caller that named none had no hypothesis to be wrong about —
+        // it established the owner some other way, and searching the project
+        // for that owner's member is the plan rather than a fallback.
+        let tier = if prefer_file.is_some() {
+            Resolution::UniqueName
+        } else {
+            tier
+        };
         Some((
             qualified_name(&file.path, sym.container.as_deref(), &sym.name),
-            Resolution::UniqueName,
+            tier,
         ))
     }
 
@@ -447,6 +481,38 @@ impl<'a> Index<'a> {
             ),
             Resolution::TraitMethod,
         ))
+    }
+
+    /// The project type a field of `owner` is declared to hold.
+    ///
+    /// The declaration is already stored: a `Field` symbol's signature is its
+    /// source line, so `storage: Arc<dyn MemoryStorage>` names its own type.
+    /// Nothing is unwrapped by hand — no list of `Arc`, `Box`, `Option`, `Rc`
+    /// to keep current, and no guessing at which position the real type sits
+    /// in. Instead every identifier in the declaration is considered and the
+    /// ones naming a project container are kept; exactly one surviving means
+    /// the type is known, and anything else means it is not.
+    ///
+    /// `HashMap<Session, Entry>` therefore yields nothing, which is correct:
+    /// the receiver could be either and the syntax does not say.
+    fn field_type(&self, owner: &str, field: &str) -> Option<String> {
+        let (_, sym) = only(
+            self.defs_by_name
+                .get(field)?
+                .iter()
+                .copied()
+                .filter(|(_, s)| {
+                    s.label == SymbolLabel::Field && s.container.as_deref() == Some(owner)
+                }),
+        )?;
+        // Everything left of the first `:` is the field's own name and any
+        // visibility keyword; the type is what follows.
+        let declared = sym.signature.split_once(':')?.1;
+        let named: HashSet<&str> = declared
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| self.containers.contains(t))
+            .collect();
+        only(named.into_iter()).map(str::to_string)
     }
 
     /// Whether a container name belongs to a trait, which is what makes one
@@ -1068,6 +1134,130 @@ mod tests {
     /// The Method half is the control: it proves the shape resolves at all, so
     /// the Field half is failing for the intended reason and not because the
     /// fixture never reached the suffix tier.
+    fn field(name: &str, container: &str, signature: &str) -> RawSymbol {
+        let mut s = sym(name, SymbolLabel::Field, Some(container));
+        s.signature = signature.to_string();
+        s
+    }
+
+    /// A field's declared type is written down, so reading it is evidence
+    /// rather than inference — which is what lets this decide where the
+    /// name-only tiers must not.
+    #[test]
+    fn a_receiver_field_resolves_through_its_declared_type() {
+        let files = vec![facts(
+            "a.rs",
+            vec![
+                sym("Librarian", SymbolLabel::Struct, None),
+                sym("run", SymbolLabel::Method, Some("Librarian")),
+                field("storage", "Librarian", "storage: Arc<dyn Store>"),
+                sym("Store", SymbolLabel::Trait, None),
+                sym("save", SymbolLabel::Method, Some("Store")),
+                // A rival `save` on an unrelated type: without the declared
+                // type this call could not choose between them.
+                sym("Cache", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Cache")),
+            ],
+            vec![call("a.rs:Librarian.run", "save", Some("self.storage"))],
+        )];
+        let out = resolve(&files, nowhere());
+        let calls: Vec<_> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].target_qualified, "a.rs:Store.save");
+        assert_eq!(calls[0].resolution, Some(Resolution::FieldType));
+    }
+
+    /// Two project types in one declaration and the syntax does not say which
+    /// the receiver is, so nothing is claimed.
+    #[test]
+    fn a_field_naming_two_project_types_resolves_to_neither() {
+        let files = vec![facts(
+            "a.rs",
+            vec![
+                sym("Holder", SymbolLabel::Struct, None),
+                sym("run", SymbolLabel::Method, Some("Holder")),
+                field("map", "Holder", "map: HashMap<Session, Entry>"),
+                sym("Session", SymbolLabel::Struct, None),
+                sym("touch", SymbolLabel::Method, Some("Session")),
+                sym("Entry", SymbolLabel::Struct, None),
+                sym("touch", SymbolLabel::Method, Some("Entry")),
+            ],
+            vec![call("a.rs:Holder.run", "touch", Some("self.map"))],
+        )];
+        let out = resolve(&files, nowhere());
+        assert!(
+            !out.edges.iter().any(|e| e.kind == EdgeKind::Calls),
+            "guessed between two declared types: {:?}",
+            out.edges
+        );
+    }
+
+    /// `self.a.b.c()` would need the type of `self.a.b`, a member of a type
+    /// this layer has not established, so it must not resolve. Stays green with
+    /// the explicit one-level guard removed — no field is named `inner.deep`,
+    /// so the lookup misses regardless. That is the intended belt-and-braces:
+    /// the guard states intent, and the data makes it true independently.
+    #[test]
+    fn a_nested_receiver_path_is_not_followed() {
+        let files = vec![facts(
+            "a.rs",
+            vec![
+                sym("Outer", SymbolLabel::Struct, None),
+                sym("run", SymbolLabel::Method, Some("Outer")),
+                field("inner", "Outer", "inner: Inner"),
+                sym("Inner", SymbolLabel::Struct, None),
+                field("deep", "Inner", "deep: Store"),
+                sym("Store", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Store")),
+                sym("Other", SymbolLabel::Struct, None),
+                sym("save", SymbolLabel::Method, Some("Other")),
+            ],
+            vec![call("a.rs:Outer.run", "save", Some("self.inner.deep"))],
+        )];
+        let out = resolve(&files, nowhere());
+        assert!(
+            !out.edges.iter().any(|e| e.kind == EdgeKind::Calls),
+            "followed a nested receiver: {:?}",
+            out.edges
+        );
+    }
+
+    /// A caller that named a file was guessing where the member lives, so a
+    /// project-wide fallback still reports the weaker tier. Only a caller with
+    /// no file hypothesis keeps its own.
+    #[test]
+    fn a_missed_file_hypothesis_still_downgrades_to_unique_name() {
+        let files = vec![
+            facts(
+                "a.rs",
+                vec![
+                    sym("Widget", SymbolLabel::Struct, None),
+                    sym("run", SymbolLabel::Method, Some("Widget")),
+                ],
+                vec![call("a.rs:Widget.run", "helper", Some("self"))],
+            ),
+            // The impl lives in another file, so the `self` branch's preferred
+            // file misses and the search widens.
+            facts(
+                "b.rs",
+                vec![sym("helper", SymbolLabel::Method, Some("Widget"))],
+                vec![],
+            ),
+        ];
+        let out = resolve(&files, nowhere());
+        let calls: Vec<_> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].resolution, Some(Resolution::UniqueName));
+    }
+
     /// A call through `dyn Trait` looks ambiguous to a tier that counts
     /// definitions — the trait declares the method and every implementor
     /// defines it again — but all the candidates are the same method, and the

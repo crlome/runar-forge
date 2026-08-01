@@ -247,6 +247,9 @@ pub enum Resolution {
     /// that implement it, so every candidate is the same method and the trait
     /// declaration is its identity.
     TraitMethod,
+    /// The receiver is a field whose declared type names a project type, so the
+    /// owner is read off the declaration rather than guessed from the name.
+    FieldType,
 }
 
 impl Resolution {
@@ -254,6 +257,10 @@ impl Resolution {
         match self {
             Resolution::ImportMap => 0.95,
             Resolution::SameModule => 0.90,
+            // A declared type is written down, not inferred — the only thing
+            // between it and certainty is that the method lookup on that type
+            // can still be ambiguous.
+            Resolution::FieldType => 0.85,
             Resolution::UniqueName => 0.75,
             Resolution::Suffix => 0.55,
             // Stronger than the suffix tier, which picks one of several
@@ -268,6 +275,7 @@ impl Resolution {
         match self {
             Resolution::ImportMap => "import_map",
             Resolution::SameModule => "same_module",
+            Resolution::FieldType => "field_type",
             Resolution::UniqueName => "unique_name",
             Resolution::Suffix => "suffix",
             Resolution::TraitMethod => "trait_method",
