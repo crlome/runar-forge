@@ -276,10 +276,13 @@ fn collect_symbols(
     }
 
     // Two queries can match the same declaration; identity is the qualified
-    // name, so collapse on it and keep the richer label.
+    // name, so collapse on it and keep the richer label. `dedup_by` keeps the
+    // first of each run, so richness has to sort ahead of line order — before
+    // it did, whichever pattern happened to match first won.
     out.sort_by(|a, b| {
         qualified_name(file_path, a.container.as_deref(), &a.name)
             .cmp(&qualified_name(file_path, b.container.as_deref(), &b.name))
+            .then(a.label.richness().cmp(&b.label.richness()))
             .then(a.start_line.cmp(&b.start_line))
     });
     out.dedup_by(|a, b| {

@@ -18,7 +18,7 @@ use super::{
 
 /// Bumping this discards every project's graph. Do it whenever the extracted
 /// shape changes, since a partially-old graph is worse than no graph.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Cross-process contention is real here: a crawl writes while hooks and the
 /// MCP server read the same file.

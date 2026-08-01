@@ -26,6 +26,9 @@ pub enum SymbolLabel {
     Type,
     Const,
     Module,
+    /// A data member of a struct, class or interface. Never callable — see
+    /// `is_callable` in `resolve.rs`.
+    Field,
 }
 
 impl SymbolLabel {
@@ -41,6 +44,7 @@ impl SymbolLabel {
             SymbolLabel::Type => "Type",
             SymbolLabel::Const => "Const",
             SymbolLabel::Module => "Module",
+            SymbolLabel::Field => "Field",
         }
     }
 
@@ -57,6 +61,7 @@ impl SymbolLabel {
             "type" => SymbolLabel::Type,
             "const" => SymbolLabel::Const,
             "module" => SymbolLabel::Module,
+            "field" => SymbolLabel::Field,
             _ => return None,
         })
     }
@@ -74,6 +79,7 @@ impl SymbolLabel {
             "Type" => SymbolLabel::Type,
             "Const" => SymbolLabel::Const,
             "Module" => SymbolLabel::Module,
+            "Field" => SymbolLabel::Field,
             _ => SymbolLabel::Function,
         }
     }
@@ -89,6 +95,25 @@ impl SymbolLabel {
                 | SymbolLabel::Struct
                 | SymbolLabel::Enum
         )
+    }
+
+    /// Ordering for collapsing two matches on the same qualified name, lower
+    /// being richer. A declaration can match more than one pattern — a TS class
+    /// field bound to an arrow function is both a field and a callable — and
+    /// the callable reading carries a body, parameters and metrics, so it is
+    /// the one worth keeping.
+    pub fn richness(self) -> u8 {
+        match self {
+            SymbolLabel::Method | SymbolLabel::Function => 0,
+            SymbolLabel::Class
+            | SymbolLabel::Interface
+            | SymbolLabel::Trait
+            | SymbolLabel::Struct
+            | SymbolLabel::Enum => 1,
+            SymbolLabel::Type | SymbolLabel::Module => 2,
+            SymbolLabel::Field => 3,
+            SymbolLabel::Const => 4,
+        }
     }
 }
 
