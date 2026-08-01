@@ -109,6 +109,17 @@ pub fn pattern_entry(pattern: &CrossFilePattern, project_id: &str) -> MemoryEntr
 
 /// Lowercase, non-alphanumeric → '-'. Keeps topic keys stable across
 /// cosmetic pattern-name changes (case, spacing).
+/// The tag marking which file a `.sql`-derived entry was generated from.
+///
+/// Separators are normalized to `/` rather than left native. These entries are
+/// written on one machine and can be read on another through sync, and the
+/// writer and the reader must agree on the spelling for a lookup to work at
+/// all — the same mismatch that has broken path handling here twice. Both
+/// sides call this function; neither formats the tag by hand.
+pub fn sql_file_tag(relative_path: &str) -> String {
+    format!("file:{}", relative_path.replace('\\', "/"))
+}
+
 fn slug(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -267,6 +278,12 @@ fn sql_entries_for_file(
     let mut out = Vec::new();
     let base_tags = || {
         let mut tags = vec![project_id.to_string(), "scout".into(), "sql".into()];
+        // The declaring file, so these entries can be retired when it is
+        // deleted. A table entry is keyed by table name and an alter entry has
+        // no key at all, so without this tag neither can be traced back to the
+        // file it came from except through its own rendered prose — and
+        // retirement must not depend on parsing a formatting string.
+        tags.push(sql_file_tag(&result.file_path));
         if let Some(seq) = &sql.migration_sequence {
             tags.push(format!("migration:{seq}"));
         }

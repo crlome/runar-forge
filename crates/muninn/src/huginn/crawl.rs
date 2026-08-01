@@ -533,6 +533,51 @@ impl<'a> CrawlOrchestrator<'a> {
         }
     }
 
+    /// Live entries of `entry_type` carrying any of `tags`.
+    ///
+    /// Paged the same way as `live_entries_under` and filtered in Rust for the
+    /// same reason: tags are stored as a JSON array in one column, so there is
+    /// no index to ask. Callers must therefore keep the candidate set small and
+    /// call this only when something actually needs retiring.
+    async fn live_entries_tagged(
+        &self,
+        entry_type: EntryType,
+        tags: &HashSet<String>,
+    ) -> Vec<MemoryEntry> {
+        const PAGE: usize = 500;
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = match self
+                .librarian
+                .list(ListFilters {
+                    entry_type: Some(entry_type),
+                    project_id: Some(self.project_id.clone()),
+                    limit: Some(PAGE),
+                    offset: Some(offset),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "listing tagged entries for retirement failed");
+                    return Vec::new();
+                }
+            };
+            let fetched = page.len();
+            for entry in page {
+                if entry.tags.iter().any(|t| tags.contains(t)) {
+                    out.push(entry);
+                }
+            }
+            if fetched < PAGE {
+                return out;
+            }
+            offset += PAGE;
+        }
+    }
+
     /// The crawl state to persist, for either of the two exits that write one.
     ///
     /// A focused crawl scanned only its subtree, so the inventory it built
@@ -658,6 +703,7 @@ impl<'a> CrawlOrchestrator<'a> {
 
         let current: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
         let mut deprecated = 0usize;
+        let mut vanished_sql: HashSet<String> = HashSet::new();
 
         for path in state.file_hashes.keys() {
             if current.contains(path.as_str()) {
@@ -669,6 +715,9 @@ impl<'a> CrawlOrchestrator<'a> {
             // that is still there.
             if root.join(path).exists() {
                 continue;
+            }
+            if is_sql(path) {
+                vanished_sql.insert(memory_entry_generator::sql_file_tag(path));
             }
             for topic_key in [
                 format!("scout:file:{}:{}", self.project_id, path),
@@ -690,8 +739,41 @@ impl<'a> CrawlOrchestrator<'a> {
             }
         }
 
+        deprecated += self.deprecate_sql_derived(&vanished_sql).await;
+
         if deprecated > 0 {
             tracing::info!(deprecated, "retired entries for removed files");
+        }
+        deprecated
+    }
+
+    /// Retire the table and alter entries a deleted `.sql` file declared.
+    ///
+    /// The loop above retires by exact topic key, which those entries do not
+    /// have: a table entry is keyed by table name so the same table keeps one
+    /// entry across migrations, and an alter entry has no key at all. Both
+    /// carry a `file:` tag naming the file they came from, which is the only
+    /// machine-readable link back — hence a scan rather than a lookup.
+    ///
+    /// The candidate set is the tags of `.sql` files that were recorded, are
+    /// absent from this scan, and are gone from disk. That is a fact about
+    /// specific files, not an inference from a set believed to be complete —
+    /// the mistake that made the previous attempt at this delete every
+    /// per-table entry in the project. An empty set does nothing at all.
+    async fn deprecate_sql_derived(&self, vanished: &HashSet<String>) -> usize {
+        if vanished.is_empty() {
+            return 0;
+        }
+        let mut deprecated = 0usize;
+        for entry_type in [EntryType::Architecture, EntryType::Context] {
+            for entry in self.live_entries_tagged(entry_type, vanished).await {
+                if self.librarian.deprecate(entry.id).await.is_ok() {
+                    deprecated += 1;
+                }
+            }
+        }
+        if deprecated > 0 {
+            tracing::info!(deprecated, "retired entries of deleted .sql files");
         }
         deprecated
     }
@@ -734,6 +816,15 @@ impl<'a> CrawlOrchestrator<'a> {
 fn is_markdown(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".md") || lower.ends_with(".mdx")
+}
+
+/// Narrows the tagged-entry scan to crawls where a `.sql` file actually
+/// vanished. Only `.sql` files produce `file:`-tagged entries, so a crawl that
+/// lost none cannot have orphaned one — this skips work, and no entry's fate
+/// depends on it. The extension is lowercased because the scanner reports it
+/// as written.
+fn is_sql(path: &str) -> bool {
+    path.to_lowercase().ends_with(".sql")
 }
 
 /// Matches `memory_entry_generator::file_entries`, which decides whether to fan
@@ -1472,6 +1563,149 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a file deleted while a focused crawl ran is never retired"
+        );
+    }
+
+    /// Recreate what `huginn_recrawl_file` does to a `.sql` file: analyze it at
+    /// Deep depth and propose the entries. A crawl cannot produce these — `.sql`
+    /// is not a `Lang`, so it always analyzes at `Skip` — which is exactly why
+    /// they need retiring by a route other than the crawl's own bookkeeping.
+    async fn recrawl_sql_file(
+        librarian: &Arc<MemoryLibrarian>,
+        project: &str,
+        root: &Path,
+        rel: &str,
+    ) {
+        let abs = root.join(rel);
+        let metadata = fs::metadata(&abs).unwrap();
+        let entry = FileEntry {
+            relative_path: rel.to_string(),
+            path: abs.clone(),
+            size: metadata.len(),
+            line_count: fs::read_to_string(&abs).unwrap().lines().count(),
+            last_modified: metadata.modified().ok(),
+            extension: "sql".into(),
+        };
+        let analysis = file_analyzer::analyze_file(
+            &entry,
+            AnalysisDepth::Deep,
+            &crate::huginn::graph::DependencyGraph::default(),
+        );
+        for input in memory_entry_generator::file_entries(&analysis, project) {
+            librarian.propose(input).await.unwrap();
+        }
+    }
+
+    /// A deleted `.sql` file must take its per-table and alter entries with it.
+    /// Neither can be reached by topic key — a table entry is keyed by table
+    /// name so it survives across migrations, and an alter entry has no key at
+    /// all — so both are found through the `file:` tag naming their source.
+    #[tokio::test]
+    async fn deleting_a_sql_file_retires_the_entries_it_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(
+            root.join("migrations/001_init.sql"),
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);\n\
+             ALTER TABLE users ADD COLUMN nickname TEXT;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("migrations/002_keep.sql"),
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY);\n",
+        )
+        .unwrap();
+
+        let librarian = test_librarian().await;
+        CrawlOrchestrator::new(&librarian, "sqlret", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        recrawl_sql_file(&librarian, "sqlret", root, "migrations/001_init.sql").await;
+        recrawl_sql_file(&librarian, "sqlret", root, "migrations/002_keep.sql").await;
+
+        let users = librarian
+            .get_by_topic_key(Some("sqlret"), "scout:table:sqlret:users")
+            .await
+            .unwrap();
+        assert!(users.is_some(), "the fixture never produced a table entry");
+
+        fs::remove_file(root.join("migrations/001_init.sql")).unwrap();
+        CrawlOrchestrator::new(&librarian, "sqlret", CrawlMode::Auto, None)
+            .run(root)
+            .await
+            .unwrap();
+
+        assert!(
+            librarian
+                .get_by_topic_key(Some("sqlret"), "scout:table:sqlret:users")
+                .await
+                .unwrap()
+                .is_none(),
+            "the table entry outlived the only file that declared it"
+        );
+        assert!(
+            librarian
+                .get_by_topic_key(Some("sqlret"), "scout:table:sqlret:orders")
+                .await
+                .unwrap()
+                .is_some(),
+            "retired a table whose declaring file is still on disk"
+        );
+
+        // The alter entry has no topic key, so it is checked by title.
+        let live = librarian
+            .list(ListFilters {
+                project_id: Some("sqlret".into()),
+                limit: Some(500),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !live.iter().any(|e| e.title.starts_with("ALTER users")),
+            "the alter entry of a deleted file stayed live"
+        );
+    }
+
+    /// Deleting an unrelated file must not touch a `.sql`-derived entry. The
+    /// `is_sql` gate makes this cheap rather than correct — the tag scan only
+    /// ever matches the tag of a file that actually vanished — so this stays
+    /// green with the gate disabled, which is the intended split: no entry's
+    /// fate depends on classifying an extension.
+    #[tokio::test]
+    async fn deleting_a_non_sql_file_leaves_table_entries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE users (id INTEGER);\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/a.ts"), "export const a = 1\n").unwrap();
+
+        let librarian = test_librarian().await;
+        CrawlOrchestrator::new(&librarian, "sqlkeep", CrawlMode::Full, None)
+            .run(root)
+            .await
+            .unwrap();
+        recrawl_sql_file(&librarian, "sqlkeep", root, "schema.sql").await;
+
+        fs::remove_file(root.join("src/a.ts")).unwrap();
+        CrawlOrchestrator::new(&librarian, "sqlkeep", CrawlMode::Auto, None)
+            .run(root)
+            .await
+            .unwrap();
+
+        assert!(
+            librarian
+                .get_by_topic_key(Some("sqlkeep"), "scout:table:sqlkeep:users")
+                .await
+                .unwrap()
+                .is_some(),
+            "a table entry was retired because an unrelated file was deleted"
         );
     }
 
