@@ -34,6 +34,7 @@ pub static SPEC: &LangSpec = &LangSpec {
     ],
     loop_kinds: &["for_expression", "while_expression", "loop_expression"],
     relation_kind: EdgeKind::Implements,
+    capitalized_names_are_exported: false,
 };
 
 /// `function_signature_item` covers a trait's method declarations, which are
