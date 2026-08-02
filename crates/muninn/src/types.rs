@@ -216,6 +216,23 @@ pub struct MemoryEntryInput {
     /// the librarian falls back to `identity::resolve_author()`.
     #[serde(default)]
     pub author: Option<String>,
+    /// Opt out of the content length bound because this entry's content is
+    /// machine-readable and must round-trip byte for byte.
+    ///
+    /// Only the crawl state sets this today: it stores a JSON blob that
+    /// `git::deserialize_state` parses back, and that is
+    /// `serde_json::from_str(json).ok()` — so a truncated blob does not
+    /// error, it returns `None`, which reads as "no previous state" and
+    /// silently downgrades every incremental crawl to a full one. On a
+    /// 2,082-file project the blob is 127,680 chars, 99.8% of it
+    /// `file_hashes`.
+    ///
+    /// The exemption has a cost, and it is deliberate: an entry over the
+    /// limit cannot satisfy the remote's own CHECK, so `propose` declines
+    /// to enqueue it for sync rather than queueing a row that can only
+    /// fail. See `MAX_CONTENT_CHARS`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact_content: bool,
 }
 
 // ── Search ─────────────────────────────────────────────────────────

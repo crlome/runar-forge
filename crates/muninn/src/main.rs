@@ -1062,6 +1062,8 @@ async fn run_extract(project: Option<String>, silent: bool) {
                 // user-confirmed saves per Phase 5.1 source confidence scoring.
                 confidence: Some(0.7),
                 author: None,
+                // Prose, so the content bound applies.
+                exact_content: false,
             };
             let _ = lib.propose(input).await;
         }
