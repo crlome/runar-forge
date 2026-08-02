@@ -139,6 +139,13 @@ fn delete_fts_rows(
     Ok(())
 }
 
+/// One graph file holds every project, so the baseline is keyed by project
+/// rather than stored once. The prefix keeps it clear of `schema_version`,
+/// which is the only `meta` row that must survive a rebuild.
+fn freshness_key(project: &str) -> String {
+    format!("freshness:{project}")
+}
+
 /// The container out of a stored qualified name (`src/a.rs:Engine.run`).
 /// Anchored on the last colon because a path may contain dots.
 fn container_of_qualified(qualified: &str) -> Option<String> {
@@ -278,6 +285,11 @@ impl CodeGraphStore {
 
     fn drop_all(&self) -> Result<()> {
         let db = self.lock()?;
+        // `meta` is not a versioned table, so it survives the drop and would
+        // otherwise keep describing a graph that no longer exists — a
+        // freshness baseline for symbols that were just discarded reads as
+        // "this index is current" when nothing is indexed at all.
+        db.execute("DELETE FROM meta WHERE key <> 'schema_version'", [])?;
         db.execute_batch(
             "DROP TABLE IF EXISTS code_symbols_fts;
              DROP TABLE IF EXISTS code_edges;
@@ -461,8 +473,52 @@ impl CodeGraphStore {
         Ok(())
     }
 
-    /// When this project's graph was last built. Nothing indexes incrementally
-    /// yet, so anything read out of it is a snapshot of that moment.
+    /// The freshness baseline recorded by the last successful index, as the
+    /// opaque string `codegraph::freshness` wrote. Stored in `meta` rather than
+    /// on `code_projects`: a new column costs a `SCHEMA_VERSION` bump, which
+    /// discards *every* project's graph, and read-only consumers do not check
+    /// the version at open, so they would hit a missing column on every read
+    /// until the next crawl. A missing `meta` key just reads as "no baseline".
+    pub fn set_freshness(&self, project: &str, value: &str) -> Result<()> {
+        let db = self.lock()?;
+        db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![freshness_key(project), value],
+        )?;
+        Ok(())
+    }
+
+    /// Readable through `open_readonly`, which is the point: doctor and the
+    /// hooks judge staleness without ever opening the graph writable.
+    pub fn freshness(&self, project: &str) -> Result<Option<String>> {
+        let db = self.lock()?;
+        Ok(db
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![freshness_key(project)],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// The root recorded at index time. Freshness is judged against the working
+    /// tree, so every reader needs the directory the symbols came from — and
+    /// this is the only copy reachable without opening the memory store.
+    pub fn project_root(&self, project: &str) -> Result<Option<String>> {
+        let db = self.lock()?;
+        Ok(db
+            .query_row(
+                "SELECT root FROM code_projects WHERE project = ?1",
+                params![project],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// When this project's graph was last built. An incremental pass updates it
+    /// too, so this is when the graph last agreed with the tree — whether it
+    /// still does is `codegraph::freshness`.
     pub fn indexed_at(&self, project: &str) -> Result<Option<String>> {
         let db = self.lock()?;
         Ok(db
@@ -2091,6 +2147,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(s.coverage("p").unwrap().symbols, 1);
+            s.set_freshness("p", "{\"head\":\"abc\",\"dirty\":\"0\"}")
+                .unwrap();
             let db = s.lock().unwrap();
             db.execute(
                 "UPDATE meta SET value = '999' WHERE key = 'schema_version'",
@@ -2104,6 +2162,53 @@ mod tests {
             0,
             "a version mismatch must rebuild from empty"
         );
+        // `meta` is not one of the tables that get dropped, so anything left
+        // in it now describes a graph that no longer exists. A surviving
+        // freshness baseline would report the emptied graph as current.
+        assert_eq!(
+            s.freshness("p").unwrap(),
+            None,
+            "a freshness baseline outlived the graph it described"
+        );
+    }
+
+    #[test]
+    fn a_freshness_baseline_is_per_project_and_reads_back_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cg.db");
+        {
+            let s = CodeGraphStore::open(&path).unwrap();
+            s.set_freshness("p", "{\"head\":\"abc\"}").unwrap();
+            s.set_freshness("q", "{\"head\":\"def\"}").unwrap();
+        }
+        // The hook and doctor paths never open this file writable.
+        let s = CodeGraphStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            s.freshness("p").unwrap().as_deref(),
+            Some("{\"head\":\"abc\"}")
+        );
+        assert_eq!(
+            s.freshness("q").unwrap().as_deref(),
+            Some("{\"head\":\"def\"}")
+        );
+        assert_eq!(s.freshness("never-indexed").unwrap(), None);
+    }
+
+    #[test]
+    fn a_project_root_round_trips_for_readers_that_need_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cg.db");
+        {
+            let s = CodeGraphStore::open(&path).unwrap();
+            s.begin_project("p", Path::new("/tmp/somewhere"), true)
+                .unwrap();
+        }
+        let s = CodeGraphStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            s.project_root("p").unwrap().as_deref(),
+            Some("/tmp/somewhere")
+        );
+        assert_eq!(s.project_root("absent").unwrap(), None);
     }
 
     #[test]

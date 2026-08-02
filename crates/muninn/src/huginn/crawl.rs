@@ -469,7 +469,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 return None;
             }
         };
-        match index::index_project(&store, &self.project_id, root, files, full) {
+        match index::index_project(&store, &self.project_id, root, files, full, None) {
             Ok(outcome) => {
                 tracing::info!(
                     symbols = outcome.symbols,

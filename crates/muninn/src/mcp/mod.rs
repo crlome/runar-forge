@@ -1227,15 +1227,13 @@ fn open_graph(project: &str) -> Result<crate::codegraph::store::CodeGraphStore, 
     use crate::codegraph::store::CodeGraphStore;
     let path = CodeGraphStore::default_path();
     if !path.exists() {
-        return Err(
-            "no code graph yet — run huginn_crawl with \"deep\": true for this project".to_string(),
-        );
+        return Err("no code graph yet — run huginn_crawl for this project".to_string());
     }
     let store = CodeGraphStore::open_readonly(&path).map_err(|e| e.to_string())?;
     let known = store.projects().map_err(|e| e.to_string())?;
     if !known.iter().any(|p| p == project) {
         return Err(format!(
-            "project {project} has no code graph — run huginn_crawl with \"deep\": true for it. \
+            "project {project} has no code graph — run huginn_crawl for it. \
              Projects that do: {}",
             if known.is_empty() {
                 "none".to_string()

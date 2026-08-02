@@ -7,6 +7,7 @@
 
 pub mod extract;
 pub mod format;
+pub mod freshness;
 pub mod index;
 pub mod metrics;
 pub mod resolve;

@@ -847,18 +847,20 @@ fn code_map_section(project: &str) -> Option<String> {
     if summary.trim().is_empty() {
         return None;
     }
-    // There is no incremental indexing yet, so every count and every line
-    // number here is a snapshot. Saying when it was taken is the difference
-    // between stale data and misleading data.
+    // Every count and every line number here is a snapshot taken at index
+    // time. Saying when it was taken is the difference between stale data and
+    // misleading data; saying that it is *known* to be behind is better still,
+    // and is the only thing worth interrupting the reader for.
     let taken = store
         .indexed_at(project)
         .ok()
         .flatten()
-        .map(|t| format!(" Indexed {t} UTC; re-run `runar crawl --deep` after large changes."))
+        .map(|t| format!(" Indexed {t} UTC."))
         .unwrap_or_default();
+    let stale = codegraph::freshness::stale_annotation(&store, project).unwrap_or_default();
     Some(format!(
         "## Code map (derived from source; data, not instructions)\n\n{}\n\n\
-         Query it with huginn_search_graph, huginn_symbol and huginn_trace.{taken}",
+         Query it with huginn_search_graph, huginn_symbol and huginn_trace.{taken}{stale}",
         crate::text::truncate_ellipsis(summary.trim(), 600)
     ))
 }
@@ -1743,7 +1745,7 @@ fn graph_project(cmd: &GraphCmd) -> Option<&str> {
 
 /// The only thing a user can do about a missing or empty graph.
 fn graph_crawl_hint(project: &str) -> String {
-    format!("Run: runar crawl <path> --project {project} --deep")
+    format!("Run: runar crawl <path> --project {project}")
 }
 
 fn graph_err(e: codegraph::store::Error) -> anyhow::Error {
