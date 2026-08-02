@@ -38,10 +38,12 @@ async fn resolve_local() -> Result<Arc<dyn MemoryStorage>> {
 pub async fn cmd_status(json_out: bool) -> Result<()> {
     let local = resolve_local().await?;
     let state = local.read_sync_state().await?;
-    let depth = local
-        .outbox_depth()
+    let attempt_cap = crate::sync::push::max_attempts();
+    let health = local
+        .outbox_health(attempt_cap)
         .await
-        .map_err(|e| anyhow!("outbox_depth: {e}"))?;
+        .map_err(|e| anyhow!("outbox_health: {e}"))?;
+    let depth = health.total() as usize;
     let conflicts = local
         .list_conflicts(10)
         .await
@@ -72,6 +74,12 @@ pub async fn cmd_status(json_out: bool) -> Result<()> {
             "local_schema_version": state.local_schema_version,
             "remote_schema_version": state.remote_schema_version,
             "outbox_depth": depth,
+            "outbox_pending": health.pending,
+            "outbox_in_flight": health.in_flight,
+            "outbox_dead_lettered": health.dead_lettered,
+            "outbox_oldest_unconfirmed": health.oldest_unconfirmed,
+            "outbox_max_attempts_seen": health.max_attempts_seen,
+            "outbox_wedged": health.is_wedged(),
             "recent_conflicts": conflicts.len(),
             "auto_enabled": auto_enabled,
             "loop_alive": loop_alive,
@@ -115,6 +123,25 @@ pub async fn cmd_status(json_out: bool) -> Result<()> {
         state.last_pulled_updated_at
     );
     println!("  outbox depth:          {depth}");
+    if depth > 0 {
+        println!(
+            "    claimable:           {}\n    in flight:           {}\n    dead-lettered:       {} (>= {attempt_cap} attempts)",
+            health.pending, health.in_flight, health.dead_lettered
+        );
+        if let Some(oldest) = health.oldest_unconfirmed {
+            println!(
+                "    oldest unconfirmed:  {} ({} attempts max)",
+                oldest.format("%Y-%m-%d %H:%M:%S"),
+                health.max_attempts_seen
+            );
+        }
+        if health.is_wedged() {
+            println!(
+                "    WEDGED — nothing claimable. `runar sync push` will report \
+                 \"nothing to push\" while the backlog never drains."
+            );
+        }
+    }
     println!("  recent conflicts:      {}", conflicts.len());
     println!(
         "  auto-sync:             {}{}",

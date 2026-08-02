@@ -488,6 +488,22 @@ enum SyncAction {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Repair an outbox damaged by older binaries: release stranded
+    /// claims and enqueue the delete ops that soft-deletes failed to
+    /// write. Additive — never deletes an entry. Start with --dry-run.
+    Repair {
+        /// Report what would change; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Max tombstones to enqueue in this run
+        #[arg(long, default_value = "1000")]
+        limit: usize,
+        /// Release every claim, not only stale ones. Only safe when no
+        /// push is running — it can yank rows from a live pusher.
+        #[arg(long)]
+        release_all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3312,6 +3328,11 @@ async fn main() -> anyhow::Result<()> {
                     sync_cmd::gc::touch_marker();
                 }
             }
+            SyncAction::Repair {
+                dry_run,
+                limit,
+                release_all,
+            } => sync_cmd::cmd_repair(dry_run, limit, release_all).await?,
         },
 
         Commands::Ask { question, project } => {

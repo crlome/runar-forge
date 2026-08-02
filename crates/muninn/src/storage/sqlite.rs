@@ -2143,7 +2143,11 @@ impl MemoryStorage for SqliteAdapter {
         Ok(id)
     }
 
-    async fn claim_outbox(&self, max: usize) -> StorageResult<Vec<crate::types::OutboxRow>> {
+    async fn claim_outbox(
+        &self,
+        max: usize,
+        max_attempts: i32,
+    ) -> StorageResult<Vec<crate::types::OutboxRow>> {
         let db = self
             .db
             .lock()
@@ -2159,12 +2163,13 @@ impl MemoryStorage for SqliteAdapter {
                 .prepare(
                     "SELECT id FROM sync_outbox
                      WHERE confirmed_at IS NULL AND claimed_at IS NULL
+                       AND attempts < ?2
                      ORDER BY created_at ASC
                      LIMIT ?1",
                 )
                 .map_err(db_err)?;
             let mapped = stmt
-                .query_map(params![max as i64], |r| r.get::<_, String>(0))
+                .query_map(params![max as i64, max_attempts], |r| r.get::<_, String>(0))
                 .map_err(db_err)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(db_err)?;
@@ -2295,6 +2300,74 @@ impl MemoryStorage for SqliteAdapter {
         Ok(())
     }
 
+    async fn reap_stale_claims(&self, older_than_secs: i64) -> StorageResult<u64> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+        // Matches idx_sync_outbox_stale, which existed for exactly this
+        // query but had no reader until now.
+        let affected = db
+            .execute(
+                "UPDATE sync_outbox SET claimed_at = NULL
+                 WHERE claimed_at IS NOT NULL
+                   AND confirmed_at IS NULL
+                   AND claimed_at < ?1",
+                params![cutoff],
+            )
+            .map_err(db_err)?;
+        Ok(affected as u64)
+    }
+
+    async fn release_outbox(&self, ids: &[Uuid]) -> StorageResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let tx = db.unchecked_transaction().map_err(db_err)?;
+        for id in ids {
+            tx.execute(
+                "UPDATE sync_outbox SET claimed_at = NULL
+                 WHERE id = ?1 AND confirmed_at IS NULL",
+                params![id.to_string()],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn deleted_entries_without_tombstone(&self, limit: usize) -> StorageResult<Vec<Uuid>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = db
+            .prepare(
+                "SELECT e.id FROM memory_entries e
+                 WHERE e.deleted_at IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM sync_outbox o WHERE o.entry_id = e.id)
+                   AND NOT EXISTS (
+                         SELECT 1 FROM sync_outbox o
+                         WHERE o.entry_id = e.id AND o.op_kind = 'delete')
+                 ORDER BY e.deleted_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let ids = stmt
+            .query_map(params![limit as i64], |r| r.get::<_, String>(0))
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        ids.iter()
+            .map(|s| Uuid::parse_str(s).map_err(|e| StorageError::Database(e.to_string())))
+            .collect()
+    }
+
     async fn outbox_depth(&self) -> StorageResult<usize> {
         let db = self
             .db
@@ -2308,6 +2381,53 @@ impl MemoryStorage for SqliteAdapter {
             )
             .map_err(db_err)?;
         Ok(count as usize)
+    }
+
+    async fn outbox_health(&self, max_attempts: i32) -> StorageResult<crate::types::OutboxHealth> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        // One pass, bucketed in SQL, so the three counts cannot disagree
+        // with each other the way three separate queries could.
+        let (pending, in_flight, dead, oldest, max_seen): (
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<i32>,
+        ) = db
+            .query_row(
+                "SELECT
+                   sum(CASE WHEN claimed_at IS NULL AND attempts <  ?1 THEN 1 ELSE 0 END),
+                   sum(CASE WHEN claimed_at IS NOT NULL AND attempts < ?1 THEN 1 ELSE 0 END),
+                   sum(CASE WHEN attempts >= ?1 THEN 1 ELSE 0 END),
+                   min(created_at),
+                   max(attempts)
+                 FROM sync_outbox WHERE confirmed_at IS NULL",
+                params![max_attempts],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i32>>(4)?,
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        Ok(crate::types::OutboxHealth {
+            pending: pending as u64,
+            in_flight: in_flight as u64,
+            dead_lettered: dead as u64,
+            oldest_unconfirmed: oldest.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|t| t.with_timezone(&Utc))
+            }),
+            max_attempts_seen: max_seen.unwrap_or(0),
+        })
     }
 
     async fn gc_outbox(&self, older_than_secs: i64) -> StorageResult<i64> {
@@ -4279,10 +4399,10 @@ mod tests {
         }
         assert_eq!(adapter.outbox_depth().await.unwrap(), 5);
 
-        let claimed = adapter.claim_outbox(3).await.unwrap();
+        let claimed = adapter.claim_outbox(3, 10).await.unwrap();
         assert_eq!(claimed.len(), 3, "claim batch respected");
         // Subsequent claim only sees unclaimed rows.
-        let claimed_again = adapter.claim_outbox(10).await.unwrap();
+        let claimed_again = adapter.claim_outbox(10, 10).await.unwrap();
         assert_eq!(claimed_again.len(), 2);
 
         let ids: Vec<Uuid> = claimed.iter().map(|r| r.id).collect();
@@ -4296,16 +4416,200 @@ mod tests {
         adapter.initialize().await.unwrap();
         adapter.enqueue_outbox(dummy_outbox_input(0)).await.unwrap();
 
-        let claimed = adapter.claim_outbox(1).await.unwrap();
+        let claimed = adapter.claim_outbox(1, 10).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].claimed_at.is_some());
 
         adapter.fail_outbox(claimed[0].id, "boom").await.unwrap();
 
-        let reclaim = adapter.claim_outbox(1).await.unwrap();
+        let reclaim = adapter.claim_outbox(1, 10).await.unwrap();
         assert_eq!(reclaim.len(), 1, "row re-claimable after fail");
         assert_eq!(reclaim[0].attempts, 1);
         assert_eq!(reclaim[0].last_error.as_deref(), Some("boom"));
+    }
+
+    /// A row that keeps failing must stop being claimed, or it retries
+    /// forever ahead of everything behind it. Dogfood found one row at
+    /// 64,634 attempts before this cap existed.
+    #[tokio::test]
+    async fn outbox_dead_letters_a_row_past_the_attempt_cap() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        adapter.enqueue_outbox(dummy_outbox_input(0)).await.unwrap();
+
+        for _ in 0..3 {
+            let c = adapter.claim_outbox(1, 3).await.unwrap();
+            assert_eq!(c.len(), 1);
+            adapter.fail_outbox(c[0].id, "boom").await.unwrap();
+        }
+
+        assert!(
+            adapter.claim_outbox(1, 3).await.unwrap().is_empty(),
+            "row at the cap must not be claimed again"
+        );
+        // Still present and still counted — dead-lettered, not deleted.
+        assert_eq!(adapter.outbox_depth().await.unwrap(), 1);
+        let health = adapter.outbox_health(3).await.unwrap();
+        assert_eq!(health.dead_lettered, 1);
+        assert_eq!(health.pending, 0);
+        assert!(health.is_wedged(), "nothing claimable but rows remain");
+        // A higher cap makes it claimable again, so the cap is a policy
+        // knob rather than a one-way door.
+        assert_eq!(adapter.claim_outbox(1, 99).await.unwrap().len(), 1);
+    }
+
+    /// A pusher that dies between claim and confirm strands its rows:
+    /// `claim_outbox` only ever selects `claimed_at IS NULL`.
+    #[tokio::test]
+    async fn stale_claims_are_reaped_back_into_the_queue() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        adapter.enqueue_outbox(dummy_outbox_input(0)).await.unwrap();
+
+        let claimed = adapter.claim_outbox(1, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        // Simulate the pusher dying here — no confirm, no fail.
+        assert!(
+            adapter.claim_outbox(10, 10).await.unwrap().is_empty(),
+            "claimed row is invisible while the claim stands"
+        );
+
+        // Not yet stale: a long cutoff must leave an in-flight claim alone,
+        // or a reaper would yank rows out from under a live pusher.
+        assert_eq!(adapter.reap_stale_claims(3600).await.unwrap(), 0);
+        assert!(adapter.claim_outbox(10, 10).await.unwrap().is_empty());
+
+        // Stale: cutoff of 0s releases it.
+        assert_eq!(adapter.reap_stale_claims(0).await.unwrap(), 1);
+        assert_eq!(
+            adapter.claim_outbox(10, 10).await.unwrap().len(),
+            1,
+            "reaped row is claimable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_never_resurrects_a_confirmed_row() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        adapter.enqueue_outbox(dummy_outbox_input(0)).await.unwrap();
+        let claimed = adapter.claim_outbox(1, 10).await.unwrap();
+        adapter.confirm_outbox(&[claimed[0].id]).await.unwrap();
+
+        assert_eq!(
+            adapter.reap_stale_claims(0).await.unwrap(),
+            0,
+            "confirmed rows are out of scope for the reaper"
+        );
+        assert_eq!(adapter.outbox_depth().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_outbox_hands_a_claim_straight_back() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        adapter.enqueue_outbox(dummy_outbox_input(0)).await.unwrap();
+
+        let claimed = adapter.claim_outbox(1, 10).await.unwrap();
+        adapter.release_outbox(&[claimed[0].id]).await.unwrap();
+
+        let again = adapter.claim_outbox(1, 10).await.unwrap();
+        assert_eq!(again.len(), 1, "released without waiting for staleness");
+        assert_eq!(again[0].attempts, 0, "release is not a failure");
+    }
+
+    /// The repair query must find exactly the entries a remote drain
+    /// would resurrect: soft-deleted, known to the outbox, no tombstone.
+    #[tokio::test]
+    async fn finds_only_deleted_entries_the_remote_would_resurrect() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let mk = |title: &str| MemoryEntryInput {
+            title: title.into(),
+            content: format!("body of {title}"),
+            entry_type: crate::types::EntryType::Note,
+            ..Default::default()
+        };
+        let queue = |id: Uuid, op: crate::types::OutboxOp| crate::types::OutboxInput {
+            entry_id: id,
+            op_kind: op,
+            row_payload: serde_json::json!({"id": id.to_string()}),
+        };
+
+        // (a) deleted, insert queued, no tombstone → NEEDS repair
+        let a = adapter.save(mk("a"), "test").await.unwrap().id;
+        adapter
+            .enqueue_outbox(queue(a, crate::types::OutboxOp::Insert))
+            .await
+            .unwrap();
+        adapter.delete(a).await.unwrap();
+
+        // (b) deleted and already tombstoned → already correct
+        let b = adapter.save(mk("b"), "test").await.unwrap().id;
+        adapter
+            .enqueue_outbox(queue(b, crate::types::OutboxOp::Insert))
+            .await
+            .unwrap();
+        adapter.delete(b).await.unwrap();
+        adapter
+            .enqueue_outbox(queue(b, crate::types::OutboxOp::Delete))
+            .await
+            .unwrap();
+
+        // (c) deleted but the remote never heard of it → nothing to undo
+        let c = adapter.save(mk("c"), "test").await.unwrap().id;
+        adapter.delete(c).await.unwrap();
+
+        // (d) live entry with a queued insert → must never be tombstoned
+        let d = adapter.save(mk("d"), "test").await.unwrap().id;
+        adapter
+            .enqueue_outbox(queue(d, crate::types::OutboxOp::Insert))
+            .await
+            .unwrap();
+
+        let found = adapter
+            .deleted_entries_without_tombstone(100)
+            .await
+            .unwrap();
+        assert_eq!(found, vec![a], "only (a) is at risk of resurrection");
+
+        // The limit must bound the result, so a huge backlog can be
+        // repaired in chunks.
+        assert!(adapter
+            .deleted_entries_without_tombstone(0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbox_health_partitions_every_unconfirmed_row() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        for i in 0..4 {
+            adapter.enqueue_outbox(dummy_outbox_input(i)).await.unwrap();
+        }
+        // one dead-lettered, one in flight, two claimable
+        let c = adapter.claim_outbox(1, 2).await.unwrap();
+        for _ in 0..2 {
+            adapter.fail_outbox(c[0].id, "boom").await.unwrap();
+            let _ = adapter.claim_outbox(0, 2).await;
+        }
+        let inflight = adapter.claim_outbox(1, 2).await.unwrap();
+        assert_eq!(inflight.len(), 1);
+
+        let health = adapter.outbox_health(2).await.unwrap();
+        assert_eq!(health.dead_lettered, 1);
+        assert_eq!(health.in_flight, 1);
+        assert_eq!(health.pending, 2);
+        assert_eq!(
+            health.total() as usize,
+            adapter.outbox_depth().await.unwrap(),
+            "the three buckets must sum to outbox_depth, never overlap or drop a row"
+        );
+        assert_eq!(health.max_attempts_seen, 2);
+        assert!(health.oldest_unconfirmed.is_some());
     }
 
     #[tokio::test]

@@ -713,6 +713,40 @@ pub struct OutboxRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Breakdown of unconfirmed `sync_outbox` rows by state.
+///
+/// `outbox_depth` returns only the sum, which reads as a healthy backlog
+/// whether the rows are waiting to be claimed or wedged and unclaimable.
+/// The distinction is the whole diagnosis, so report the parts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxHealth {
+    /// Claimable now: unconfirmed, unclaimed, under the attempt cap.
+    pub pending: u64,
+    /// Claimed by some pusher and not yet confirmed or failed. Non-zero
+    /// outside an active push means a pusher died mid-run; these are
+    /// what `reap_stale_claims` releases.
+    pub in_flight: u64,
+    /// At or beyond the attempt cap. Never claimed again; needs a human.
+    pub dead_lettered: u64,
+    /// Age of the oldest unconfirmed row, whatever its state.
+    pub oldest_unconfirmed: Option<DateTime<Utc>>,
+    /// Highest `attempts` across unconfirmed rows.
+    pub max_attempts_seen: i32,
+}
+
+impl OutboxHealth {
+    /// Total unconfirmed rows — matches `outbox_depth`.
+    pub fn total(&self) -> u64 {
+        self.pending + self.in_flight + self.dead_lettered
+    }
+
+    /// True when rows exist but none can be claimed, i.e. pushing will
+    /// report "nothing to push" while the backlog never drains.
+    pub fn is_wedged(&self) -> bool {
+        self.pending == 0 && (self.in_flight > 0 || self.dead_lettered > 0)
+    }
+}
+
 /// Singleton state row tracking the pull cursor + handshake metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {

@@ -1877,7 +1877,11 @@ impl MemoryStorage for PostgresAdapter {
         Ok(id)
     }
 
-    async fn claim_outbox(&self, max: usize) -> StorageResult<Vec<crate::types::OutboxRow>> {
+    async fn claim_outbox(
+        &self,
+        max: usize,
+        max_attempts: i32,
+    ) -> StorageResult<Vec<crate::types::OutboxRow>> {
         let mut client = self.get_client().await?;
         let tx = client.transaction().await.map_err(db_err)?;
         let claim_max = max as i64;
@@ -1889,13 +1893,14 @@ impl MemoryStorage for PostgresAdapter {
                     WHERE id IN (
                         SELECT id FROM muninn.sync_outbox
                         WHERE confirmed_at IS NULL AND claimed_at IS NULL
+                          AND attempts < $2
                         ORDER BY created_at ASC
                         LIMIT $1
                         FOR UPDATE SKIP LOCKED
                     )
                     RETURNING id, entry_id, op_kind, row_payload, attempts,
                               last_error, claimed_at, confirmed_at, created_at",
-                &[&claim_max],
+                &[&claim_max, &max_attempts],
             )
             .await
             .map_err(db_err)?;
@@ -1954,6 +1959,89 @@ impl MemoryStorage for PostgresAdapter {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn reap_stale_claims(&self, older_than_secs: i64) -> StorageResult<u64> {
+        let client = self.get_client().await?;
+        let affected = client
+            .execute(
+                "UPDATE muninn.sync_outbox SET claimed_at = NULL
+                 WHERE claimed_at IS NOT NULL
+                   AND confirmed_at IS NULL
+                   AND claimed_at < NOW() - make_interval(secs => $1::DOUBLE PRECISION)",
+                &[&(older_than_secs as f64)],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(affected)
+    }
+
+    async fn release_outbox(&self, ids: &[Uuid]) -> StorageResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let client = self.get_client().await?;
+        let id_strs: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        client
+            .execute(
+                "UPDATE muninn.sync_outbox SET claimed_at = NULL
+                 WHERE id = ANY($1) AND confirmed_at IS NULL",
+                &[&id_strs],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn outbox_health(&self, max_attempts: i32) -> StorageResult<crate::types::OutboxHealth> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_one(
+                "SELECT
+                   COALESCE(count(*) FILTER (
+                     WHERE claimed_at IS NULL AND attempts < $1), 0)::BIGINT AS pending,
+                   COALESCE(count(*) FILTER (
+                     WHERE claimed_at IS NOT NULL AND attempts < $1), 0)::BIGINT AS in_flight,
+                   COALESCE(count(*) FILTER (WHERE attempts >= $1), 0)::BIGINT AS dead,
+                   min(created_at) AS oldest,
+                   COALESCE(max(attempts), 0)::INT AS max_seen
+                 FROM muninn.sync_outbox WHERE confirmed_at IS NULL",
+                &[&max_attempts],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(crate::types::OutboxHealth {
+            pending: row.get::<_, i64>("pending") as u64,
+            in_flight: row.get::<_, i64>("in_flight") as u64,
+            dead_lettered: row.get::<_, i64>("dead") as u64,
+            oldest_unconfirmed: row.get("oldest"),
+            max_attempts_seen: row.get("max_seen"),
+        })
+    }
+
+    async fn deleted_entries_without_tombstone(&self, limit: usize) -> StorageResult<Vec<Uuid>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT e.id FROM muninn.memory_entries e
+                 WHERE e.deleted_at IS NOT NULL
+                   AND EXISTS (
+                         SELECT 1 FROM muninn.sync_outbox o WHERE o.entry_id = e.id)
+                   AND NOT EXISTS (
+                         SELECT 1 FROM muninn.sync_outbox o
+                         WHERE o.entry_id = e.id AND o.op_kind = 'delete')
+                 ORDER BY e.deleted_at ASC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .await
+            .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                let s: String = r.get("id");
+                Uuid::parse_str(&s).map_err(|e| StorageError::Database(e.to_string()))
+            })
+            .collect()
     }
 
     async fn outbox_depth(&self) -> StorageResult<usize> {

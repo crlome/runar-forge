@@ -23,3 +23,33 @@ pub(crate) fn with_runar_home<F: FnOnce()>(f: F) {
         None => std::env::remove_var("RUNAR_HOME"),
     }
 }
+
+/// RAII form of the same idea for one arbitrary env var, so async tests
+/// can hold it across `.await` (a closure taking `FnOnce()` cannot).
+/// Restores the previous value on drop and holds `HOME_LOCK` throughout.
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// Set `key` to `val` until the returned guard drops.
+pub(crate) fn with_env(key: &'static str, val: &str) -> EnvGuard {
+    let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var(key).ok();
+    std::env::set_var(key, val);
+    EnvGuard {
+        key,
+        prev,
+        _lock: lock,
+    }
+}
