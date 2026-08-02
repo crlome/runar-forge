@@ -503,6 +503,10 @@ enum SyncAction {
         /// push is running — it can yank rows from a live pusher.
         #[arg(long)]
         release_all: bool,
+        /// Delete queued rows whose content exceeds the remote's limit.
+        /// They can never be pushed. Memory entries are NOT touched.
+        #[arg(long)]
+        purge_unsendable: bool,
     },
 }
 
@@ -3334,7 +3338,8 @@ async fn main() -> anyhow::Result<()> {
                 dry_run,
                 limit,
                 release_all,
-            } => sync_cmd::cmd_repair(dry_run, limit, release_all).await?,
+                purge_unsendable,
+            } => sync_cmd::cmd_repair(dry_run, limit, release_all, purge_unsendable).await?,
         },
 
         Commands::Ask { question, project } => {

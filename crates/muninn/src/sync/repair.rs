@@ -17,8 +17,17 @@
 //!    side deleted are queued to the remote as inserts with no delete
 //!    behind them. Draining that outbox resurrects them.
 //!
-//! Enqueueing a tombstone is additive: it appends outbox rows and
-//! touches no memory entry. Nothing here deletes anything.
+//! 3. **Unpushable delete payloads.** An earlier build queued id-only
+//!    stubs, which `push_one` cannot deserialize into a `MemoryEntry`.
+//!
+//! 4. **Rows the remote will never accept**, because the payload's
+//!    `content` exceeds its `CHECK (char_length(content) <= N)`. These
+//!    retry to the dead-letter cap and then sit there forever. Removing
+//!    them needs `--purge-unsendable`, since it is the only step here
+//!    that deletes anything — and even then only queue rows. **No memory
+//!    entry is ever touched by this command.**
+//!
+//! Passes 1–3 are additive: they append outbox rows or rewrite payloads.
 
 use std::sync::Arc;
 
@@ -51,7 +60,12 @@ async fn resolve_local() -> Result<Arc<dyn MemoryStorage>> {
     Ok(local)
 }
 
-pub async fn cmd_repair(dry_run: bool, limit: usize, release_all: bool) -> Result<()> {
+pub async fn cmd_repair(
+    dry_run: bool,
+    limit: usize,
+    release_all: bool,
+    purge_unsendable: bool,
+) -> Result<()> {
     let local = resolve_local().await?;
     let cap = crate::sync::push::max_attempts();
 
@@ -199,6 +213,48 @@ pub async fn cmd_repair(dry_run: bool, limit: usize, release_all: bool) -> Resul
             }
         }
         println!("  rewrote {fixed} unpushable delete payload(s)");
+    }
+
+    // ── 4. rows the remote can never accept ───────────────────────
+    // Tested against the payload, not the entry: the payload is what gets
+    // pushed, and an entry rewritten or deleted since still carries its
+    // original oversized body in the queue.
+    let limit = crate::librarian::content_limit();
+    let unsendable = local
+        .unsendable_outbox_rows(limit, usize::MAX)
+        .await
+        .map_err(|e| anyhow!("unsendable_outbox_rows: {e}"))?;
+
+    if unsendable.is_empty() {
+        println!("  no rows exceed the remote's {limit}-char content limit");
+    } else {
+        let worst = unsendable
+            .iter()
+            .map(|r| r.content_chars)
+            .max()
+            .unwrap_or(0);
+        println!(
+            "\n  {} row(s) exceed the remote's {limit}-char content limit \
+             (largest {worst} chars).",
+            unsendable.len()
+        );
+        println!("  These can never be pushed; they will retry to the dead-letter cap and stay.");
+        if purge_unsendable && !dry_run {
+            let ids: Vec<_> = unsendable.iter().map(|r| r.outbox_id).collect();
+            let removed = local
+                .delete_outbox_rows(&ids)
+                .await
+                .map_err(|e| anyhow!("delete_outbox_rows: {e}"))?;
+            println!("  purged {removed} unsendable row(s) — memory entries untouched");
+        } else if dry_run && purge_unsendable {
+            println!(
+                "  would purge all {} (memory entries untouched)",
+                unsendable.len()
+            );
+        } else {
+            println!("  re-run with --purge-unsendable to drop them from the queue.");
+            println!("  The entries themselves stay in local memory either way.");
+        }
     }
 
     if !dry_run {

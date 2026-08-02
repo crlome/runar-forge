@@ -9,6 +9,7 @@ use crate::types::{
     ListFilters, MemoryEdge, MemoryEdgeInput, MemoryEntry, MemoryEntryInput, MemoryStats,
     MergeCounts, ObservationInput, OutboxHealth, OutboxInput, OutboxRow, PendingObservation,
     SaveResult, SearchQuery, Session, SessionInput, SessionUpdate, SyncConflict, SyncState,
+    UnsendableRow,
 };
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -348,6 +349,22 @@ pub trait MemoryStorage: Send + Sync {
         outbox_id: Uuid,
         payload: &serde_json::Value,
     ) -> StorageResult<()>;
+
+    /// Unconfirmed outbox rows whose payload `content` exceeds
+    /// `max_content_chars` — the remote's CHECK rejects these on every
+    /// attempt, so they occupy the queue forever without ever draining.
+    async fn unsendable_outbox_rows(
+        &self,
+        max_content_chars: usize,
+        limit: usize,
+    ) -> StorageResult<Vec<UnsendableRow>>;
+
+    /// Hard-delete outbox rows by id. Returns the number removed.
+    ///
+    /// Distinct from `gc_outbox`, which only ever removes rows that were
+    /// successfully confirmed. This removes rows that never can be, so the
+    /// caller must have established that. Memory entries are untouched.
+    async fn delete_outbox_rows(&self, ids: &[Uuid]) -> StorageResult<u64>;
 
     /// Count of pending (unconfirmed) outbox rows.
     async fn outbox_depth(&self) -> StorageResult<usize>;
