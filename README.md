@@ -63,15 +63,23 @@ questions by assembling context from memory.
   localhost; `runar graph export` writes the same interface to a single
   HTML file that works offline. No bundler, no CDN, no vendored
   JavaScript, and no new dependency — see [Code view](#code-view).
+- **A graph that says when it is stale, and can fix itself.** Every index
+  records the commit and working-tree state it read, so `runar doctor` and
+  the session code map report when the graph has fallen behind instead of
+  answering confidently from an old picture. `runar graph refresh` re-indexes
+  the graph alone in well under a second — only changed files are re-parsed —
+  and the opt-in hooks keep it current on their own. See
+  [Keeping the graph current](#keeping-the-graph-current).
 - **Tiered memory.** Entries graduate through 4 layers based on age,
   citation count, verification, and confidence; `runar gc` enforces
   retention.
 - **Auto-capture.** Optional Claude Code hooks queue PostToolUse
   payloads, then summarize them at session end (Claude Haiku if
   `ANTHROPIC_API_KEY` is set, otherwise heuristic fallback).
-- **Health checks.** `runar doctor` runs 10 read-only probes
-  (env file, storage, DB reachable, auth, pgvector, schema,
-  migrations, row counts, breaker state, project-local `.env`).
+- **Health checks.** `runar doctor` runs 21 read-only probes — storage,
+  schema, migrations, FTS parity, sync state, hook log, code-graph coverage
+  and freshness, and the auto-refresh record. A degraded subsystem is
+  reported as skipped with the reason and the fix, never as a silent pass.
 - **Self-update.** `runar update --check|--rollback` fetches signed
   release manifests; previous binary preserved at `runar.previous`.
 
@@ -128,7 +136,7 @@ scripts, no install-time network** — so it installs cleanly even with
 ```bash
 runar init                          # creates ~/.runar-forge/.env
 runar config wizard                 # interactive storage + DB setup
-runar doctor                        # 10 read-only health checks
+runar doctor                        # 21 read-only health checks
 runar setup claude-code -p my-proj  # wire MCP tools into Claude Code
 ```
 
@@ -207,6 +215,64 @@ opens the store read-only. No CORS headers are sent.
 
 ---
 
+## Keeping the graph current
+
+The graph is built by `runar crawl`, so between crawls it describes the code as
+it was, not as it is. That matters more than ordinary staleness: `graph
+search|symbol|trace` and the search-hint hook answer *confidently* from the old
+picture, and a stale symbol looks exactly like a current one.
+
+Every index now records two things about the tree it read — the commit at
+`HEAD`, and a signature over `git status --porcelain` with each listed path's
+size and mtime. Any reader can compare them without opening the graph writable.
+
+```bash
+runar graph refresh --project myproject --check   # 0 current, 2 stale, 3 cannot tell
+runar graph refresh --project myproject           # re-index; ~0.3s on a 160-file project
+```
+
+`runar doctor` reports the same verdict, and the session code map adds one
+`STALE:` line when the graph is genuinely behind. Nothing is claimed when it
+cannot be known: a project without git, or a graph built before this feature
+existed, reports "cannot judge" rather than a false all-clear.
+
+### Automatic refresh (opt-in)
+
+```bash
+runar setup claude-code --project myproject --with-graph-autorefresh
+```
+
+Installs two triggers — after a file write, and at session start. Neither does
+any work in the hook itself: it reads one timestamp file and, if a refresh is
+due, starts a detached child, so the tool call that triggered it never waits.
+
+The child refuses more often than it runs, and deliberately so. It will not
+build a graph that does not exist, will not touch a project without git, and
+skips entirely when the recorded signals have not changed — it fires on
+*change*, never on "the working tree is dirty", because a repository that stays
+dirty all afternoon is not getting staler. After each pass the next one is held
+off for twenty times what that one cost, floored at 30s and capped at 10
+minutes.
+
+Every decision — including every refusal — is recorded, because a background
+task that quietly does nothing is indistinguishable from one that is broken:
+
+```
+$ runar doctor
+✔ graph auto-refresh  myproject: done (4s ago, 379ms)
+     3 fire(s): 1 started a refresh, 2 debounced; 100% of runs had work;
+     1 refresh(es), 373ms median / 373ms p95
+```
+
+Raw rows land in `~/.runar-forge/graph-refresh-stats.tsv`. Remove the hooks
+again with `--no-graph-autorefresh`.
+
+> Enable it per project as you return to work on each one. It only helps where
+> you are actively editing, and it requires that project to have been crawled
+> at least once — `runar graph refresh` is maintenance, never construction.
+
+---
+
 ## CLI reference
 
 | Command                      | Purpose                                                                         |
@@ -214,8 +280,8 @@ opens the store read-only. No CORS headers are sent.
 | `runar mcp-muninn`           | Start MCP server over stdio (called by AI tools, not humans).                  |
 | `runar init`                 | Create `~/.runar-forge/.env`. `--interactive` runs the wizard.                 |
 | `runar config <action>`      | Manage `~/.runar-forge/.env`: `path`, `show`, `get`, `set`, `unset`, `wizard`. |
-| `runar doctor`               | 10 read-only health checks. `--db`, `--json`, `--quiet`, `--timeout-ms`.       |
-| `runar setup <tool>`         | Wire MCP into `claude-code`/`vscode`/`opencode`/`codex`/`cursor`/`windsurf`. `--with-auto-capture`, `--configure`. |
+| `runar doctor`               | 21 read-only health checks. `--db`, `--json`, `--quiet`, `--timeout-ms`.       |
+| `runar setup <tool>`         | Wire MCP into `claude-code`/`vscode`/`opencode`/`codex`/`cursor`/`windsurf`. `--with-auto-capture`, `--with-search-hints`, `--with-graph-autorefresh`, `--all-projects`, `--configure`. |
 | `runar update`               | Self-update binary via release manifest. `--check`, `--channel`, `--rollback`. |
 | `runar search <query>`       | CLI-side semantic search; `--limit`.                                           |
 | `runar save <title> <body>`  | Save a memory entry from the shell. `--project`, `--type`, `--tags`, `--topic-key`. |
@@ -227,6 +293,8 @@ opens the store read-only. No CORS headers are sent.
 | `runar graph status`         | Symbol-graph coverage: files indexed, skipped by language, symbols, edges, unresolved calls. |
 | `runar graph serve`          | Open the code view on localhost. `--project`, `--port` (0 = pick one), `--no-open`. |
 | `runar graph export`         | Write the code view to one self-contained HTML file. `--project`, `--output`.  |
+| `runar graph refresh`        | Re-index an already-built graph so it matches the working tree. `--project`, `--path`, `--full`, `--check` (report only; exits 0 current / 2 stale / 3 cannot tell). |
+| `runar graph autorefresh`    | Hook entry point: start a background refresh if one is due. `--silent` for hook use; opt in via `setup claude-code --with-graph-autorefresh`. |
 | `runar hint`                 | PreToolUse `Grep|Glob` search hints from the symbol graph. `--silent` for hook use; opt in via `setup claude-code --with-search-hints`. |
 | `runar architecture`         | Latest architecture summary for a project.                                     |
 | `runar techdebt`             | List TODO/FIXME/HACK/XXX markers. `--type`.                                    |
@@ -286,7 +354,7 @@ with the package they belong to.
 | `huginn_status`       | Crawl status + entry breakdown for a project.                       |
 | `huginn_architecture` | Latest architecture summary.                                        |
 | `huginn_techdebt`     | TODO/FIXME/HACK/XXX entries from the crawler.                       |
-| `huginn_recrawl_file` | Re-analyze a single file after editing (memory entry + symbol graph). |
+| `huginn_recrawl_file` | Re-analyze a single file after editing (memory entry only — the symbol graph is whole-project; use `runar graph refresh`). |
 | `huginn_search_graph` | Full-text search over symbol names, ranked, with an optional label filter. |
 | `huginn_symbol`       | One symbol: definition site, signature, metrics, one-hop callers and callees. |
 | `huginn_trace`        | Walk callers or callees from a symbol, or find a path between two.  |
@@ -357,13 +425,15 @@ Config lives at `~/.runar-forge/.env`. Edit via `runar config set <KEY> <VAL>`.
 
 | Var                          | Default | Effect                                                                    |
 |------------------------------|---------|---------------------------------------------------------------------------|
-| `RUNAR_HOOK_BUDGET_MS`       | `5000`  | Outer budget for any single hook fire.                                    |
+| `RUNAR_HOOK_BUDGET_MS`       | `800`   | Outer budget for any single hook fire.                                    |
 | `RUNAR_DISABLE_HOOKS`        | unset   | Set to `1` to bypass all Claude Code hooks (escape hatch).                |
 | `RUNAR_PASSIVE_LEARNING`     | unset   | Set to `true` to enable `runar extract` rule-based capture.               |
 | `RUNAR_SAVE_PROMPTS`         | unset   | Persist captured prompts (otherwise scrubbed).                            |
 | `RUNAR_DEBUG`                | unset   | Enable internal debug log (`muninn_debug` MCP tool).                      |
 | `RUNAR_API_KEY`              | unset   | Reserved; not read by any current code path.                              |
 | `RUNAR_UPDATE_MANIFEST_URL`  | unset   | Override the release manifest URL for `runar update`.                     |
+| `RUNAR_GRAPH_AUTOREFRESH_MAX_FILES` | `20000` | Projects larger than this are left to a manual `runar graph refresh`. |
+| `RUNAR_GRAPH_LOCK_WAIT_MS`   | `120000`| How long an explicit crawl waits for a background refresh to finish.      |
 
 `docs/HOW_TO_USE_IT.md` covers each subsystem in depth.
 
