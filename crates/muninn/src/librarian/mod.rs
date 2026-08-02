@@ -185,9 +185,19 @@ impl MemoryLibrarian {
     }
 
     pub async fn deprecate(&self, id: Uuid) -> StorageResult<()> {
-        self.storage.delete(id).await?;
         // Phase 5.6.2 — soft-delete needs to propagate to remote.
-        self.enqueue_outbox_for_entry(id, OutboxOp::Delete).await;
+        //
+        // Snapshot BEFORE deleting. `storage.get` filters
+        // `deleted_at IS NULL`, so reading after the delete returns
+        // NotFound and the enqueue silently bails — which is why zero
+        // `delete` rows had ever reached the outbox. Every deletion in
+        // the tree (dedup, retirement, crawler cleanup) funnels through
+        // here, so with no delete ops a remote drain would resurrect
+        // everything the local side had cleaned up.
+        let snapshot = self.outbox_snapshot(id).await;
+        self.storage.delete(id).await?;
+        self.enqueue_outbox_snapshot(id, OutboxOp::Delete, snapshot)
+            .await;
         Ok(())
     }
 
@@ -199,16 +209,43 @@ impl MemoryLibrarian {
         if std::env::var("RUNAR_STORAGE_LOCAL").is_err() {
             return;
         }
-        let entry = match self.storage.get(entry_id).await {
-            Ok(e) => e,
-            Err(_) => return, // can't outbox what we can't read
-        };
-        let payload = match serde_json::to_value(&entry) {
-            Ok(v) => v,
+        let payload = self.outbox_snapshot(entry_id).await;
+        self.enqueue_outbox_snapshot(entry_id, op_kind, payload)
+            .await;
+    }
+
+    /// Serialize the current row for an outbox payload. `None` when the
+    /// row is unreadable or unserializable, or when hybrid mode is off.
+    async fn outbox_snapshot(&self, entry_id: Uuid) -> Option<serde_json::Value> {
+        if std::env::var("RUNAR_STORAGE_LOCAL").is_err() {
+            return None;
+        }
+        let entry = self.storage.get(entry_id).await.ok()?;
+        match serde_json::to_value(&entry) {
+            Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(error = %e, "outbox payload serialization failed");
-                return;
+                None
             }
+        }
+    }
+
+    /// Append an outbox row from an already-captured payload.
+    async fn enqueue_outbox_snapshot(
+        &self,
+        entry_id: Uuid,
+        op_kind: OutboxOp,
+        payload: Option<serde_json::Value>,
+    ) {
+        if std::env::var("RUNAR_STORAGE_LOCAL").is_err() {
+            return;
+        }
+        // A delete must propagate even if the pre-delete snapshot could
+        // not be taken: the tombstone is the point, not the body.
+        let payload = match (payload, op_kind) {
+            (Some(v), _) => v,
+            (None, OutboxOp::Delete) => serde_json::json!({ "id": entry_id.to_string() }),
+            (None, _) => return, // can't outbox what we can't read
         };
         if let Err(e) = self
             .storage
@@ -1390,6 +1427,84 @@ mod tests {
         storage.initialize().await.unwrap();
         let embedding = Arc::new(DisabledEmbeddingProvider);
         MemoryLibrarian::new(storage, embedding, "test", None)
+    }
+
+    /// Same, but keeping the storage handle so a test can read the
+    /// outbox the librarian wrote to.
+    async fn test_librarian_with_storage() -> (MemoryLibrarian, Arc<SqliteAdapter>) {
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let embedding = Arc::new(DisabledEmbeddingProvider);
+        let lib = MemoryLibrarian::new(storage.clone(), embedding, "test", None);
+        (lib, storage)
+    }
+
+    /// Deletes never reached the outbox: `deprecate` deleted first and
+    /// then asked `storage.get` for a payload, but `get` filters
+    /// `deleted_at IS NULL`, so it returned NotFound and the enqueue
+    /// bailed silently. Live dogfood DB: 3,946 outbox rows, every one an
+    /// `insert`, zero `delete` — a remote drain would have resurrected
+    /// every deduped and GC'd entry.
+    #[tokio::test]
+    async fn deprecate_enqueues_a_delete_op() {
+        let _env = crate::test_support::with_env("RUNAR_STORAGE_LOCAL", "sqlite");
+        let (lib, storage) = test_librarian_with_storage().await;
+
+        let saved = lib
+            .propose(MemoryEntryInput {
+                title: "doomed".into(),
+                content: "this entry gets retired".into(),
+                entry_type: EntryType::Note,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        lib.deprecate(saved.id).await.unwrap();
+
+        let rows = storage.claim_outbox(50, 10).await.unwrap();
+        let ops: Vec<_> = rows
+            .iter()
+            .filter(|r| r.entry_id == saved.id)
+            .map(|r| r.op_kind)
+            .collect();
+        assert!(
+            ops.contains(&OutboxOp::Delete),
+            "a soft-delete must enqueue a delete op, got {ops:?}"
+        );
+
+        // The tombstone carries the entry id even though the row is gone.
+        let del = rows
+            .iter()
+            .find(|r| r.entry_id == saved.id && r.op_kind == OutboxOp::Delete)
+            .unwrap();
+        assert_eq!(
+            del.row_payload.get("id").and_then(|v| v.as_str()),
+            Some(saved.id.to_string().as_str()),
+            "delete payload must identify the entry"
+        );
+    }
+
+    /// Outbox writes stay off unless hybrid mode is configured; a
+    /// single-backend user should never accumulate a queue.
+    #[tokio::test]
+    async fn deprecate_writes_no_outbox_row_outside_hybrid_mode() {
+        let _env = crate::test_support::with_env("RUNAR_STORAGE_LOCAL", "");
+        std::env::remove_var("RUNAR_STORAGE_LOCAL");
+        let (lib, storage) = test_librarian_with_storage().await;
+
+        let saved = lib
+            .propose(MemoryEntryInput {
+                title: "local only".into(),
+                content: "no sync configured".into(),
+                entry_type: EntryType::Note,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        lib.deprecate(saved.id).await.unwrap();
+
+        assert_eq!(storage.outbox_depth().await.unwrap(), 0);
     }
 
     #[tokio::test]

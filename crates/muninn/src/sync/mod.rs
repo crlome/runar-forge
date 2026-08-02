@@ -13,6 +13,7 @@ pub mod heartbeat;
 pub mod init;
 pub mod pull;
 pub mod push;
+pub mod repair;
 pub mod status;
 
 pub use bootstrap::cmd_bootstrap;
@@ -20,6 +21,7 @@ pub use gc::cmd_gc;
 pub use init::cmd_init;
 pub use pull::cmd_pull;
 pub use push::cmd_push;
+pub use repair::cmd_repair;
 pub use status::cmd_status;
 
 use anyhow::Result;

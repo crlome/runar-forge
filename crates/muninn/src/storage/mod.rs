@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::types::{
     ApplyOutcome, DebugLogEntry, DebugLogInput, DebugLogQuery, DuplicateCluster, GlobalStats,
     ListFilters, MemoryEdge, MemoryEdgeInput, MemoryEntry, MemoryEntryInput, MemoryStats,
-    MergeCounts, ObservationInput, OutboxInput, OutboxRow, PendingObservation, SaveResult,
-    SearchQuery, Session, SessionInput, SessionUpdate, SyncConflict, SyncState,
+    MergeCounts, ObservationInput, OutboxHealth, OutboxInput, OutboxRow, PendingObservation,
+    SaveResult, SearchQuery, Session, SessionInput, SessionUpdate, SyncConflict, SyncState,
 };
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -289,7 +289,11 @@ pub trait MemoryStorage: Send + Sync {
     /// Atomically claim up to `max` pending outbox rows in FIFO order
     /// (`confirmed_at IS NULL`, `claimed_at IS NULL`), flipping
     /// `claimed_at = now()` so concurrent pushers get disjoint sets.
-    async fn claim_outbox(&self, max: usize) -> StorageResult<Vec<OutboxRow>>;
+    ///
+    /// Rows at or beyond `max_attempts` are dead-lettered: they stay in
+    /// the table but are never claimed again, so one poisoned payload
+    /// cannot starve the queue behind it.
+    async fn claim_outbox(&self, max: usize, max_attempts: i32) -> StorageResult<Vec<OutboxRow>>;
 
     /// Mark outbox rows as confirmed (`confirmed_at = now()`).
     async fn confirm_outbox(&self, ids: &[Uuid]) -> StorageResult<()>;
@@ -299,8 +303,34 @@ pub trait MemoryStorage: Send + Sync {
     /// can be re-claimed.
     async fn fail_outbox(&self, id: Uuid, err: &str) -> StorageResult<()>;
 
+    /// Release claims held longer than `older_than_secs` by returning
+    /// `claimed_at` to NULL. A pusher that dies between claim and
+    /// confirm would otherwise strand its rows forever, since
+    /// `claim_outbox` only ever sees `claimed_at IS NULL`. Returns the
+    /// number of rows released. Confirmed rows are never touched.
+    async fn reap_stale_claims(&self, older_than_secs: i64) -> StorageResult<u64>;
+
+    /// Release a specific set of claims immediately, without waiting for
+    /// the staleness cutoff. Used by `--dry-run`, which claims rows it
+    /// never intends to push.
+    async fn release_outbox(&self, ids: &[Uuid]) -> StorageResult<()>;
+
+    /// Ids of soft-deleted entries that have at least one outbox row but
+    /// no `delete` op — i.e. the remote has been told (or is queued to be
+    /// told) the entry exists, and will never be told it went away.
+    ///
+    /// Repairs history written while `deprecate` silently dropped its
+    /// delete ops. Ordered oldest-deletion-first so a capped run makes
+    /// deterministic progress.
+    async fn deleted_entries_without_tombstone(&self, limit: usize) -> StorageResult<Vec<Uuid>>;
+
     /// Count of pending (unconfirmed) outbox rows.
     async fn outbox_depth(&self) -> StorageResult<usize>;
+
+    /// Breakdown of unconfirmed outbox rows by state. `outbox_depth`
+    /// sums these and so cannot distinguish a queue that is merely deep
+    /// from one that is wedged.
+    async fn outbox_health(&self, max_attempts: i32) -> StorageResult<OutboxHealth>;
 
     /// Delete confirmed outbox rows older than `older_than_secs`.
     /// Returns the number deleted. Pending rows are never touched.
