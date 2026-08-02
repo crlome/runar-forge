@@ -12,6 +12,7 @@ use crate::huginn::graph::parsers::Lang;
 use crate::huginn::scanner::FileEntry;
 
 use super::extract::{extract_file, is_supported};
+use super::freshness::{self, Snapshot};
 use super::resolve::{resolve, FileFacts};
 use super::store::{CodeGraphStore, FileRecord, RawFacts, Result, SymbolRecord};
 use super::{qualified_name, FileStatus};
@@ -47,7 +48,16 @@ pub fn index_project(
     root: &Path,
     files: &[FileEntry],
     full: bool,
+    observed: Option<Snapshot>,
 ) -> Result<IndexOutcome> {
+    // What the tree looked like when this pass began. Taken before any work so
+    // that an edit landing mid-index is outside the baseline and reads as
+    // stale next time: the graph may have missed it, and claiming otherwise is
+    // the one error this must never make. Callers that scanned the tree
+    // themselves pass the snapshot they took before scanning, which closes the
+    // same window over the scan.
+    let observed = observed.unwrap_or_else(|| freshness::snapshot(root));
+
     // A full pass clears the project first; an incremental one keeps every row
     // it is not about to replace.
     store.begin_project(project, root, full)?;
@@ -214,6 +224,10 @@ pub fn index_project(
     let summary = render_summary(store, project, &outcome)?;
     store.set_summary(project, &summary)?;
 
+    // Last, and only on the success path: a baseline recorded for a pass that
+    // then failed would claim a currency the stored graph does not have.
+    freshness::stamp(store, project, &observed)?;
+
     Ok(outcome)
 }
 
@@ -295,7 +309,7 @@ mod tests {
         ];
 
         let store = CodeGraphStore::in_memory().unwrap();
-        let out = index_project(&store, "p", root, &files, true).unwrap();
+        let out = index_project(&store, "p", root, &files, true, None).unwrap();
 
         assert_eq!(out.files_skipped, 2, "md and java are not parseable here");
         let cov = store.coverage("p").unwrap();
@@ -327,11 +341,11 @@ mod tests {
         };
 
         let full_store = CodeGraphStore::in_memory().unwrap();
-        index_project(&full_store, "p", root, &files(), true).unwrap();
+        index_project(&full_store, "p", root, &files(), true, None).unwrap();
         let full_cov = full_store.coverage("p").unwrap();
 
         let inc_store = CodeGraphStore::in_memory().unwrap();
-        index_project(&inc_store, "p", root, &files(), true).unwrap();
+        index_project(&inc_store, "p", root, &files(), true, None).unwrap();
         // Edit one file; the other two must be reused, not re-parsed.
         let changed = vec![
             entry(
@@ -342,7 +356,7 @@ mod tests {
             entry(root, "src/b.rs", "pub fn helper() {}\n"),
             entry(root, "src/c.rs", "pub fn gamma() {}\n"),
         ];
-        let out = index_project(&inc_store, "p", root, &changed, false).unwrap();
+        let out = index_project(&inc_store, "p", root, &changed, false, None).unwrap();
         assert_eq!(out.files_reused, 2, "unchanged files must not be re-parsed");
 
         let inc_cov = inc_store.coverage("p").unwrap();
@@ -362,10 +376,10 @@ mod tests {
         let b = entry(root, "src/b.rs", "pub fn beta() {}\n");
 
         let store = CodeGraphStore::in_memory().unwrap();
-        index_project(&store, "p", root, &[a.clone(), b], true).unwrap();
+        index_project(&store, "p", root, &[a.clone(), b], true, None).unwrap();
         assert_eq!(store.coverage("p").unwrap().symbols, 2);
 
-        index_project(&store, "p", root, &[a], false).unwrap();
+        index_project(&store, "p", root, &[a], false, None).unwrap();
         let cov = store.coverage("p").unwrap();
         assert_eq!(cov.symbols, 1, "the deleted file kept contributing symbols");
         assert_eq!(cov.files_total, 1);
@@ -377,11 +391,55 @@ mod tests {
         let root = dir.path();
         let files = vec![entry(root, "src/a.rs", "pub fn alpha() {}\n")];
         let store = CodeGraphStore::in_memory().unwrap();
-        index_project(&store, "p", root, &files, true).unwrap();
+        index_project(&store, "p", root, &files, true, None).unwrap();
 
         let summary = store.summary("p").unwrap().expect("summary is stored");
         assert!(summary.contains("symbols"), "got {summary}");
         assert!(summary.len() <= 600);
+    }
+
+    /// Through the real producer: whatever else an index does, it must leave
+    /// behind a record of the tree it read, or nothing downstream can tell a
+    /// current graph from a month-old one.
+    #[test]
+    fn an_index_records_the_tree_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![entry(root, "src/a.rs", "pub fn alpha() {}\n")];
+        let store = CodeGraphStore::in_memory().unwrap();
+        index_project(&store, "p", root, &files, true, None).unwrap();
+
+        let recorded = freshness::baseline(&store, "p").expect("every index leaves a baseline");
+        // A bare tempdir is not a repository, so the honest record is that it
+        // could not be judged — never a hash that would later compare equal.
+        assert_eq!(recorded.head, "no-git");
+        assert!(!matches!(
+            freshness::judge(Some(&recorded), &freshness::Snapshot::default()),
+            freshness::Verdict::Fresh
+        ));
+    }
+
+    /// The parameter exists so a caller that scanned the tree first can record
+    /// what it saw *before* scanning, rather than what the tree became while
+    /// the scan ran.
+    #[test]
+    fn a_caller_supplied_snapshot_is_the_one_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![entry(root, "src/a.rs", "pub fn alpha() {}\n")];
+        let store = CodeGraphStore::in_memory().unwrap();
+        let observed = freshness::Snapshot {
+            head: Some("cafebabe".into()),
+            dirty: Some("0".into()),
+        };
+        index_project(&store, "p", root, &files, true, Some(observed.clone())).unwrap();
+
+        let recorded = freshness::baseline(&store, "p").unwrap();
+        assert_eq!(recorded.head, "cafebabe");
+        assert_eq!(
+            freshness::judge(Some(&recorded), &observed),
+            freshness::Verdict::Fresh
+        );
     }
 
     #[test]
@@ -391,7 +449,7 @@ mod tests {
         let mut f = entry(root, "src/bad.rs", "pub fn x() {}\n");
         f.path = root.join("src/does-not-exist.rs");
         let store = CodeGraphStore::in_memory().unwrap();
-        let out = index_project(&store, "p", root, &[f], true).unwrap();
+        let out = index_project(&store, "p", root, &[f], true, None).unwrap();
         assert_eq!(out.files_errored, 1);
         assert_eq!(store.coverage("p").unwrap().errored, 1);
     }

@@ -462,6 +462,22 @@ impl<'a> CrawlOrchestrator<'a> {
             return None;
         }
 
+        // A background refresh may be writing this project's graph right now.
+        // Wait for it rather than interleave: both rebuild the whole edge
+        // table, and the refresh is short. Proceeding after the wait is
+        // deliberate — an explicit crawl silently skipping the graph would be
+        // worse than two writers against a WAL database with a busy timeout.
+        let _lock = crate::codegraph::refresh::RefreshLock::acquire_bounded(
+            &self.project_id,
+            crate::codegraph::refresh::crawl_lock_wait(),
+        );
+        if _lock.is_none() {
+            tracing::warn!(
+                project = %self.project_id,
+                "a graph refresh still holds the lock; indexing anyway"
+            );
+        }
+
         let store = match CodeGraphStore::open_default() {
             Ok(s) => s,
             Err(e) => {
@@ -469,7 +485,7 @@ impl<'a> CrawlOrchestrator<'a> {
                 return None;
             }
         };
-        match index::index_project(&store, &self.project_id, root, files, full) {
+        match index::index_project(&store, &self.project_id, root, files, full, None) {
             Ok(outcome) => {
                 tracing::info!(
                     symbols = outcome.symbols,

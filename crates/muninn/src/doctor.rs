@@ -19,6 +19,7 @@ use chrono::Utc;
 use serde::Serialize;
 use tokio_postgres::NoTls;
 
+use crate::codegraph::freshness::{self, Verdict};
 use crate::codegraph::store::{CodeGraphStore, Coverage};
 use crate::setup;
 use crate::storage::postgres::PG_MIGRATIONS;
@@ -218,6 +219,10 @@ pub async fn run(opts: DoctorOpts) -> Report {
     report
         .checks
         .push(check_code_graph(&CodeGraphStore::default_path()));
+    report
+        .checks
+        .push(check_graph_freshness(&CodeGraphStore::default_path()));
+    report.checks.push(check_graph_autorefresh());
     report.checks.push(check_search_hints());
 
     if !opts.db_only {
@@ -872,7 +877,7 @@ fn run_sqlite_checks(report: &mut Report) {
 
 /// Every degraded code-graph state has the same fix. The graph is derived
 /// data, so rebuilding it is always correct and never loses anything.
-const CODEGRAPH_REMEDY: &str = "rebuild with `runar crawl <path> --project <id> --deep`";
+const CODEGRAPH_REMEDY: &str = "rebuild with `runar crawl <path> --project <id>`";
 
 /// Coverage costs a few aggregate queries per project, so the listing is
 /// bounded — doctor runs often and is not a coverage report.
@@ -936,10 +941,7 @@ fn check_code_graph(path: &Path) -> Check {
         |detail: String| Check::skip("code graph", format!("{detail}; {CODEGRAPH_REMEDY}"));
 
     if !path.exists() {
-        return degraded(format!(
-            "{} absent — no project crawled --deep",
-            path.display()
-        ));
+        return degraded(format!("{} absent — no project crawled", path.display()));
     }
 
     let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -1010,6 +1012,177 @@ fn check_code_graph(path: &Path) -> Check {
         return degraded(format!("{body}\n     no symbols in any project"));
     }
     Check::pass_with("code graph", body)
+}
+
+/// Does the graph still describe the tree it was built from?
+///
+/// Separate from `check_code_graph`, which reports whether a graph exists and
+/// is readable: a perfectly healthy graph can be describing yesterday's code,
+/// and that is the failure this feature exists to make visible.
+///
+/// Never a Fail — a stale graph is a graph that needs rebuilding, not a broken
+/// install — and never a silent Pass either. "Cannot judge" is reported as
+/// degraded rather than green, because a reader who sees green will trust the
+/// symbols. Costs two `git` calls per project, and none at all for a project
+/// whose root is gone, which is why it is bounded like its neighbour.
+fn check_graph_freshness(path: &Path) -> Check {
+    let name = "graph freshness";
+    if !path.exists() {
+        return Check::skip(name, "no code graph to judge".to_string());
+    }
+    // Read-only, like every other consumer of this file: judging staleness
+    // must never create or migrate the graph a crawl is writing.
+    let store = match CodeGraphStore::open_readonly(path) {
+        Ok(s) => s,
+        Err(e) => return Check::skip(name, format!("graph unreadable: {e}")),
+    };
+    let projects = match store.projects() {
+        Ok(p) => p,
+        Err(e) => return Check::skip(name, format!("project list unreadable: {e}")),
+    };
+    if projects.is_empty() {
+        return Check::skip(name, "no projects indexed".to_string());
+    }
+
+    let shown = projects.len().min(CODEGRAPH_MAX_PROJECTS);
+    let mut fresh: Vec<&str> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for project in projects.iter().take(shown) {
+        match freshness::verdict(&store, project) {
+            Verdict::Fresh => fresh.push(project),
+            Verdict::Stale { reason } => stale.push(format!("{project}: {reason}")),
+            Verdict::Unknown { reason } => unknown.push(format!("{project}: {reason}")),
+        }
+    }
+    // A bound that is not stated reads as a total: with more projects than are
+    // judged, "all fresh" would be a claim about projects nobody looked at.
+    let unjudged = projects.len() - shown;
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(stale.iter().cloned());
+    lines.extend(unknown.iter().cloned());
+    if !fresh.is_empty() {
+        lines.push(format!("current: {}", fresh.join(", ")));
+    }
+    if unjudged > 0 {
+        lines.push(format!("{unjudged} more project(s) not checked"));
+    }
+    let body = lines.join("\n     ");
+
+    if !stale.is_empty() {
+        return Check::skip(
+            name,
+            format!("{body}\n     refresh with `runar graph refresh --project <id>`"),
+        );
+    }
+    if !unknown.is_empty() {
+        return Check::skip(name, body);
+    }
+    Check::pass_with(name, body)
+}
+
+/// Report what the opt-in auto-refresh hook has actually been doing.
+///
+/// Reads only the stamp files it writes — no database, no git — because the
+/// question here is whether the hook is working, not whether the graph is
+/// current, which the check above already answers. An error left by the last
+/// attempt is a genuine failure: something is writing to the graph on every
+/// file save and getting it wrong.
+fn check_graph_autorefresh() -> Check {
+    let name = "graph auto-refresh";
+    let stamps = auto_refresh_stamps();
+    if stamps.is_empty() {
+        return Check::skip(
+            name,
+            "not enabled — opt in with `runar setup claude-code \
+             --with-graph-autorefresh` (needs a crawl first)"
+                .to_string(),
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut failing = Vec::new();
+    for (project, stamp) in &stamps {
+        let age = crate::protocol::now_ms().saturating_sub(stamp.last_attempt_ms) / 1000;
+        lines.push(format!(
+            "{project}: {} ({}s ago, {}ms)",
+            stamp.last_outcome, age, stamp.last_duration_ms
+        ));
+        if stamp.last_outcome.starts_with("error:") {
+            failing.push(project.clone());
+        }
+    }
+
+    // The stamps are a point sample — the last attempt, per project. What
+    // decides whether this hook keeps its place is the shape of the whole
+    // record: how often it finds work, what the slow tail costs, and whether
+    // it has ever failed.
+    let stats = crate::codegraph::refresh::refresh_stats();
+    if stats.fires() > 0 {
+        let mut summary = format!(
+            "{} fire(s): {} started a refresh, {} debounced",
+            stats.fires(),
+            stats.spawns,
+            stats.debounced
+        );
+        if let Some(rate) = stats.work_rate() {
+            summary.push_str(&format!("; {rate}% of runs had work"));
+        }
+        if let (Some(p50), Some(p95)) = (stats.median_ms(), stats.percentile_ms(95)) {
+            summary.push_str(&format!(
+                "; {} refresh(es), {p50}ms median / {p95}ms p95",
+                stats.refreshes
+            ));
+        }
+        lines.push(summary);
+        if let Some((reason, n)) = stats.skipped.first() {
+            lines.push(format!("most skipped: {reason} ({n})"));
+        }
+        if stats.errors > 0 {
+            lines.push(format!(
+                "{} error(s), most recent: {}",
+                stats.errors,
+                stats.last_error.clone().unwrap_or_default()
+            ));
+            failing.push("recorded errors".to_string());
+        }
+    }
+    let body = lines.join("\n     ");
+
+    if !failing.is_empty() {
+        return Check::fail_hint(
+            name,
+            body,
+            "check ~/.runar-forge/hook.log; disable with \
+             `runar setup claude-code --no-graph-autorefresh`",
+        );
+    }
+    Check::pass_with(name, body)
+}
+
+/// Every project the auto-refresh hook has recorded an attempt for.
+fn auto_refresh_stamps() -> Vec<(String, crate::codegraph::refresh::Stamp)> {
+    let dir = setup::runar_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `graph-refresh-<project>.stamp`, and never the `.lock` beside it.
+        let Some(project) = name
+            .strip_prefix("graph-refresh-")
+            .and_then(|rest| rest.strip_suffix(".stamp"))
+        else {
+            continue;
+        };
+        if let Some(stamp) = crate::codegraph::refresh::read_stamp(project) {
+            out.push((project.to_string(), stamp));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Wording matches `codegraph::format::coverage` so the two read the same.
@@ -1166,7 +1339,7 @@ mod tests {
         let c = check_code_graph(&dir.path().join("codegraph.db"));
         match c.status {
             Status::Skip { reason } => {
-                assert!(reason.contains("--deep"), "no remedy in: {reason}");
+                assert!(reason.contains("runar crawl"), "no remedy in: {reason}");
                 assert!(reason.contains("codegraph.db"), "no path in: {reason}");
             }
             other => panic!("expected skip, got {other:?}"),
@@ -1187,10 +1360,202 @@ mod tests {
         // rebuild rather than exiting non-zero.
         match c.status {
             Status::Skip { reason } => {
-                assert!(reason.contains("--deep"), "no remedy in: {reason}")
+                assert!(reason.contains("runar crawl"), "no remedy in: {reason}")
             }
             other => panic!("expected skip, got {other:?}"),
         }
+    }
+
+    /// Builds a real graph in a real repository, then asks doctor what it
+    /// thinks — the same path a user's `runar doctor` takes, including the
+    /// read-only open.
+    ///
+    /// The graph file lives outside the repository on purpose, as it does in
+    /// production: a graph written *inside* the tree it indexes is itself an
+    /// untracked change, so every index would leave the project instantly
+    /// stale by its own measurement.
+    fn graph_fixture(dir: &Path, db: &Path) -> Option<()> {
+        use crate::codegraph::index::index_project;
+        use crate::huginn::scanner::FileEntry;
+
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !run_git(&["init", "--quiet"]) {
+            return None;
+        }
+        fs::write(dir.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        if !run_git(&["add", "-A"])
+            || !run_git(&[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ])
+        {
+            return None;
+        }
+
+        let store = CodeGraphStore::open(db).unwrap();
+        let files = vec![FileEntry {
+            path: dir.join("a.rs"),
+            relative_path: "a.rs".to_string(),
+            size: 18,
+            line_count: 1,
+            last_modified: None,
+            extension: "rs".to_string(),
+        }];
+        index_project(&store, "p", dir, &files, true, None).unwrap();
+        Some(())
+    }
+
+    #[test]
+    fn graph_freshness_passes_only_while_the_tree_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("codegraph.db");
+        if graph_fixture(dir.path(), &path).is_none() {
+            return; // no git here; the module's own tests cover the logic
+        }
+
+        let c = check_graph_freshness(&path);
+        assert!(
+            matches!(c.status, Status::Pass),
+            "a just-indexed tree should be current, got {:?}",
+            c.status
+        );
+
+        // The same edit a user would make between crawls.
+        fs::write(dir.path().join("a.rs"), "pub fn alpha() { beta(); }\n").unwrap();
+        let c = check_graph_freshness(&path);
+        match c.status {
+            Status::Skip { reason } => {
+                assert!(reason.contains("working tree"), "unnamed signal: {reason}");
+                assert!(
+                    reason.contains("runar graph refresh"),
+                    "no remedy in: {reason}"
+                );
+                assert!(reason.contains('p'), "no project named in: {reason}");
+            }
+            other => panic!("a stale graph must not read green, got {other:?}"),
+        }
+    }
+
+    /// The failure mode worth a test of its own: a graph nobody can judge must
+    /// not be reported as current.
+    #[test]
+    fn graph_freshness_cannot_judge_a_project_without_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codegraph.db");
+        let store = CodeGraphStore::open(&path).unwrap();
+        crate::codegraph::index::index_project(&store, "p", dir.path(), &[], true, None).unwrap();
+        drop(store);
+
+        let c = check_graph_freshness(&path);
+        assert!(
+            !matches!(c.status, Status::Pass),
+            "an unjudgeable graph reported as current: {:?}",
+            c.status
+        );
+        match c.status {
+            Status::Skip { reason } => assert!(
+                reason.contains("git"),
+                "the reason should say why it cannot be judged: {reason}"
+            ),
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_freshness_without_a_baseline_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("codegraph.db");
+        if graph_fixture(dir.path(), &path).is_none() {
+            return;
+        }
+        // A graph written by a build that predates baselines at all.
+        let store = CodeGraphStore::open(&path).unwrap();
+        store.set_freshness("p", "").unwrap();
+        drop(store);
+
+        let c = check_graph_freshness(&path);
+        assert!(
+            !matches!(c.status, Status::Pass),
+            "a graph with no baseline reported as current: {:?}",
+            c.status
+        );
+    }
+
+    #[test]
+    fn auto_refresh_reports_nothing_when_it_was_never_enabled() {
+        crate::test_support::with_runar_home(|| {
+            let c = check_graph_autorefresh();
+            match c.status {
+                Status::Skip { reason } => assert!(
+                    reason.contains("--with-graph-autorefresh"),
+                    "no way in named: {reason}"
+                ),
+                other => panic!("expected skip, got {other:?}"),
+            }
+        });
+    }
+
+    /// A background writer that keeps failing must not read as healthy: it is
+    /// running on every file save and getting it wrong, and nobody would
+    /// notice except by seeing the graph never change.
+    #[test]
+    fn auto_refresh_failing_in_the_background_is_a_failure() {
+        crate::test_support::with_runar_home(|| {
+            use crate::codegraph::refresh::{write_stamp, Stamp};
+            write_stamp(
+                "p",
+                &Stamp {
+                    last_attempt_ms: crate::protocol::now_ms(),
+                    not_before_ms: 0,
+                    last_outcome: "error: codegraph db: disk I/O error".into(),
+                    last_duration_ms: 12,
+                },
+            );
+            let c = check_graph_autorefresh();
+            assert!(
+                matches!(c.status, Status::Fail { .. }),
+                "a failing background writer read as {:?}",
+                c.status
+            );
+
+            // A healthy one passes and says what it did.
+            write_stamp(
+                "p",
+                &Stamp {
+                    last_attempt_ms: crate::protocol::now_ms(),
+                    not_before_ms: 0,
+                    last_outcome: "done".into(),
+                    last_duration_ms: 310,
+                },
+            );
+            let c = check_graph_autorefresh();
+            assert!(matches!(c.status, Status::Pass), "got {:?}", c.status);
+            let detail = c.detail.unwrap_or_default();
+            assert!(detail.contains("310ms"), "got {detail}");
+        });
+    }
+
+    #[test]
+    fn graph_freshness_has_nothing_to_say_without_a_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = check_graph_freshness(&dir.path().join("codegraph.db"));
+        assert!(matches!(c.status, Status::Skip { .. }));
     }
 
     #[test]

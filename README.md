@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/@runar-forge/cli?label=npm)](https://www.npmjs.com/package/@runar-forge/cli)
 [![CI](https://img.shields.io/github/actions/workflow/status/crlome/runar-forge/ci.yml?branch=main&label=CI)](https://github.com/crlome/runar-forge/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/crlome/runar-forge)](LICENSE)
-![tests](https://img.shields.io/badge/tests-580%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-633%20passing-brightgreen)
 ![languages](https://img.shields.io/badge/languages-5-orange)
 ![platforms](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-supported-lightgrey)
 

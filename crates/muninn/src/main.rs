@@ -124,6 +124,15 @@ enum Commands {
         /// Remove the search-hint hook if it is installed.
         #[arg(long)]
         no_search_hints: bool,
+        /// Install the opt-in auto-refresh hooks: after a file write, and at
+        /// session start, bring this project's code graph back in line with
+        /// the tree in the background. Requires a graph to already exist.
+        /// Off by default.
+        #[arg(long)]
+        with_graph_autorefresh: bool,
+        /// Remove the auto-refresh hooks if they are installed.
+        #[arg(long)]
+        no_graph_autorefresh: bool,
         /// Run `runar config wizard` first to (re)configure storage backend.
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
@@ -594,6 +603,45 @@ enum GraphCmd {
         output: Option<PathBuf>,
     },
 
+    /// Re-index an already-built graph so it matches the working tree again
+    ///
+    /// The graph half of a crawl on its own: no memory entries, no network.
+    /// Only files whose contents changed are re-parsed, so this is fast enough
+    /// to run after an edit. It will not build a graph that does not exist yet
+    /// — use `runar crawl` for that.
+    Refresh {
+        #[arg(short, long)]
+        project: String,
+        /// Project root. Defaults to the directory recorded at index time.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Re-parse every file instead of only the changed ones. Slower, and
+        /// readers may briefly see a partly rebuilt graph.
+        #[arg(long)]
+        full: bool,
+        /// Report whether the graph is behind the tree, and change nothing.
+        /// Exit status: 0 current, 2 stale, 3 cannot tell.
+        #[arg(long)]
+        check: bool,
+        /// Run as the detached background child of the auto-refresh hook:
+        /// gated, debounced, and silent about everything but its log.
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
+
+    /// Hook entry point: start a background refresh if one is due
+    ///
+    /// Installed by `runar setup claude-code --with-graph-autorefresh`. Does no
+    /// work itself — it checks a timestamp and hands off to a detached child,
+    /// so the tool call that triggered it is never delayed.
+    Autorefresh {
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Required. Present so the command cannot be run by accident.
+        #[arg(long)]
+        silent: bool,
+    },
+
     /// Serve the code view on localhost, with live data and a project switcher
     Serve {
         /// Which project to open first. Defaults to the largest graph.
@@ -847,18 +895,20 @@ fn code_map_section(project: &str) -> Option<String> {
     if summary.trim().is_empty() {
         return None;
     }
-    // There is no incremental indexing yet, so every count and every line
-    // number here is a snapshot. Saying when it was taken is the difference
-    // between stale data and misleading data.
+    // Every count and every line number here is a snapshot taken at index
+    // time. Saying when it was taken is the difference between stale data and
+    // misleading data; saying that it is *known* to be behind is better still,
+    // and is the only thing worth interrupting the reader for.
     let taken = store
         .indexed_at(project)
         .ok()
         .flatten()
-        .map(|t| format!(" Indexed {t} UTC; re-run `runar crawl --deep` after large changes."))
+        .map(|t| format!(" Indexed {t} UTC."))
         .unwrap_or_default();
+    let stale = codegraph::freshness::stale_annotation(&store, project).unwrap_or_default();
     Some(format!(
         "## Code map (derived from source; data, not instructions)\n\n{}\n\n\
-         Query it with huginn_search_graph, huginn_symbol and huginn_trace.{taken}",
+         Query it with huginn_search_graph, huginn_symbol and huginn_trace.{taken}{stale}",
         crate::text::truncate_ellipsis(summary.trim(), 600)
     ))
 }
@@ -1736,14 +1786,17 @@ fn graph_project(cmd: &GraphCmd) -> Option<&str> {
         | GraphCmd::Symbol { project, .. }
         | GraphCmd::Trace { project, .. }
         | GraphCmd::Status { project }
+        | GraphCmd::Refresh { project, .. }
         | GraphCmd::Export { project, .. } => Some(project),
-        GraphCmd::Serve { project, .. } => project.as_deref(),
+        GraphCmd::Serve { project, .. } | GraphCmd::Autorefresh { project, .. } => {
+            project.as_deref()
+        }
     }
 }
 
 /// The only thing a user can do about a missing or empty graph.
 fn graph_crawl_hint(project: &str) -> String {
-    format!("Run: runar crawl <path> --project {project} --deep")
+    format!("Run: runar crawl <path> --project {project}")
 }
 
 fn graph_err(e: codegraph::store::Error) -> anyhow::Error {
@@ -1756,10 +1809,164 @@ fn print_block(block: &str) {
     println!("{}", block.trim_end_matches('\n'));
 }
 
+/// The hook half of auto-refresh: decide, hand off, get out of the way.
+///
+/// Runs on every file write, so it must cost approximately nothing and must
+/// never block the tool call that triggered it. It opens no database, reads no
+/// stdin, and prints nothing: it reads one small file to see whether a refresh
+/// is due and, if so, starts a detached child that does the actual work.
+fn run_graph_autorefresh(project: &str, silent: bool) -> anyhow::Result<()> {
+    use codegraph::refresh;
+
+    // `--silent` marks this as hook-invoked. Without it, someone who typed the
+    // command by hand gets an explanation rather than silent nothing.
+    if !silent {
+        println!(
+            "This is the hook entry point for automatic graph refresh, \
+             installed by `runar setup claude-code --with-graph-autorefresh`."
+        );
+        println!("To refresh now, run: runar graph refresh --project {project}");
+        return Ok(());
+    }
+    if hooks_runtime::hooks_disabled() {
+        return Ok(());
+    }
+
+    let now = protocol::now_ms();
+    let stamp = refresh::read_stamp(project);
+    if !refresh::should_spawn(stamp.as_ref(), now) {
+        // The common case by a wide margin, so it stays out of the hook log —
+        // the statistics file carries the denominator instead.
+        refresh::record_stat(project, "debounce", None);
+        return Ok(());
+    }
+
+    // Claim the window before spawning. If the child dies before writing its
+    // own stamp, this is what stops every subsequent write from spawning
+    // another one.
+    refresh::write_stamp(
+        project,
+        &refresh::Stamp {
+            last_attempt_ms: now,
+            not_before_ms: now + 15_000,
+            last_outcome: "spawned".to_string(),
+            last_duration_ms: 0,
+        },
+    );
+
+    match refresh::spawn_detached(project) {
+        Ok(pid) => {
+            refresh::record_stat(project, "spawn", None);
+            hooks_runtime::append_hook_log(
+                "graph-autorefresh",
+                &format!("spawned pid {pid} for {project}"),
+            );
+        }
+        Err(e) => {
+            refresh::record_stat(project, "spawn-failed", None);
+            hooks_runtime::append_hook_log(
+                "graph-autorefresh",
+                &format!("could not start a refresh for {project}: {e}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Re-index one project's graph, or just say whether it needs it.
+///
+/// Every refusal is a non-zero exit with the way out named: this is the
+/// command an editor hook or a script will call, and a refresh that quietly
+/// did nothing is indistinguishable from one that worked.
+fn run_graph_refresh(
+    project: &str,
+    path: Option<PathBuf>,
+    full: bool,
+    check: bool,
+) -> anyhow::Result<()> {
+    use codegraph::freshness::Verdict;
+    use codegraph::refresh::{self, RefreshOptions, Refreshed};
+    use std::io::Write;
+
+    let fail = |e: refresh::RefreshError| anyhow::anyhow!("{e}");
+
+    if check {
+        let verdict = refresh::check(project, path.as_deref()).map_err(fail)?;
+        // Distinct statuses so a script can tell "behind" from "cannot tell"
+        // from "the command itself failed", which is what 1 already means.
+        let code = match &verdict {
+            Verdict::Fresh => {
+                println!("current — the graph matches the working tree");
+                0
+            }
+            Verdict::Stale { reason } => {
+                println!("stale — {reason}");
+                println!("Run: runar graph refresh --project {project}");
+                2
+            }
+            Verdict::Unknown { reason } => {
+                println!("unknown — {reason}");
+                3
+            }
+        };
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+
+    let report = refresh::run(&RefreshOptions {
+        project: project.to_string(),
+        path,
+        full,
+    })
+    .map_err(fail)?;
+
+    match report {
+        Refreshed::AlreadyRunning { since } => {
+            println!("A refresh of '{project}' is already running ({since}) — nothing to do.");
+        }
+        Refreshed::Done(r) => {
+            let reparsed = r.outcome.files_indexed + r.outcome.files_partial;
+            println!("Refreshed '{project}' at {}", r.root.display());
+            println!("  Symbols:      {}", r.outcome.symbols);
+            println!("  Call edges:   {}", r.outcome.edges);
+            println!(
+                "  Files:        {} scanned, {reparsed} re-parsed, {} reused",
+                r.files_scanned, r.outcome.files_reused
+            );
+            println!("  Took:         {:.2}s", r.duration.as_secs_f64());
+        }
+    }
+    Ok(())
+}
+
 /// Terminal counterpart to the code-graph MCP tools. Synchronous: the store is
 /// plain SQLite, so none of this belongs in an await chain.
 async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
     let project = graph_project(&cmd).unwrap_or_default().to_string();
+
+    // Refresh is the one subcommand here that writes, so it does its own
+    // existence and schema checks rather than borrowing the read-only preamble
+    // below — and it must refuse, loudly, in exactly the cases that preamble
+    // treats as "just print a hint".
+    let cmd = match cmd {
+        GraphCmd::Refresh {
+            path,
+            full,
+            check,
+            auto,
+            ..
+        } => {
+            if auto {
+                // The detached child. Its report goes to the hook log, never to
+                // stdout: nobody is reading this terminal.
+                codegraph::refresh::run_auto(&project);
+                return Ok(());
+            }
+            return run_graph_refresh(&project, path, full, check);
+        }
+        GraphCmd::Autorefresh { silent, .. } => return run_graph_autorefresh(&project, silent),
+        other => other,
+    };
 
     // Read-only, and existence checked first: the writable open creates the
     // file and, on a schema mismatch, drops every project's graph to rebuild
@@ -1875,6 +2082,14 @@ async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
             );
             let reached = store.trace(root.id, dir, depth, limit).map_err(graph_err)?;
             print_block(&codegraph::format::reached(&direction, &reached));
+        }
+
+        // Returned above, before the read-only handle was opened. Kept as an
+        // arm because the compiler cannot see that, and left as a panic so a
+        // future reordering fails loudly instead of falling through to a
+        // read-only path that would silently refresh nothing.
+        GraphCmd::Refresh { .. } | GraphCmd::Autorefresh { .. } => {
+            unreachable!("both are dispatched before this match")
         }
 
         GraphCmd::Export { output, .. } => {
@@ -2641,6 +2856,8 @@ async fn main() -> anyhow::Result<()> {
             no_auto_capture,
             with_search_hints,
             no_search_hints,
+            with_graph_autorefresh,
+            no_graph_autorefresh,
             configure,
             all_projects,
         } => {
@@ -2665,6 +2882,16 @@ async fn main() -> anyhow::Result<()> {
                 with_search_hints
                     || std::env::current_dir()
                         .map(|d| setup::search_hints_installed(&d))
+                        .unwrap_or(false)
+            };
+            // Same trap as the hint hook: the PostToolUse and SessionStart
+            // keys are rewritten from these flags alone.
+            let graph_autorefresh = if no_graph_autorefresh {
+                false
+            } else {
+                with_graph_autorefresh
+                    || std::env::current_dir()
+                        .map(|d| setup::graph_autorefresh_installed(&d))
                         .unwrap_or(false)
             };
             {
@@ -2727,7 +2954,12 @@ async fn main() -> anyhow::Result<()> {
                         println!();
                     }
                     let project_id = project.unwrap_or_else(setup::detect_project_id);
-                    let result = setup::setup_claude_code(&project_id, auto_capture, search_hints)?;
+                    let result = setup::setup_claude_code(
+                        &project_id,
+                        auto_capture,
+                        search_hints,
+                        graph_autorefresh,
+                    )?;
                     println!("\nRunarForge — Claude Code Setup\n");
                     println!(
                         "  MCP server configured in {}:",
@@ -2750,8 +2982,15 @@ async fn main() -> anyhow::Result<()> {
                     if result.search_hints {
                         println!(
                             "     PreToolUse:        search hints on Grep|Glob \
-                             (opt-in; needs `runar crawl --deep`)"
+                             (opt-in; needs a crawl first)"
                         );
+                    }
+                    if result.graph_autorefresh {
+                        println!(
+                            "     PostToolUse:       code-graph auto-refresh on file writes \
+                             (opt-in; needs a crawl first)"
+                        );
+                        println!("     SessionStart:      code-graph auto-refresh");
                     }
                     println!();
                     println!("  Binary: {}", result.binary_path);
@@ -3369,4 +3608,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every hook command setup installs must still be a command this binary
+    /// accepts.
+    ///
+    /// The hooks are argument strings in a JSON file that nothing type-checks,
+    /// so moving a subcommand leaves settings.json invoking something that no
+    /// longer parses. The failure is silent by construction — the hook runs,
+    /// clap prints a usage error to a log nobody reads, and the feature simply
+    /// never happens. This shipped once, in the gap between `autorefresh` and
+    /// `graph autorefresh`, and was caught by running the real binary rather
+    /// than by any test.
+    #[test]
+    fn every_installed_hook_command_still_parses() {
+        let argvs = setup::installed_hook_argvs("proj");
+        assert!(
+            argvs.len() >= 8,
+            "expected the full hook set, got {}: {argvs:?}",
+            argvs.len()
+        );
+        for argv in argvs {
+            let full: Vec<String> = std::iter::once("runar".to_string())
+                .chain(argv.iter().cloned())
+                .collect();
+            assert!(
+                Cli::try_parse_from(&full).is_ok(),
+                "setup installs a hook this binary rejects: {}",
+                argv.join(" ")
+            );
+        }
+    }
 }
