@@ -190,13 +190,16 @@ fn ep(path: &str, framework: Framework, confidence: f64) -> EntryPoint {
 /// present (case-insensitive). Returns false on IO error — better to miss a
 /// framework hit than crash the crawl.
 fn sniff(f: &FileEntry, needles: &[&str]) -> bool {
-    let Ok(mut content) = fs::read_to_string(&f.path) else {
+    let Ok(content) = fs::read_to_string(&f.path) else {
         return false;
     };
-    if content.len() > 8192 {
-        content.truncate(8192);
-    }
-    let lower = content.to_lowercase();
+    // 8192 is a BYTE budget, and `String::truncate` panics when that index
+    // lands inside a multibyte character — which crashed the whole crawl,
+    // exactly what this function's "better to miss a hit than crash"
+    // contract exists to prevent. Three files in this repo trip it: byte
+    // 8192 falls inside a `─` from a `// ── Section ──` divider.
+    let head = crate::text::byte_prefix(&content, 8192);
+    let lower = head.to_lowercase();
     needles.iter().any(|n| lower.contains(n))
 }
 
@@ -215,6 +218,48 @@ mod tests {
             last_modified: Some(SystemTime::now()),
             extension: rel.rsplit('.').next().unwrap_or("").to_string(),
         }
+    }
+
+    /// `sniff` crashed the entire crawl on a file whose byte 8192 fell inside
+    /// a multibyte character — the `─` of a `// ── Section ──` divider, which
+    /// this codebase uses everywhere. Three files in this repo trip it.
+    ///
+    /// Asserted through `sniff` itself, not through the helper: the helper
+    /// being correct proved nothing about the caller, and that exact gap let
+    /// two other bugs ship this week.
+    #[test]
+    fn sniffing_a_file_with_a_multibyte_char_at_the_read_cap_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.rs");
+
+        // Pad so byte 8192 lands mid-character, then put the needle AFTER the
+        // cap so we also prove the budget is still enforced.
+        let body = "a".repeat(8191) + &"─".repeat(50) + "needle-past-the-cap";
+        assert!(
+            !body.is_char_boundary(8192),
+            "fixture must straddle the cap"
+        );
+        std::fs::write(&p, &body).unwrap();
+
+        let f = mk_file("big.rs", p);
+        assert!(
+            !sniff(&f, &["needle-past-the-cap"]),
+            "content beyond the 8 KiB cap must not be searched"
+        );
+        assert!(sniff(&f, &["aaa"]), "content before the cap still matches");
+    }
+
+    /// The contract in `sniff`'s own doc comment: never crash the crawl.
+    #[test]
+    fn sniff_returns_false_rather_than_failing_on_unreadable_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = mk_file("nope.rs", dir.path().join("nope.rs"));
+        assert!(!sniff(&missing, &["anything"]));
+
+        // Invalid UTF-8 is an IO/decode failure, not a panic.
+        let bin = dir.path().join("bin.rs");
+        std::fs::write(&bin, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(!sniff(&mk_file("bin.rs", bin), &["anything"]));
     }
 
     #[test]
