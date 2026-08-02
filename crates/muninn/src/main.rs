@@ -1837,7 +1837,7 @@ fn run_graph_autorefresh(project: &str, silent: bool) -> anyhow::Result<()> {
     if !refresh::should_spawn(stamp.as_ref(), now) {
         // The common case by a wide margin, so it stays out of the hook log —
         // the statistics file carries the denominator instead.
-        refresh::record_stat(project, "debounce");
+        refresh::record_stat(project, "debounce", None);
         return Ok(());
     }
 
@@ -1856,14 +1856,14 @@ fn run_graph_autorefresh(project: &str, silent: bool) -> anyhow::Result<()> {
 
     match refresh::spawn_detached(project) {
         Ok(pid) => {
-            refresh::record_stat(project, "spawn");
+            refresh::record_stat(project, "spawn", None);
             hooks_runtime::append_hook_log(
                 "graph-autorefresh",
                 &format!("spawned pid {pid} for {project}"),
             );
         }
         Err(e) => {
-            refresh::record_stat(project, "spawn-failed");
+            refresh::record_stat(project, "spawn-failed", None);
             hooks_runtime::append_hook_log(
                 "graph-autorefresh",
                 &format!("could not start a refresh for {project}: {e}"),

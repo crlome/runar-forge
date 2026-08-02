@@ -283,7 +283,11 @@ pub struct Stamp {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AutoOutcome {
-    Refreshed { files: usize, duration_ms: i64 },
+    Refreshed {
+        files: usize,
+        scanned: usize,
+        duration_ms: i64,
+    },
     Skipped(String),
     Failed(String),
 }
@@ -333,11 +337,20 @@ pub fn write_stamp(project: &str, stamp: &Stamp) {
     }
 }
 
+pub fn stats_path() -> PathBuf {
+    crate::setup::runar_dir().join("graph-refresh-stats.tsv")
+}
+
 /// One tab-separated line per decision, for judging later whether this hook
 /// earns its keep. Mirrors what the search-hint hook records.
-pub fn record_stat(project: &str, outcome: &str) {
+///
+/// The cost columns are what make a soak worth running: an outcome alone says
+/// the hook is alive, but not whether it is getting slower, how much work each
+/// pass actually does, or what a bad day looks like. None of that can be
+/// reconstructed afterwards from a stamp holding only the last run.
+pub fn record_stat(project: &str, outcome: &str, cost: Option<RefreshCost>) {
     use std::io::Write;
-    let path = crate::setup::runar_dir().join("graph-refresh-stats.tsv");
+    let path = stats_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -346,8 +359,132 @@ pub fn record_stat(project: &str, outcome: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{}\t{project}\t{outcome}", crate::protocol::now_ms());
+        let (ms, reparsed, scanned) = match cost {
+            Some(c) => (
+                c.duration_ms.to_string(),
+                c.files_reparsed.to_string(),
+                c.files_scanned.to_string(),
+            ),
+            None => ("-".into(), "-".into(), "-".into()),
+        };
+        let _ = writeln!(
+            f,
+            "{}\t{project}\t{outcome}\t{ms}\t{reparsed}\t{scanned}",
+            crate::protocol::now_ms()
+        );
     }
+}
+
+/// What one automatic pass cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshCost {
+    pub duration_ms: i64,
+    pub files_reparsed: usize,
+    pub files_scanned: usize,
+}
+
+/// Everything the recorded rows can answer, for `runar doctor` and for
+/// deciding whether this hook should stay opt-in.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RefreshStats {
+    /// Hook fires that started a child.
+    pub spawns: usize,
+    /// Hook fires the debounce turned away.
+    pub debounced: usize,
+    /// Passes that actually re-indexed.
+    pub refreshes: usize,
+    /// Children that decided there was nothing to do, by reason.
+    pub skipped: Vec<(String, usize)>,
+    pub errors: usize,
+    pub last_error: Option<String>,
+    /// Durations of successful passes, ascending.
+    durations_ms: Vec<i64>,
+    pub files_reparsed: usize,
+    pub projects: usize,
+}
+
+impl RefreshStats {
+    /// Hook fires, however they ended.
+    pub fn fires(&self) -> usize {
+        self.spawns + self.debounced
+    }
+
+    /// Of the children that ran, how many found work. A number that falls
+    /// towards zero means the hook is spawning processes for nothing.
+    pub fn work_rate(&self) -> Option<usize> {
+        let ran = self.refreshes + self.skipped.iter().map(|(_, n)| n).sum::<usize>();
+        (self.refreshes * 100).checked_div(ran)
+    }
+
+    pub fn median_ms(&self) -> Option<i64> {
+        self.percentile_ms(50)
+    }
+
+    /// Nearest-rank percentile. The tail is the number that matters here: a
+    /// median refresh is always fast, and what would make this unacceptable is
+    /// the occasional slow one.
+    pub fn percentile_ms(&self, p: usize) -> Option<i64> {
+        if self.durations_ms.is_empty() {
+            return None;
+        }
+        let rank = (self.durations_ms.len() * p).div_ceil(100).max(1);
+        self.durations_ms.get(rank - 1).copied()
+    }
+}
+
+/// Read the recorded rows.
+///
+/// Tolerates the three-column rows written before the cost columns existed, so
+/// a soak already in progress is not thrown away by an upgrade.
+pub fn refresh_stats() -> RefreshStats {
+    let Ok(body) = std::fs::read_to_string(stats_path()) else {
+        return RefreshStats::default();
+    };
+    let mut out = RefreshStats::default();
+    let mut skipped: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut projects: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in body.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        // Timestamp, project, outcome, then optionally the cost columns.
+        let (Some(project), Some(outcome)) = (cols.get(1), cols.get(2)) else {
+            continue;
+        };
+        projects.insert((*project).to_string());
+        let duration = cols.get(3).and_then(|v| v.parse::<i64>().ok());
+        let reparsed = cols.get(4).and_then(|v| v.parse::<usize>().ok());
+
+        match *outcome {
+            "spawn" => out.spawns += 1,
+            "debounce" => out.debounced += 1,
+            "done" => {
+                out.refreshes += 1;
+                if let Some(ms) = duration {
+                    out.durations_ms.push(ms);
+                }
+                out.files_reparsed += reparsed.unwrap_or(0);
+            }
+            other if other.starts_with("error") => {
+                out.errors += 1;
+                out.last_error = Some(other.to_string());
+            }
+            other if other.starts_with("skip") => {
+                let reason = other.strip_prefix("skip: ").unwrap_or(other);
+                *skipped.entry(reason.to_string()).or_default() += 1;
+            }
+            // `spawn-failed` and anything a later version writes.
+            other => {
+                *skipped.entry(other.to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    out.durations_ms.sort_unstable();
+    out.projects = projects.len();
+    let mut skipped: Vec<(String, usize)> = skipped.into_iter().collect();
+    skipped.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out.skipped = skipped;
+    out
 }
 
 /// Start a refresh that outlives this process.
@@ -406,7 +543,22 @@ pub fn run_auto(project: &str) -> AutoOutcome {
             last_duration_ms: duration_ms,
         },
     );
-    record_stat(project, &outcome.label());
+    // Cost columns only where there was a cost: a skip's duration is the cost
+    // of deciding not to work, which would drag every percentile down towards
+    // zero and make a slow refresh invisible.
+    let cost = match &outcome {
+        AutoOutcome::Refreshed {
+            files,
+            scanned,
+            duration_ms,
+        } => Some(RefreshCost {
+            duration_ms: *duration_ms,
+            files_reparsed: *files,
+            files_scanned: *scanned,
+        }),
+        _ => None,
+    };
+    record_stat(project, &outcome.label(), cost);
     crate::hooks_runtime::append_hook_log(
         "graph-autorefresh",
         &format!("{} ({project}, {duration_ms}ms)", outcome.label()),
@@ -506,6 +658,7 @@ fn decide_and_run(project: &str, started: Instant) -> (AutoOutcome, i64) {
             (
                 AutoOutcome::Refreshed {
                     files: outcome.files_indexed + outcome.files_partial,
+                    scanned: scan.files.len(),
                     duration_ms,
                 },
                 next_gap_ms(duration_ms),
@@ -1142,6 +1295,20 @@ mod tests {
         assert_eq!(store.search("p", "beta_auto", None, 5).unwrap().len(), 1);
         drop(store);
 
+        // Through the real child, not a hand-made row: what a pass cost has to
+        // survive into the record, or a week of soaking answers nothing about
+        // how expensive this actually is.
+        let stats = refresh_stats();
+        assert_eq!(stats.refreshes, 1);
+        assert!(
+            stats.median_ms().is_some(),
+            "the child recorded a refresh with no duration"
+        );
+        assert!(
+            stats.files_reparsed >= 1,
+            "the child recorded no work done: {stats:?}"
+        );
+
         // And now it settles: the second run has nothing to do.
         assert!(matches!(run_auto("p"), AutoOutcome::Skipped(_)));
         std::env::remove_var("RUNAR_HOME");
@@ -1245,6 +1412,81 @@ mod tests {
             AutoOutcome::Skipped(reason) => assert!(reason.contains("ceiling"), "{reason}"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// The recorded rows have to answer the questions a soak is run to
+    /// answer, and the cost of a pass cannot be reconstructed later: the stamp
+    /// keeps only the last one.
+    #[test]
+    fn the_record_answers_what_a_soak_needs_to_know() {
+        let runar = tempfile::tempdir().unwrap();
+        let _g = with_env("RUNAR_HOME", runar.path().to_str().unwrap());
+
+        record_stat("p", "spawn", None);
+        record_stat("p", "debounce", None);
+        for ms in [100, 200, 300, 400, 5_000] {
+            record_stat(
+                "p",
+                "done",
+                Some(RefreshCost {
+                    duration_ms: ms,
+                    files_reparsed: 2,
+                    files_scanned: 160,
+                }),
+            );
+        }
+        record_stat("p", "skip: nothing changed since the last index", None);
+        record_stat("q", "error: codegraph db: disk I/O error", None);
+
+        let s = refresh_stats();
+        assert_eq!(s.spawns, 1);
+        assert_eq!(s.debounced, 1);
+        assert_eq!(s.fires(), 2);
+        assert_eq!(s.refreshes, 5);
+        assert_eq!(s.files_reparsed, 10);
+        assert_eq!(s.projects, 2);
+        assert_eq!(s.errors, 1);
+        assert!(s
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("disk I/O"));
+        assert_eq!(
+            s.skipped.first().map(|(r, n)| (r.as_str(), *n)),
+            Some(("nothing changed since the last index", 1))
+        );
+
+        // The tail is the point: a median that stays fast while the worst case
+        // grows is exactly the failure a soak is meant to surface.
+        assert_eq!(s.median_ms(), Some(300));
+        assert_eq!(s.percentile_ms(95), Some(5_000));
+        // 5 of 6 children found work.
+        assert_eq!(s.work_rate(), Some(83));
+    }
+
+    /// A soak already running must not be discarded by an upgrade that adds
+    /// columns to the file it is writing.
+    #[test]
+    fn rows_written_before_the_cost_columns_still_count() {
+        use std::io::Write;
+        let runar = tempfile::tempdir().unwrap();
+        let _g = with_env("RUNAR_HOME", runar.path().to_str().unwrap());
+        std::fs::create_dir_all(crate::setup::runar_dir()).unwrap();
+
+        let mut f = std::fs::File::create(stats_path()).unwrap();
+        writeln!(f, "1785690869495\tp\tspawn").unwrap();
+        writeln!(f, "1785690869501\tp\tdebounce").unwrap();
+        writeln!(f, "1785690869855\tp\tdone").unwrap();
+        drop(f);
+
+        let s = refresh_stats();
+        assert_eq!(s.fires(), 2, "old rows still count as fires");
+        assert_eq!(s.refreshes, 1);
+        assert_eq!(
+            s.median_ms(),
+            None,
+            "a row with no duration must not be read as a zero-millisecond refresh"
+        );
     }
 
     /// Every decision leaves a trace. A background task that quietly does

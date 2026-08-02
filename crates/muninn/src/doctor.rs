@@ -1113,6 +1113,41 @@ fn check_graph_autorefresh() -> Check {
             failing.push(project.clone());
         }
     }
+
+    // The stamps are a point sample — the last attempt, per project. What
+    // decides whether this hook keeps its place is the shape of the whole
+    // record: how often it finds work, what the slow tail costs, and whether
+    // it has ever failed.
+    let stats = crate::codegraph::refresh::refresh_stats();
+    if stats.fires() > 0 {
+        let mut summary = format!(
+            "{} fire(s): {} started a refresh, {} debounced",
+            stats.fires(),
+            stats.spawns,
+            stats.debounced
+        );
+        if let Some(rate) = stats.work_rate() {
+            summary.push_str(&format!("; {rate}% of runs had work"));
+        }
+        if let (Some(p50), Some(p95)) = (stats.median_ms(), stats.percentile_ms(95)) {
+            summary.push_str(&format!(
+                "; {} refresh(es), {p50}ms median / {p95}ms p95",
+                stats.refreshes
+            ));
+        }
+        lines.push(summary);
+        if let Some((reason, n)) = stats.skipped.first() {
+            lines.push(format!("most skipped: {reason} ({n})"));
+        }
+        if stats.errors > 0 {
+            lines.push(format!(
+                "{} error(s), most recent: {}",
+                stats.errors,
+                stats.last_error.clone().unwrap_or_default()
+            ));
+            failing.push("recorded errors".to_string());
+        }
+    }
     let body = lines.join("\n     ");
 
     if !failing.is_empty() {
