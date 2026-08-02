@@ -443,6 +443,20 @@ impl MemoryStorage for PostgresAdapter {
         Ok(row_to_entry(&row))
     }
 
+    async fn get_including_deleted(&self, id: Uuid) -> StorageResult<MemoryEntry> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT * FROM muninn.memory_entries WHERE id = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .map_err(db_err)?
+            .ok_or(StorageError::NotFound(id))?;
+
+        Ok(row_to_entry(&row))
+    }
+
     async fn get_by_topic_key(
         &self,
         namespace: &str,
@@ -2042,6 +2056,50 @@ impl MemoryStorage for PostgresAdapter {
                 Uuid::parse_str(&s).map_err(|e| StorageError::Database(e.to_string()))
             })
             .collect()
+    }
+
+    async fn malformed_delete_payloads(&self, limit: usize) -> StorageResult<Vec<(Uuid, Uuid)>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT id, entry_id FROM muninn.sync_outbox
+                 WHERE confirmed_at IS NULL
+                   AND op_kind = 'delete'
+                   AND row_payload->>'title' IS NULL
+                 ORDER BY created_at ASC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .await
+            .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                let a: String = r.get("id");
+                let b: String = r.get("entry_id");
+                Ok((
+                    Uuid::parse_str(&a).map_err(|e| StorageError::Database(e.to_string()))?,
+                    Uuid::parse_str(&b).map_err(|e| StorageError::Database(e.to_string()))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn rewrite_outbox_payload(
+        &self,
+        outbox_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE muninn.sync_outbox
+                 SET row_payload = $1, attempts = 0, last_error = NULL, claimed_at = NULL
+                 WHERE id = $2 AND confirmed_at IS NULL",
+                &[payload, &outbox_id.to_string()],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
     async fn outbox_depth(&self) -> StorageResult<usize> {

@@ -495,6 +495,22 @@ impl MemoryStorage for SqliteAdapter {
         })
     }
 
+    async fn get_including_deleted(&self, id: Uuid) -> StorageResult<MemoryEntry> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        db.query_row(
+            "SELECT * FROM memory_entries WHERE id = ?1",
+            params![id.to_string()],
+            row_to_entry,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StorageError::NotFound(id),
+            _ => db_err(e),
+        })
+    }
+
     async fn get_by_topic_key(
         &self,
         namespace: &str,
@@ -2366,6 +2382,62 @@ impl MemoryStorage for SqliteAdapter {
         ids.iter()
             .map(|s| Uuid::parse_str(s).map_err(|e| StorageError::Database(e.to_string())))
             .collect()
+    }
+
+    async fn malformed_delete_payloads(&self, limit: usize) -> StorageResult<Vec<(Uuid, Uuid)>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = db
+            .prepare(
+                "SELECT id, entry_id FROM sync_outbox
+                 WHERE confirmed_at IS NULL
+                   AND op_kind = 'delete'
+                   AND json_extract(row_payload, '$.title') IS NULL
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows.iter()
+            .map(|(a, b)| {
+                Ok((
+                    Uuid::parse_str(a).map_err(|e| StorageError::Database(e.to_string()))?,
+                    Uuid::parse_str(b).map_err(|e| StorageError::Database(e.to_string()))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn rewrite_outbox_payload(
+        &self,
+        outbox_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> StorageResult<()> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let body = serde_json::to_string(payload)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        // Reset attempts and the claim as well: the row failed for a
+        // reason that no longer applies, so it should not carry its old
+        // strikes toward the dead-letter cap.
+        db.execute(
+            "UPDATE sync_outbox
+             SET row_payload = ?1, attempts = 0, last_error = NULL, claimed_at = NULL
+             WHERE id = ?2 AND confirmed_at IS NULL",
+            params![body, outbox_id.to_string()],
+        )
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn outbox_depth(&self) -> StorageResult<usize> {
@@ -4581,6 +4653,116 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_including_deleted_is_the_only_reader_that_sees_a_tombstone() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        let id = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "gone".into(),
+                    content: "but not forgotten".into(),
+                    entry_type: crate::types::EntryType::Note,
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap()
+            .id;
+        adapter.delete(id).await.unwrap();
+
+        assert!(matches!(
+            adapter.get(id).await,
+            Err(StorageError::NotFound(_))
+        ));
+        let raw = adapter.get_including_deleted(id).await.unwrap();
+        assert_eq!(raw.title, "gone");
+        assert!(raw.deleted_at.is_some(), "must carry the tombstone marker");
+
+        // Still NotFound for an id that never existed.
+        assert!(matches!(
+            adapter.get_including_deleted(Uuid::new_v4()).await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    /// A delete row whose payload is not a full entry can never be
+    /// pushed — `push_one` deserializes into `MemoryEntry`. Repair finds
+    /// them structurally, so rows that have not failed yet count too.
+    #[tokio::test]
+    async fn malformed_delete_payloads_are_found_and_rewritten() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        let id = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "stub victim".into(),
+                    content: "body".into(),
+                    entry_type: crate::types::EntryType::Note,
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap()
+            .id;
+        adapter.delete(id).await.unwrap();
+
+        // the broken shape an earlier build wrote
+        let bad = adapter
+            .enqueue_outbox(crate::types::OutboxInput {
+                entry_id: id,
+                op_kind: crate::types::OutboxOp::Delete,
+                row_payload: serde_json::json!({ "id": id.to_string() }),
+            })
+            .await
+            .unwrap();
+        // a well-formed delete must NOT be reported
+        let good_entry = adapter.get_including_deleted(id).await.unwrap();
+        adapter
+            .enqueue_outbox(crate::types::OutboxInput {
+                entry_id: id,
+                op_kind: crate::types::OutboxOp::Delete,
+                row_payload: serde_json::to_value(&good_entry).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let found = adapter.malformed_delete_payloads(100).await.unwrap();
+        assert_eq!(found, vec![(bad, id)], "only the stub is unpushable");
+
+        // Burn some attempts so the reset is observable.
+        adapter
+            .fail_outbox(bad, "payload deserialize")
+            .await
+            .unwrap();
+        adapter
+            .rewrite_outbox_payload(bad, &serde_json::to_value(&good_entry).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            adapter
+                .malformed_delete_payloads(100)
+                .await
+                .unwrap()
+                .is_empty(),
+            "rewritten row is no longer malformed"
+        );
+        let row = adapter
+            .claim_outbox(10, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == bad)
+            .expect("rewritten row is claimable again");
+        assert_eq!(row.attempts, 0, "old strikes must not count toward the cap");
+        assert!(row.last_error.is_none());
+        let parsed: MemoryEntry = serde_json::from_value(row.row_payload).unwrap();
+        assert!(parsed.deleted_at.is_some());
     }
 
     #[tokio::test]
