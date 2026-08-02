@@ -1,5 +1,18 @@
 # RunarForge — Huginn & Muninn
 
+[![release](https://img.shields.io/github/v/release/crlome/runar-forge?label=release)](https://github.com/crlome/runar-forge/releases/latest)
+[![npm](https://img.shields.io/npm/v/@runar-forge/cli?label=npm)](https://www.npmjs.com/package/@runar-forge/cli)
+[![CI](https://img.shields.io/github/actions/workflow/status/crlome/runar-forge/ci.yml?branch=main&label=CI)](https://github.com/crlome/runar-forge/actions/workflows/ci.yml)
+[![license](https://img.shields.io/github/license/crlome/runar-forge)](LICENSE)
+![tests](https://img.shields.io/badge/tests-553%20passing-brightgreen)
+![languages](https://img.shields.io/badge/languages-5-orange)
+![platforms](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-supported-lightgrey)
+
+<!-- release/npm/CI/license are live. tests/languages/platforms are static
+     strings and will drift; re-check them at release time — `tests` against
+     the preflight `cargo test -p runar-muninn --lib` count, `languages`
+     against the tree-sitter grammars in crates/muninn/Cargo.toml. -->
+
 > Persistent, semantically-searchable memory for AI coding tools.
 > One static Rust binary. SQLite or PostgreSQL. MCP-compatible.
 
