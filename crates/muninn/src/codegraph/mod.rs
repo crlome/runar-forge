@@ -10,6 +10,7 @@ pub mod format;
 pub mod freshness;
 pub mod index;
 pub mod metrics;
+pub mod refresh;
 pub mod resolve;
 pub mod store;
 pub mod view;

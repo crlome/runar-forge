@@ -594,6 +594,28 @@ enum GraphCmd {
         output: Option<PathBuf>,
     },
 
+    /// Re-index an already-built graph so it matches the working tree again
+    ///
+    /// The graph half of a crawl on its own: no memory entries, no network.
+    /// Only files whose contents changed are re-parsed, so this is fast enough
+    /// to run after an edit. It will not build a graph that does not exist yet
+    /// — use `runar crawl` for that.
+    Refresh {
+        #[arg(short, long)]
+        project: String,
+        /// Project root. Defaults to the directory recorded at index time.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Re-parse every file instead of only the changed ones. Slower, and
+        /// readers may briefly see a partly rebuilt graph.
+        #[arg(long)]
+        full: bool,
+        /// Report whether the graph is behind the tree, and change nothing.
+        /// Exit status: 0 current, 2 stale, 3 cannot tell.
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Serve the code view on localhost, with live data and a project switcher
     Serve {
         /// Which project to open first. Defaults to the largest graph.
@@ -1738,6 +1760,7 @@ fn graph_project(cmd: &GraphCmd) -> Option<&str> {
         | GraphCmd::Symbol { project, .. }
         | GraphCmd::Trace { project, .. }
         | GraphCmd::Status { project }
+        | GraphCmd::Refresh { project, .. }
         | GraphCmd::Export { project, .. } => Some(project),
         GraphCmd::Serve { project, .. } => project.as_deref(),
     }
@@ -1758,10 +1781,87 @@ fn print_block(block: &str) {
     println!("{}", block.trim_end_matches('\n'));
 }
 
+/// Re-index one project's graph, or just say whether it needs it.
+///
+/// Every refusal is a non-zero exit with the way out named: this is the
+/// command an editor hook or a script will call, and a refresh that quietly
+/// did nothing is indistinguishable from one that worked.
+fn run_graph_refresh(
+    project: &str,
+    path: Option<PathBuf>,
+    full: bool,
+    check: bool,
+) -> anyhow::Result<()> {
+    use codegraph::freshness::Verdict;
+    use codegraph::refresh::{self, RefreshOptions, Refreshed};
+    use std::io::Write;
+
+    let fail = |e: refresh::RefreshError| anyhow::anyhow!("{e}");
+
+    if check {
+        let verdict = refresh::check(project, path.as_deref()).map_err(fail)?;
+        // Distinct statuses so a script can tell "behind" from "cannot tell"
+        // from "the command itself failed", which is what 1 already means.
+        let code = match &verdict {
+            Verdict::Fresh => {
+                println!("current — the graph matches the working tree");
+                0
+            }
+            Verdict::Stale { reason } => {
+                println!("stale — {reason}");
+                println!("Run: runar graph refresh --project {project}");
+                2
+            }
+            Verdict::Unknown { reason } => {
+                println!("unknown — {reason}");
+                3
+            }
+        };
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+
+    let report = refresh::run(&RefreshOptions {
+        project: project.to_string(),
+        path,
+        full,
+    })
+    .map_err(fail)?;
+
+    match report {
+        Refreshed::AlreadyRunning { since } => {
+            println!("A refresh of '{project}' is already running ({since}) — nothing to do.");
+        }
+        Refreshed::Done(r) => {
+            let reparsed = r.outcome.files_indexed + r.outcome.files_partial;
+            println!("Refreshed '{project}' at {}", r.root.display());
+            println!("  Symbols:      {}", r.outcome.symbols);
+            println!("  Call edges:   {}", r.outcome.edges);
+            println!(
+                "  Files:        {} scanned, {reparsed} re-parsed, {} reused",
+                r.files_scanned, r.outcome.files_reused
+            );
+            println!("  Took:         {:.2}s", r.duration.as_secs_f64());
+        }
+    }
+    Ok(())
+}
+
 /// Terminal counterpart to the code-graph MCP tools. Synchronous: the store is
 /// plain SQLite, so none of this belongs in an await chain.
 async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
     let project = graph_project(&cmd).unwrap_or_default().to_string();
+
+    // Refresh is the one subcommand here that writes, so it does its own
+    // existence and schema checks rather than borrowing the read-only preamble
+    // below — and it must refuse, loudly, in exactly the cases that preamble
+    // treats as "just print a hint".
+    let cmd = match cmd {
+        GraphCmd::Refresh {
+            path, full, check, ..
+        } => return run_graph_refresh(&project, path, full, check),
+        other => other,
+    };
 
     // Read-only, and existence checked first: the writable open creates the
     // file and, on a schema mismatch, drops every project's graph to rebuild
@@ -1878,6 +1978,12 @@ async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
             let reached = store.trace(root.id, dir, depth, limit).map_err(graph_err)?;
             print_block(&codegraph::format::reached(&direction, &reached));
         }
+
+        // Returned above, before the read-only handle was opened. Kept as an
+        // arm because the compiler cannot see that, and left as a panic so a
+        // future reordering fails loudly instead of falling through to a
+        // read-only path that would silently refresh nothing.
+        GraphCmd::Refresh { .. } => unreachable!("refresh is dispatched before this match"),
 
         GraphCmd::Export { output, .. } => {
             let cov = store.coverage(&project).map_err(graph_err)?;

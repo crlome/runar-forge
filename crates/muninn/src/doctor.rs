@@ -1072,7 +1072,7 @@ fn check_graph_freshness(path: &Path) -> Check {
     if !stale.is_empty() {
         return Check::skip(
             name,
-            format!("{body}\n     refresh with `runar crawl <path> --project <id>`"),
+            format!("{body}\n     refresh with `runar graph refresh --project <id>`"),
         );
     }
     if !unknown.is_empty() {
@@ -1337,7 +1337,10 @@ mod tests {
         match c.status {
             Status::Skip { reason } => {
                 assert!(reason.contains("working tree"), "unnamed signal: {reason}");
-                assert!(reason.contains("runar crawl"), "no remedy in: {reason}");
+                assert!(
+                    reason.contains("runar graph refresh"),
+                    "no remedy in: {reason}"
+                );
                 assert!(reason.contains('p'), "no project named in: {reason}");
             }
             other => panic!("a stale graph must not read green, got {other:?}"),

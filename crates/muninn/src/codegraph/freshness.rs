@@ -199,7 +199,8 @@ pub fn verdict(store: &CodeGraphStore, project: &str) -> Verdict {
 pub fn stale_annotation(store: &CodeGraphStore, project: &str) -> Option<String> {
     match verdict(store, project) {
         Verdict::Stale { reason } => Some(format!(
-            " STALE: {reason}, so symbols and line numbers below may be wrong."
+            " STALE: {reason}, so symbols and line numbers above may be wrong; \
+             `runar graph refresh` brings it up to date."
         )),
         _ => None,
     }
