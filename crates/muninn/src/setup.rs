@@ -71,6 +71,8 @@ pub struct ClaudeCodeSetup {
     /// Whether the opt-in `Grep|Glob` search-hint PreToolUse hook was written,
     /// so the caller's summary reports what is actually on disk.
     pub search_hints: bool,
+    /// Likewise for the opt-in auto-refresh hooks.
+    pub graph_autorefresh: bool,
 }
 
 pub fn detect_project_id() -> String {
@@ -293,6 +295,7 @@ pub fn setup_claude_code(
     project_id: &str,
     with_auto_capture: bool,
     with_search_hints: bool,
+    with_graph_autorefresh: bool,
 ) -> anyhow::Result<ClaudeCodeSetup> {
     let home = home_dir();
 
@@ -351,6 +354,7 @@ pub fn setup_claude_code(
         &log_path,
         with_auto_capture,
         with_search_hints,
+        with_graph_autorefresh,
     );
     sobj.insert("hooks".into(), Value::Object(hooks_obj));
 
@@ -379,6 +383,7 @@ pub fn setup_claude_code(
         claude_md_path,
         binary_path,
         search_hints: with_search_hints,
+        graph_autorefresh: with_graph_autorefresh,
     })
 }
 
@@ -391,6 +396,55 @@ pub fn search_hints_installed(dir: &Path) -> bool {
         return false;
     };
     installed_search_hints(&settings.get("hooks").cloned().unwrap_or(json!({})))
+}
+
+/// The argument vector of every hook command setup would install, with all
+/// opt-ins enabled.
+///
+/// Exists so the binary can check that it still accepts every command it asks
+/// Claude Code to run. Nothing else validates that: the hooks are strings in a
+/// JSON file, so a subcommand that moves — `autorefresh` becoming
+/// `graph autorefresh`, say — leaves settings.json pointing at a command that
+/// no longer parses, and the only symptom is a hook that silently does nothing
+/// forever.
+pub fn installed_hook_argvs(project_id: &str) -> Vec<Vec<String>> {
+    let hooks = build_hooks_object(
+        &json!({}),
+        "/bin/runar",
+        project_id,
+        "/log/hook.log",
+        true,
+        true,
+        true,
+    );
+    let mut out = Vec::new();
+    for entries in hooks.values().filter_map(|v| v.as_array()) {
+        for entry in entries {
+            let tokens = runar_hook_tokens(entry);
+            // Drop the binary path, and stop at the shell redirect the Unix
+            // form appends — neither is part of the command's own arguments.
+            let argv: Vec<String> = tokens
+                .into_iter()
+                .skip(1)
+                .take_while(|t| !t.starts_with("2>>"))
+                .collect();
+            if !argv.is_empty() {
+                out.push(argv);
+            }
+        }
+    }
+    out
+}
+
+/// Same question for the opt-in auto-refresh hooks. `build_hooks_object`
+/// rewrites every runar hook from its flags, so without reading the previous
+/// choice back a bare `runar setup claude-code` re-run would uninstall this.
+pub fn graph_autorefresh_installed(dir: &Path) -> bool {
+    let settings_path = dir.join(".claude").join("settings.json");
+    let Ok(settings) = read_json_or_empty(&settings_path) else {
+        return false;
+    };
+    installed_graph_autorefresh(&settings.get("hooks").cloned().unwrap_or(json!({})))
 }
 
 /// Result of `setup claude-code --all-projects`.
@@ -463,6 +517,7 @@ pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
         // a feature they did not ask for, and it does not revoke one they did.
         let with_auto_capture = installed_auto_capture(&existing_hooks);
         let with_search_hints = installed_search_hints(&existing_hooks);
+        let with_graph_autorefresh = installed_graph_autorefresh(&existing_hooks);
 
         let hooks_obj = build_hooks_object(
             &existing_hooks,
@@ -471,6 +526,7 @@ pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
             &log_path,
             with_auto_capture,
             with_search_hints,
+            with_graph_autorefresh,
         );
         sobj.insert("hooks".into(), Value::Object(hooks_obj));
         write_json_pretty(&settings_path, &settings)?;
@@ -554,6 +610,17 @@ fn is_search_hint_entry(entry: &Value) -> bool {
 }
 
 /// Is the opt-in search-hint hook already installed?
+/// The auto-refresh entries, identified by their unique subcommand token.
+fn is_graph_autorefresh_entry(entry: &Value) -> bool {
+    runar_hook_tokens(entry).iter().any(|t| t == "autorefresh")
+}
+
+fn installed_graph_autorefresh(existing_hooks: &Value) -> bool {
+    runar_hook_entries(existing_hooks)
+        .into_iter()
+        .any(is_graph_autorefresh_entry)
+}
+
 fn installed_search_hints(existing_hooks: &Value) -> bool {
     pre_tool_runar_entries(existing_hooks)
         .into_iter()
@@ -613,6 +680,7 @@ fn build_hooks_object(
     log_path: &str,
     with_auto_capture: bool,
     with_search_hints: bool,
+    with_graph_autorefresh: bool,
 ) -> serde_json::Map<String, Value> {
     // Render each hook from a raw arg vector. Shell-form (quoted) on Unix,
     // exec-form (no shell) on Windows — see `runar_hook_entry`.
@@ -682,6 +750,16 @@ fn build_hooks_object(
         ".*",
         &["context", "--silent", "--project", project_id],
     ));
+    if with_graph_autorefresh {
+        // Also at session start, because the edits a session opens against
+        // were often made somewhere this hook could not see: another editor, a
+        // pull, a branch switch. Same command, same debounce — it costs
+        // nothing when the graph is already current.
+        session_start.push(entry(
+            ".*",
+            &["graph", "autorefresh", "--silent", "--project", project_id],
+        ));
+    }
 
     let mut post_tool = post_tool;
     post_tool.push(entry(
@@ -701,6 +779,20 @@ fn build_hooks_object(
         post_tool.push(entry(
             "Write|Edit|Create|MultiEdit|Bash",
             &["enqueue", "--silent", "--project", project_id],
+        ));
+    }
+    if with_graph_autorefresh {
+        // Opt-in, and the first hook that writes to the code graph rather than
+        // reading it. What keeps it cheap is that it does no work itself: it
+        // reads one timestamp file and hands off to a detached child, so the
+        // tool call that triggered it is never waiting on an index.
+        //
+        // No `Bash` in the matcher, unlike the passive-learning hooks: a
+        // command that happens to touch files is not a signal worth paying a
+        // process spawn for on every shell invocation.
+        post_tool.push(entry(
+            "Write|Edit|Create|MultiEdit",
+            &["graph", "autorefresh", "--silent", "--project", project_id],
         ));
     }
 
@@ -923,6 +1015,7 @@ mod tests {
             "/log/hook.log",
             false,
             false,
+            false,
         )
     }
 
@@ -933,6 +1026,20 @@ mod tests {
             "/bin/runar",
             "proj",
             "/log/hook.log",
+            false,
+            true,
+            false,
+        )
+    }
+
+    /// Same, with the opt-in auto-refresh hooks enabled.
+    fn hooks_with_autorefresh(existing: Value) -> serde_json::Map<String, Value> {
+        build_hooks_object(
+            &existing,
+            "/bin/runar",
+            "proj",
+            "/log/hook.log",
+            false,
             false,
             true,
         )
@@ -1225,10 +1332,103 @@ mod tests {
             "/log/hook.log",
             false,
             installed_search_hints(&installed),
+            false,
         );
         let pre_tool = entries_for(&rebuilt, "PreToolUse");
         assert_eq!(pre_tool.len(), 1, "no duplicate on re-run: {pre_tool:?}");
         assert_eq!(pre_tool[0]["matcher"], "Grep|Glob");
+    }
+
+    #[test]
+    /// What Claude Code actually reads is settings.json, so the assertion is
+    /// on the entries themselves — matcher included, since that is what
+    /// decides how often this fires.
+    fn graph_autorefresh_writes_both_triggers_and_only_when_asked() {
+        let off = hooks_for(json!({}));
+        assert!(
+            !entries_for(&off, "PostToolUse")
+                .iter()
+                .any(is_graph_autorefresh_entry),
+            "auto-refresh must be opt-in"
+        );
+        assert!(!entries_for(&off, "SessionStart")
+            .iter()
+            .any(is_graph_autorefresh_entry));
+
+        let on = hooks_with_autorefresh(json!({}));
+        let post: Vec<Value> = entries_for(&on, "PostToolUse")
+            .into_iter()
+            .filter(is_graph_autorefresh_entry)
+            .collect();
+        assert_eq!(post.len(), 1, "expected one write trigger: {post:?}");
+        assert_eq!(
+            post[0]["matcher"], "Write|Edit|Create|MultiEdit",
+            "a wider matcher puts this on the hot path"
+        );
+        let tokens = runar_hook_tokens(&post[0]);
+        assert!(tokens.iter().any(|t| t == "autorefresh"), "{tokens:?}");
+        assert!(tokens.iter().any(|t| t == "--silent"), "{tokens:?}");
+        assert!(tokens.iter().any(|t| t == "proj"), "{tokens:?}");
+
+        let start: Vec<Value> = entries_for(&on, "SessionStart")
+            .into_iter()
+            .filter(is_graph_autorefresh_entry)
+            .collect();
+        assert_eq!(start.len(), 1, "expected one session trigger");
+        assert_eq!(start[0]["matcher"], ".*");
+
+        // The context hook is still there beside it.
+        assert_eq!(entries_for(&on, "SessionStart").len(), 2);
+    }
+
+    #[test]
+    /// `build_hooks_object` rewrites every runar hook from its flags, so a
+    /// bare re-run that did not read the previous choice back would silently
+    /// uninstall this. The same defect once killed auto-capture.
+    fn a_rerun_that_reads_the_choice_back_keeps_auto_refresh() {
+        let installed = Value::Object(hooks_with_autorefresh(json!({})));
+        assert!(installed_graph_autorefresh(&installed));
+
+        let rebuilt = build_hooks_object(
+            &installed,
+            "/bin/runar",
+            "proj",
+            "/log/hook.log",
+            false,
+            false,
+            installed_graph_autorefresh(&installed),
+        );
+        let post: Vec<Value> = entries_for(&rebuilt, "PostToolUse")
+            .into_iter()
+            .filter(is_graph_autorefresh_entry)
+            .collect();
+        assert_eq!(post.len(), 1, "no duplicate on re-run: {post:?}");
+        assert!(installed_graph_autorefresh(&Value::Object(rebuilt)));
+
+        // And an explicit opt-out still removes it.
+        let removed = build_hooks_object(
+            &installed,
+            "/bin/runar",
+            "proj",
+            "/log/hook.log",
+            false,
+            false,
+            false,
+        );
+        assert!(!installed_graph_autorefresh(&Value::Object(removed)));
+    }
+
+    #[test]
+    /// The hint hook and the auto-refresh hooks are independent opt-ins;
+    /// detecting one must never read as the other.
+    fn the_two_opt_ins_do_not_shadow_each_other() {
+        let hints = Value::Object(hooks_with_hints(json!({})));
+        assert!(installed_search_hints(&hints));
+        assert!(!installed_graph_autorefresh(&hints));
+
+        let auto = Value::Object(hooks_with_autorefresh(json!({})));
+        assert!(installed_graph_autorefresh(&auto));
+        assert!(!installed_search_hints(&auto));
     }
 
     #[test]

@@ -244,6 +244,299 @@ fn resolve_root(store: &CodeGraphStore, opts: &RefreshOptions) -> Result<PathBuf
     Ok(root.canonicalize().unwrap_or(root))
 }
 
+// ── Automatic refresh ──────────────────────────────────────────────
+
+/// Beyond this many files a refresh stops being something to do behind
+/// someone's back. Override with `RUNAR_GRAPH_AUTOREFRESH_MAX_FILES`; running
+/// `runar graph refresh` by hand ignores the ceiling entirely.
+const AUTO_MAX_FILES: usize = 20_000;
+
+/// Floor on the gap between automatic refreshes.
+const AUTO_MIN_GAP_MS: i64 = 30_000;
+/// Ceiling on it, so a slow project still refreshes eventually.
+const AUTO_MAX_GAP_MS: i64 = 600_000;
+/// How much of the time an automatic refresh may occupy: the next one is held
+/// off for this many times its own duration, which keeps a 0.3s refresh to
+/// roughly 1.5% duty cycle and stops a slow one from running back to back.
+const AUTO_DUTY_FACTOR: i64 = 20;
+
+/// Backoff for states that will not change on their own.
+const AUTO_BACKOFF_SETTLED_MS: i64 = 3_600_000;
+/// Backoff for states that need a person, but might change sooner.
+const AUTO_BACKOFF_BLOCKED_MS: i64 = 600_000;
+/// Backoff for states that are expected to clear by themselves.
+const AUTO_BACKOFF_TRANSIENT_MS: i64 = 30_000;
+/// Backoff after an error, which is neither expected nor permanent.
+const AUTO_BACKOFF_ERROR_MS: i64 = 300_000;
+
+/// What the last automatic attempt did, and when the next may start.
+///
+/// A file rather than a database row: the hook that reads it must not open any
+/// store, and this has to be answerable in well under a millisecond.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Stamp {
+    pub last_attempt_ms: i64,
+    pub not_before_ms: i64,
+    pub last_outcome: String,
+    pub last_duration_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AutoOutcome {
+    Refreshed { files: usize, duration_ms: i64 },
+    Skipped(String),
+    Failed(String),
+}
+
+impl AutoOutcome {
+    fn label(&self) -> String {
+        match self {
+            AutoOutcome::Refreshed { .. } => "done".to_string(),
+            AutoOutcome::Skipped(reason) => format!("skip: {reason}"),
+            AutoOutcome::Failed(reason) => format!("error: {reason}"),
+        }
+    }
+}
+
+/// Is another automatic refresh due?
+///
+/// Pure, so the debounce is testable without a clock. No stamp at all means
+/// yes: a project that has never refreshed should not have to wait.
+pub fn should_spawn(stamp: Option<&Stamp>, now_ms: i64) -> bool {
+    stamp.is_none_or(|s| now_ms >= s.not_before_ms)
+}
+
+pub fn stamp_path(project: &str) -> PathBuf {
+    crate::setup::runar_dir().join(format!("graph-refresh-{}.stamp", sanitize(project)))
+}
+
+pub fn read_stamp(project: &str) -> Option<Stamp> {
+    let body = std::fs::read_to_string(stamp_path(project)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Best-effort: a stamp that fails to write costs an extra refresh, not
+/// correctness, and this runs on a path that must never fail a tool call.
+pub fn write_stamp(project: &str, stamp: &Stamp) {
+    let path = stamp_path(project);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(body) = serde_json::to_string(stamp) {
+        // Write-then-rename: a reader must never see half a stamp and treat a
+        // truncated one as "no stamp", which would defeat the debounce exactly
+        // when writes are frequent.
+        let tmp = path.with_extension("stamp.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// One tab-separated line per decision, for judging later whether this hook
+/// earns its keep. Mirrors what the search-hint hook records.
+pub fn record_stat(project: &str, outcome: &str) {
+    use std::io::Write;
+    let path = crate::setup::runar_dir().join("graph-refresh-stats.tsv");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}\t{project}\t{outcome}", crate::protocol::now_ms());
+    }
+}
+
+/// Start a refresh that outlives this process.
+///
+/// The hook that calls this has a budget measured in milliseconds and must
+/// never delay a tool call, so the work cannot happen inline. The child is put
+/// in its own process group so that the group-kill Claude Code uses to enforce
+/// a hook timeout cannot take the refresh with it, and its streams are closed
+/// so nothing it prints can reach the transcript.
+pub fn spawn_detached(project: &str) -> std::io::Result<u32> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["graph", "refresh", "--auto", "--project", project])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    // Never waited on: the parent exits immediately and init reaps the child.
+    cmd.spawn().map(|c| c.id())
+}
+
+/// The detached child's whole job.
+///
+/// Every exit — including every refusal — writes a stamp, a breadcrumb and a
+/// statistic. A background task that decides to do nothing and says nothing is
+/// indistinguishable from one that is broken, and the only way anyone would
+/// find out is by noticing the graph never changes.
+pub fn run_auto(project: &str) -> AutoOutcome {
+    let started = Instant::now();
+    let (outcome, backoff_ms) = decide_and_run(project, started);
+
+    let now = crate::protocol::now_ms();
+    let duration_ms = started.elapsed().as_millis() as i64;
+    write_stamp(
+        project,
+        &Stamp {
+            last_attempt_ms: now,
+            not_before_ms: now + backoff_ms,
+            last_outcome: outcome.label(),
+            last_duration_ms: duration_ms,
+        },
+    );
+    record_stat(project, &outcome.label());
+    crate::hooks_runtime::append_hook_log(
+        "graph-autorefresh",
+        &format!("{} ({project}, {duration_ms}ms)", outcome.label()),
+    );
+    outcome
+}
+
+/// The gate chain, cheapest and most conclusive first. Returns how long to
+/// wait before trying again alongside what happened.
+fn decide_and_run(project: &str, started: Instant) -> (AutoOutcome, i64) {
+    let skip = |reason: &str, backoff: i64| (AutoOutcome::Skipped(reason.to_string()), backoff);
+
+    // The switch may have been thrown between the hook firing and this
+    // starting, and this is the one that actually writes.
+    if crate::hooks_runtime::hooks_disabled() {
+        return skip("hooks disabled", AUTO_BACKOFF_TRANSIENT_MS);
+    }
+
+    // Read-only, and never creates the file: refreshing is maintenance, so a
+    // project with no graph is not this hook's business.
+    let Some(store) = CodeGraphStore::open_if_indexed(project) else {
+        return skip(
+            "no graph for this project — run `runar crawl` once",
+            AUTO_BACKOFF_SETTLED_MS,
+        );
+    };
+    let Some(root) = store
+        .project_root(project)
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
+    else {
+        return skip("no root recorded", AUTO_BACKOFF_SETTLED_MS);
+    };
+    if !root.is_dir() {
+        return skip("recorded root is gone", AUTO_BACKOFF_SETTLED_MS);
+    }
+
+    // Observed before anything is scanned or written, and committed only if
+    // the index below succeeds.
+    let observed = freshness::snapshot(&root);
+    if observed.head.is_none() || observed.dirty.is_none() {
+        // Without git there is no cheap way to tell whether anything changed,
+        // so every trigger would pay for a full content-hash pass over the
+        // tree. Refreshing by hand still works.
+        return skip("not a git repository", AUTO_BACKOFF_SETTLED_MS);
+    }
+
+    // The gate that makes this safe to fire on every write: refresh when the
+    // signals have *changed*, not merely when the tree is dirty. A repository
+    // that stays dirty is not getting staler, and re-indexing it on a timer
+    // would be a write amplifier with no reader.
+    if let Some(base) = freshness::baseline(&store, project) {
+        if matches!(
+            freshness::judge(Some(&base), &observed),
+            Verdict::Fresh | Verdict::Unknown { .. }
+        ) {
+            return skip(
+                "nothing changed since the last index",
+                AUTO_BACKOFF_TRANSIENT_MS,
+            );
+        }
+    }
+    drop(store);
+
+    let Some(_lock) = RefreshLock::try_acquire(project) else {
+        return skip("a refresh is already running", AUTO_BACKOFF_TRANSIENT_MS);
+    };
+
+    let scan = scanner::scan_project(&root);
+    // An empty inventory would make the index forget the entire project. The
+    // tree cannot really be empty — it was indexed once — so this means the
+    // scan failed, and doing nothing is the only safe response.
+    if scan.files.is_empty() {
+        return skip(
+            "scan found no files, refusing to index over a project",
+            AUTO_BACKOFF_BLOCKED_MS,
+        );
+    }
+    if scan.files.len() > auto_max_files() {
+        return (
+            AutoOutcome::Skipped(format!(
+                "{} files is over the automatic ceiling — refresh by hand",
+                scan.files.len()
+            )),
+            AUTO_BACKOFF_BLOCKED_MS,
+        );
+    }
+
+    let store = match CodeGraphStore::open_default() {
+        Ok(s) => s,
+        Err(e) => return (AutoOutcome::Failed(e.to_string()), AUTO_BACKOFF_ERROR_MS),
+    };
+    match index::index_project(&store, project, &root, &scan.files, false, Some(observed)) {
+        Ok(outcome) => {
+            let duration_ms = started.elapsed().as_millis() as i64;
+            (
+                AutoOutcome::Refreshed {
+                    files: outcome.files_indexed + outcome.files_partial,
+                    duration_ms,
+                },
+                next_gap_ms(duration_ms),
+            )
+        }
+        Err(e) => (AutoOutcome::Failed(e.to_string()), AUTO_BACKOFF_ERROR_MS),
+    }
+}
+
+/// Hold off the next automatic refresh in proportion to what this one cost.
+fn next_gap_ms(duration_ms: i64) -> i64 {
+    (duration_ms * AUTO_DUTY_FACTOR).clamp(AUTO_MIN_GAP_MS, AUTO_MAX_GAP_MS)
+}
+
+/// How long an explicit crawl waits for a background refresh to finish.
+/// Tunable so tests do not have to spend it.
+pub fn crawl_lock_wait() -> Duration {
+    std::env::var("RUNAR_GRAPH_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(120))
+}
+
+fn auto_max_files() -> usize {
+    std::env::var("RUNAR_GRAPH_AUTOREFRESH_MAX_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(AUTO_MAX_FILES)
+}
+
 // ── Locking ────────────────────────────────────────────────────────
 
 /// A whole-file advisory lock, held for as long as the guard lives.
@@ -257,6 +550,26 @@ pub struct RefreshLock {
 }
 
 impl RefreshLock {
+    /// Wait up to `limit` for the lock, then give up.
+    ///
+    /// For a crawl, which is explicit work someone is waiting on: a background
+    /// refresh takes well under a second, so waiting is nearly always better
+    /// than colliding. Giving up rather than blocking forever matters more —
+    /// a crawl that hangs behind a stuck refresh would be a far worse failure
+    /// than two writers briefly sharing a WAL database.
+    pub fn acquire_bounded(project: &str, limit: Duration) -> Option<Self> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(lock) = Self::try_acquire(project) {
+                return Some(lock);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     pub fn try_acquire(project: &str) -> Option<Self> {
         let path = lock_path(project);
         if let Some(dir) = path.parent() {
@@ -319,14 +632,17 @@ impl Drop for RefreshLock {
 }
 
 fn lock_path(project: &str) -> PathBuf {
-    // Same sanitising as the hint hook's per-session files: a project id
-    // reaches this from a command line and must not be able to name a path.
-    let safe: String = project
+    crate::setup::runar_dir().join(format!("graph-refresh-{}.lock", sanitize(project)))
+}
+
+/// A project id reaches these paths straight off a command line, so it must
+/// not be able to name a directory of its own choosing.
+fn sanitize(project: &str) -> String {
+    project
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(64)
-        .collect();
-    crate::setup::runar_dir().join(format!("graph-refresh-{safe}.lock"))
+        .collect()
 }
 
 /// A lock file older than [`LOCK_STALE`] is assumed abandoned. Judged by
@@ -711,6 +1027,253 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(when))
             .unwrap();
+    }
+
+    // ── the automatic path ─────────────────────────────────────────
+
+    fn stamp_at(not_before_ms: i64) -> Stamp {
+        Stamp {
+            last_attempt_ms: 0,
+            not_before_ms,
+            last_outcome: "done".into(),
+            last_duration_ms: 10,
+        }
+    }
+
+    #[test]
+    fn the_debounce_holds_until_its_window_passes() {
+        assert!(
+            should_spawn(None, 1_000),
+            "a project that has never refreshed must not wait"
+        );
+        assert!(!should_spawn(Some(&stamp_at(2_000)), 1_999));
+        assert!(
+            should_spawn(Some(&stamp_at(2_000)), 2_000),
+            "boundary is due"
+        );
+        assert!(should_spawn(Some(&stamp_at(2_000)), 5_000));
+    }
+
+    #[test]
+    fn an_unreadable_stamp_does_not_wedge_the_debounce() {
+        let runar = tempfile::tempdir().unwrap();
+        let _g = with_env("RUNAR_HOME", runar.path().to_str().unwrap());
+        std::fs::create_dir_all(crate::setup::runar_dir()).unwrap();
+        std::fs::write(stamp_path("p"), "{ truncated").unwrap();
+        assert!(read_stamp("p").is_none());
+        assert!(
+            should_spawn(read_stamp("p").as_ref(), 0),
+            "a corrupt stamp must read as 'never refreshed', not as 'wait forever'"
+        );
+    }
+
+    #[test]
+    fn a_stamp_round_trips() {
+        let runar = tempfile::tempdir().unwrap();
+        let _g = with_env("RUNAR_HOME", runar.path().to_str().unwrap());
+        let s = stamp_at(1234);
+        write_stamp("p", &s);
+        assert_eq!(read_stamp("p").unwrap(), s);
+    }
+
+    /// The gap scales with what the refresh cost, so a slow project does not
+    /// spend its life re-indexing, and a fast one is not throttled to a crawl.
+    #[test]
+    fn the_next_gap_scales_with_cost_and_stays_within_bounds() {
+        assert_eq!(
+            next_gap_ms(10),
+            AUTO_MIN_GAP_MS,
+            "a fast refresh gets the floor"
+        );
+        assert_eq!(next_gap_ms(5_000), 100_000);
+        assert_eq!(
+            next_gap_ms(120_000),
+            AUTO_MAX_GAP_MS,
+            "a very slow refresh is still retried eventually"
+        );
+    }
+
+    /// The gate that lets this fire on every write: unchanged signals mean no
+    /// work, so a tree that merely stays dirty is not re-indexed forever.
+    #[test]
+    fn an_unchanged_tree_is_not_re_indexed() {
+        if !have_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let db = home.path().join("cg.db");
+        let _g = fixture(dir.path(), &db, "p");
+        std::env::set_var("RUNAR_HOME", runar.path());
+
+        let before = {
+            let s = CodeGraphStore::open_readonly(&db).unwrap();
+            s.indexed_at("p").unwrap()
+        };
+        match run_auto("p") {
+            AutoOutcome::Skipped(reason) => assert!(reason.contains("nothing changed"), "{reason}"),
+            other => panic!("an unchanged tree was re-indexed: {other:?}"),
+        }
+        let s = CodeGraphStore::open_readonly(&db).unwrap();
+        assert_eq!(
+            s.indexed_at("p").unwrap(),
+            before,
+            "the graph was rewritten"
+        );
+        std::env::remove_var("RUNAR_HOME");
+    }
+
+    #[test]
+    fn a_changed_tree_is_re_indexed_and_the_baseline_moves() {
+        if !have_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let _g = fixture(dir.path(), &home.path().join("cg.db"), "p");
+        std::env::set_var("RUNAR_HOME", runar.path());
+
+        std::fs::write(dir.path().join("b.rs"), "pub fn beta_auto() {}\n").unwrap();
+        assert!(matches!(run_auto("p"), AutoOutcome::Refreshed { .. }));
+
+        let store = CodeGraphStore::open_default().unwrap();
+        assert_eq!(store.search("p", "beta_auto", None, 5).unwrap().len(), 1);
+        drop(store);
+
+        // And now it settles: the second run has nothing to do.
+        assert!(matches!(run_auto("p"), AutoOutcome::Skipped(_)));
+        std::env::remove_var("RUNAR_HOME");
+    }
+
+    /// Automatic refresh is maintenance, never construction.
+    #[test]
+    fn the_automatic_path_never_builds_a_graph() {
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let db = home.path().join("cg.db");
+        let _g = with_env("RUNAR_CODEGRAPH_PATH", db.to_str().unwrap());
+        std::env::set_var("RUNAR_HOME", runar.path());
+
+        match run_auto("never-indexed") {
+            AutoOutcome::Skipped(reason) => assert!(reason.contains("no graph"), "{reason}"),
+            other => panic!("got {other:?}"),
+        }
+        assert!(!db.exists(), "the automatic path created a graph");
+        std::env::remove_var("RUNAR_HOME");
+    }
+
+    #[test]
+    fn the_kill_switch_stops_the_child_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let db = home.path().join("cg.db");
+        let _g = fixture(dir.path(), &db, "p");
+        std::env::set_var("RUNAR_HOME", runar.path());
+        std::env::set_var("RUNAR_DISABLE_HOOKS", "1");
+
+        std::fs::write(dir.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let outcome = run_auto("p");
+        std::env::remove_var("RUNAR_DISABLE_HOOKS");
+        std::env::remove_var("RUNAR_HOME");
+
+        match outcome {
+            AutoOutcome::Skipped(reason) => assert!(reason.contains("disabled"), "{reason}"),
+            other => panic!("the kill switch did not stop a write: {other:?}"),
+        }
+        let store = CodeGraphStore::open_readonly(&db).unwrap();
+        assert!(store.search("p", "beta", None, 5).unwrap().is_empty());
+    }
+
+    /// A scan that comes back empty is the shape of a failure, not of a
+    /// project. Indexing over it would hand the index an empty inventory,
+    /// which forgets every file the project has — the worst thing a
+    /// background writer could quietly do.
+    #[test]
+    fn an_empty_scan_is_refused_rather_than_indexed_over() {
+        if !have_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let db = home.path().join("cg.db");
+        let _g = fixture(dir.path(), &db, "p");
+        std::env::set_var("RUNAR_HOME", runar.path());
+
+        // Everything the scanner would find is gone; only `.git` remains, and
+        // that is ignored. The tree still *exists*, so this is not the
+        // vanished-root case.
+        std::fs::remove_file(dir.path().join("a.rs")).unwrap();
+        let outcome = run_auto("p");
+        std::env::remove_var("RUNAR_HOME");
+
+        match outcome {
+            AutoOutcome::Skipped(reason) => {
+                assert!(reason.contains("no files"), "{reason}")
+            }
+            other => panic!("an empty scan was indexed: {other:?}"),
+        }
+        let store = CodeGraphStore::open_readonly(&db).unwrap();
+        assert_eq!(
+            store.coverage("p").unwrap().symbols,
+            1,
+            "the project was erased by an empty scan"
+        );
+    }
+
+    #[test]
+    fn a_project_over_the_ceiling_is_left_to_a_person() {
+        if !have_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let _g = fixture(dir.path(), &home.path().join("cg.db"), "p");
+        std::env::set_var("RUNAR_HOME", runar.path());
+        std::env::set_var("RUNAR_GRAPH_AUTOREFRESH_MAX_FILES", "1");
+
+        std::fs::write(dir.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let outcome = run_auto("p");
+        std::env::remove_var("RUNAR_GRAPH_AUTOREFRESH_MAX_FILES");
+        std::env::remove_var("RUNAR_HOME");
+
+        match outcome {
+            AutoOutcome::Skipped(reason) => assert!(reason.contains("ceiling"), "{reason}"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Every decision leaves a trace. A background task that quietly does
+    /// nothing is indistinguishable from one that is broken.
+    #[test]
+    fn every_automatic_decision_is_recorded() {
+        let home = tempfile::tempdir().unwrap();
+        let runar = tempfile::tempdir().unwrap();
+        let _g = with_env(
+            "RUNAR_CODEGRAPH_PATH",
+            home.path().join("cg.db").to_str().unwrap(),
+        );
+        std::env::set_var("RUNAR_HOME", runar.path());
+
+        run_auto("p");
+        let stamp = read_stamp("p").expect("a stamp is written even when nothing happens");
+        assert!(stamp.last_outcome.starts_with("skip:"), "{stamp:?}");
+        assert!(
+            stamp.not_before_ms > stamp.last_attempt_ms,
+            "a skip must still back off"
+        );
+
+        let stats =
+            std::fs::read_to_string(crate::setup::runar_dir().join("graph-refresh-stats.tsv"))
+                .expect("a statistic is recorded");
+        assert!(stats.contains("skip:"), "{stats}");
+        let log = crate::hooks_runtime::tail_hook_log(5).join("\n");
+        assert!(log.contains("graph-autorefresh"), "no breadcrumb in: {log}");
+        std::env::remove_var("RUNAR_HOME");
     }
 
     #[test]

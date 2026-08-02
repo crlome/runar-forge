@@ -124,11 +124,14 @@ pub fn run_wizard() -> anyhow::Result<WizardResult> {
         match setup::setup_claude_code(
             &project_id,
             false,
-            // Read the installed choice back rather than rewriting it: setup
-            // regenerates the PreToolUse key from this flag, so passing a bare
-            // false here would uninstall a hook the user opted into.
+            // Read the installed choices back rather than rewriting them:
+            // setup regenerates each hook key from these flags, so passing a
+            // bare false here would uninstall a hook the user opted into.
             std::env::current_dir()
                 .map(|d| setup::search_hints_installed(&d))
+                .unwrap_or(false),
+            std::env::current_dir()
+                .map(|d| setup::graph_autorefresh_installed(&d))
                 .unwrap_or(false),
         ) {
             Ok(result) => {

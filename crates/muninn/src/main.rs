@@ -124,6 +124,15 @@ enum Commands {
         /// Remove the search-hint hook if it is installed.
         #[arg(long)]
         no_search_hints: bool,
+        /// Install the opt-in auto-refresh hooks: after a file write, and at
+        /// session start, bring this project's code graph back in line with
+        /// the tree in the background. Requires a graph to already exist.
+        /// Off by default.
+        #[arg(long)]
+        with_graph_autorefresh: bool,
+        /// Remove the auto-refresh hooks if they are installed.
+        #[arg(long)]
+        no_graph_autorefresh: bool,
         /// Run `runar config wizard` first to (re)configure storage backend.
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
@@ -614,6 +623,23 @@ enum GraphCmd {
         /// Exit status: 0 current, 2 stale, 3 cannot tell.
         #[arg(long)]
         check: bool,
+        /// Run as the detached background child of the auto-refresh hook:
+        /// gated, debounced, and silent about everything but its log.
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
+
+    /// Hook entry point: start a background refresh if one is due
+    ///
+    /// Installed by `runar setup claude-code --with-graph-autorefresh`. Does no
+    /// work itself — it checks a timestamp and hands off to a detached child,
+    /// so the tool call that triggered it is never delayed.
+    Autorefresh {
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Required. Present so the command cannot be run by accident.
+        #[arg(long)]
+        silent: bool,
     },
 
     /// Serve the code view on localhost, with live data and a project switcher
@@ -1762,7 +1788,9 @@ fn graph_project(cmd: &GraphCmd) -> Option<&str> {
         | GraphCmd::Status { project }
         | GraphCmd::Refresh { project, .. }
         | GraphCmd::Export { project, .. } => Some(project),
-        GraphCmd::Serve { project, .. } => project.as_deref(),
+        GraphCmd::Serve { project, .. } | GraphCmd::Autorefresh { project, .. } => {
+            project.as_deref()
+        }
     }
 }
 
@@ -1779,6 +1807,70 @@ fn graph_err(e: codegraph::store::Error) -> anyhow::Error {
 /// without, so anything printed afterwards would otherwise run on.
 fn print_block(block: &str) {
     println!("{}", block.trim_end_matches('\n'));
+}
+
+/// The hook half of auto-refresh: decide, hand off, get out of the way.
+///
+/// Runs on every file write, so it must cost approximately nothing and must
+/// never block the tool call that triggered it. It opens no database, reads no
+/// stdin, and prints nothing: it reads one small file to see whether a refresh
+/// is due and, if so, starts a detached child that does the actual work.
+fn run_graph_autorefresh(project: &str, silent: bool) -> anyhow::Result<()> {
+    use codegraph::refresh;
+
+    // `--silent` marks this as hook-invoked. Without it, someone who typed the
+    // command by hand gets an explanation rather than silent nothing.
+    if !silent {
+        println!(
+            "This is the hook entry point for automatic graph refresh, \
+             installed by `runar setup claude-code --with-graph-autorefresh`."
+        );
+        println!("To refresh now, run: runar graph refresh --project {project}");
+        return Ok(());
+    }
+    if hooks_runtime::hooks_disabled() {
+        return Ok(());
+    }
+
+    let now = protocol::now_ms();
+    let stamp = refresh::read_stamp(project);
+    if !refresh::should_spawn(stamp.as_ref(), now) {
+        // The common case by a wide margin, so it stays out of the hook log —
+        // the statistics file carries the denominator instead.
+        refresh::record_stat(project, "debounce");
+        return Ok(());
+    }
+
+    // Claim the window before spawning. If the child dies before writing its
+    // own stamp, this is what stops every subsequent write from spawning
+    // another one.
+    refresh::write_stamp(
+        project,
+        &refresh::Stamp {
+            last_attempt_ms: now,
+            not_before_ms: now + 15_000,
+            last_outcome: "spawned".to_string(),
+            last_duration_ms: 0,
+        },
+    );
+
+    match refresh::spawn_detached(project) {
+        Ok(pid) => {
+            refresh::record_stat(project, "spawn");
+            hooks_runtime::append_hook_log(
+                "graph-autorefresh",
+                &format!("spawned pid {pid} for {project}"),
+            );
+        }
+        Err(e) => {
+            refresh::record_stat(project, "spawn-failed");
+            hooks_runtime::append_hook_log(
+                "graph-autorefresh",
+                &format!("could not start a refresh for {project}: {e}"),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Re-index one project's graph, or just say whether it needs it.
@@ -1858,8 +1950,21 @@ async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
     // treats as "just print a hint".
     let cmd = match cmd {
         GraphCmd::Refresh {
-            path, full, check, ..
-        } => return run_graph_refresh(&project, path, full, check),
+            path,
+            full,
+            check,
+            auto,
+            ..
+        } => {
+            if auto {
+                // The detached child. Its report goes to the hook log, never to
+                // stdout: nobody is reading this terminal.
+                codegraph::refresh::run_auto(&project);
+                return Ok(());
+            }
+            return run_graph_refresh(&project, path, full, check);
+        }
+        GraphCmd::Autorefresh { silent, .. } => return run_graph_autorefresh(&project, silent),
         other => other,
     };
 
@@ -1983,7 +2088,9 @@ async fn run_graph(cmd: GraphCmd) -> anyhow::Result<()> {
         // arm because the compiler cannot see that, and left as a panic so a
         // future reordering fails loudly instead of falling through to a
         // read-only path that would silently refresh nothing.
-        GraphCmd::Refresh { .. } => unreachable!("refresh is dispatched before this match"),
+        GraphCmd::Refresh { .. } | GraphCmd::Autorefresh { .. } => {
+            unreachable!("both are dispatched before this match")
+        }
 
         GraphCmd::Export { output, .. } => {
             let cov = store.coverage(&project).map_err(graph_err)?;
@@ -2749,6 +2856,8 @@ async fn main() -> anyhow::Result<()> {
             no_auto_capture,
             with_search_hints,
             no_search_hints,
+            with_graph_autorefresh,
+            no_graph_autorefresh,
             configure,
             all_projects,
         } => {
@@ -2773,6 +2882,16 @@ async fn main() -> anyhow::Result<()> {
                 with_search_hints
                     || std::env::current_dir()
                         .map(|d| setup::search_hints_installed(&d))
+                        .unwrap_or(false)
+            };
+            // Same trap as the hint hook: the PostToolUse and SessionStart
+            // keys are rewritten from these flags alone.
+            let graph_autorefresh = if no_graph_autorefresh {
+                false
+            } else {
+                with_graph_autorefresh
+                    || std::env::current_dir()
+                        .map(|d| setup::graph_autorefresh_installed(&d))
                         .unwrap_or(false)
             };
             {
@@ -2835,7 +2954,12 @@ async fn main() -> anyhow::Result<()> {
                         println!();
                     }
                     let project_id = project.unwrap_or_else(setup::detect_project_id);
-                    let result = setup::setup_claude_code(&project_id, auto_capture, search_hints)?;
+                    let result = setup::setup_claude_code(
+                        &project_id,
+                        auto_capture,
+                        search_hints,
+                        graph_autorefresh,
+                    )?;
                     println!("\nRunarForge — Claude Code Setup\n");
                     println!(
                         "  MCP server configured in {}:",
@@ -2858,8 +2982,15 @@ async fn main() -> anyhow::Result<()> {
                     if result.search_hints {
                         println!(
                             "     PreToolUse:        search hints on Grep|Glob \
-                             (opt-in; needs `runar crawl --deep`)"
+                             (opt-in; needs a crawl first)"
                         );
+                    }
+                    if result.graph_autorefresh {
+                        println!(
+                            "     PostToolUse:       code-graph auto-refresh on file writes \
+                             (opt-in; needs a crawl first)"
+                        );
+                        println!("     SessionStart:      code-graph auto-refresh");
                     }
                     println!();
                     println!("  Binary: {}", result.binary_path);
@@ -3477,4 +3608,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every hook command setup installs must still be a command this binary
+    /// accepts.
+    ///
+    /// The hooks are argument strings in a JSON file that nothing type-checks,
+    /// so moving a subcommand leaves settings.json invoking something that no
+    /// longer parses. The failure is silent by construction — the hook runs,
+    /// clap prints a usage error to a log nobody reads, and the feature simply
+    /// never happens. This shipped once, in the gap between `autorefresh` and
+    /// `graph autorefresh`, and was caught by running the real binary rather
+    /// than by any test.
+    #[test]
+    fn every_installed_hook_command_still_parses() {
+        let argvs = setup::installed_hook_argvs("proj");
+        assert!(
+            argvs.len() >= 8,
+            "expected the full hook set, got {}: {argvs:?}",
+            argvs.len()
+        );
+        for argv in argvs {
+            let full: Vec<String> = std::iter::once("runar".to_string())
+                .chain(argv.iter().cloned())
+                .collect();
+            assert!(
+                Cli::try_parse_from(&full).is_ok(),
+                "setup installs a hook this binary rejects: {}",
+                argv.join(" ")
+            );
+        }
+    }
 }

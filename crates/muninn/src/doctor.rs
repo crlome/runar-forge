@@ -222,6 +222,7 @@ pub async fn run(opts: DoctorOpts) -> Report {
     report
         .checks
         .push(check_graph_freshness(&CodeGraphStore::default_path()));
+    report.checks.push(check_graph_autorefresh());
     report.checks.push(check_search_hints());
 
     if !opts.db_only {
@@ -1081,6 +1082,74 @@ fn check_graph_freshness(path: &Path) -> Check {
     Check::pass_with(name, body)
 }
 
+/// Report what the opt-in auto-refresh hook has actually been doing.
+///
+/// Reads only the stamp files it writes — no database, no git — because the
+/// question here is whether the hook is working, not whether the graph is
+/// current, which the check above already answers. An error left by the last
+/// attempt is a genuine failure: something is writing to the graph on every
+/// file save and getting it wrong.
+fn check_graph_autorefresh() -> Check {
+    let name = "graph auto-refresh";
+    let stamps = auto_refresh_stamps();
+    if stamps.is_empty() {
+        return Check::skip(
+            name,
+            "not enabled — opt in with `runar setup claude-code \
+             --with-graph-autorefresh` (needs a crawl first)"
+                .to_string(),
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut failing = Vec::new();
+    for (project, stamp) in &stamps {
+        let age = crate::protocol::now_ms().saturating_sub(stamp.last_attempt_ms) / 1000;
+        lines.push(format!(
+            "{project}: {} ({}s ago, {}ms)",
+            stamp.last_outcome, age, stamp.last_duration_ms
+        ));
+        if stamp.last_outcome.starts_with("error:") {
+            failing.push(project.clone());
+        }
+    }
+    let body = lines.join("\n     ");
+
+    if !failing.is_empty() {
+        return Check::fail_hint(
+            name,
+            body,
+            "check ~/.runar-forge/hook.log; disable with \
+             `runar setup claude-code --no-graph-autorefresh`",
+        );
+    }
+    Check::pass_with(name, body)
+}
+
+/// Every project the auto-refresh hook has recorded an attempt for.
+fn auto_refresh_stamps() -> Vec<(String, crate::codegraph::refresh::Stamp)> {
+    let dir = setup::runar_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `graph-refresh-<project>.stamp`, and never the `.lock` beside it.
+        let Some(project) = name
+            .strip_prefix("graph-refresh-")
+            .and_then(|rest| rest.strip_suffix(".stamp"))
+        else {
+            continue;
+        };
+        if let Some(stamp) = crate::codegraph::refresh::read_stamp(project) {
+            out.push((project.to_string(), stamp));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Wording matches `codegraph::format::coverage` so the two read the same.
 fn codegraph_line(project: &str, cov: &Coverage) -> String {
     let parsed = cov.indexed + cov.partial;
@@ -1391,6 +1460,60 @@ mod tests {
             "a graph with no baseline reported as current: {:?}",
             c.status
         );
+    }
+
+    #[test]
+    fn auto_refresh_reports_nothing_when_it_was_never_enabled() {
+        crate::test_support::with_runar_home(|| {
+            let c = check_graph_autorefresh();
+            match c.status {
+                Status::Skip { reason } => assert!(
+                    reason.contains("--with-graph-autorefresh"),
+                    "no way in named: {reason}"
+                ),
+                other => panic!("expected skip, got {other:?}"),
+            }
+        });
+    }
+
+    /// A background writer that keeps failing must not read as healthy: it is
+    /// running on every file save and getting it wrong, and nobody would
+    /// notice except by seeing the graph never change.
+    #[test]
+    fn auto_refresh_failing_in_the_background_is_a_failure() {
+        crate::test_support::with_runar_home(|| {
+            use crate::codegraph::refresh::{write_stamp, Stamp};
+            write_stamp(
+                "p",
+                &Stamp {
+                    last_attempt_ms: crate::protocol::now_ms(),
+                    not_before_ms: 0,
+                    last_outcome: "error: codegraph db: disk I/O error".into(),
+                    last_duration_ms: 12,
+                },
+            );
+            let c = check_graph_autorefresh();
+            assert!(
+                matches!(c.status, Status::Fail { .. }),
+                "a failing background writer read as {:?}",
+                c.status
+            );
+
+            // A healthy one passes and says what it did.
+            write_stamp(
+                "p",
+                &Stamp {
+                    last_attempt_ms: crate::protocol::now_ms(),
+                    not_before_ms: 0,
+                    last_outcome: "done".into(),
+                    last_duration_ms: 310,
+                },
+            );
+            let c = check_graph_autorefresh();
+            assert!(matches!(c.status, Status::Pass), "got {:?}", c.status);
+            let detail = c.detail.unwrap_or_default();
+            assert!(detail.contains("310ms"), "got {detail}");
+        });
     }
 
     #[test]
