@@ -803,6 +803,15 @@ impl<'a> CrawlOrchestrator<'a> {
             ],
             project_id: Some(self.project_id.clone()),
             topic_key: Some(self.crawl_state_key()),
+            // This content is machine-readable, not prose. `load_state` runs
+            // it through `git::deserialize_state`, which is
+            // `serde_json::from_str(json).ok()` — so a truncated blob does
+            // not error, it yields `None`, which reads as "no previous
+            // state" and silently downgrades every later crawl to a full
+            // one. The blob is dominated by `file_hashes` (99.8% of 127,680
+            // chars on a 2,082-file project), so it exceeds the content
+            // limit on any sizeable project.
+            exact_content: true,
             ..Default::default()
         };
         self.librarian.propose(input).await?;
@@ -858,6 +867,54 @@ mod tests {
         storage.initialize().await.unwrap();
         let embedding = Arc::new(DisabledEmbeddingProvider);
         Arc::new(MemoryLibrarian::new(storage, embedding, "test", None))
+    }
+
+    /// A large project's crawl state exceeds the content limit — 99.8% of it
+    /// is `file_hashes` — and it must survive the round trip whole.
+    ///
+    /// `load_state` parses through `git::deserialize_state`, which is
+    /// `serde_json::from_str(json).ok()`. Truncation therefore does not
+    /// error: it yields `None`, which reads as "no previous state", so every
+    /// later crawl silently downgrades to a full one and incremental crawling
+    /// is dead with nothing in the logs. Deleting `exact_content: true` from
+    /// `save_state` must fail here.
+    #[tokio::test]
+    async fn a_large_crawl_state_round_trips_and_stays_parseable() {
+        let librarian = test_librarian().await;
+        let orch = CrawlOrchestrator::new(&librarian, "bigproj", CrawlMode::Full, None);
+
+        let mut state = CrawlState {
+            project_root: "/tmp/bigproj".into(),
+            project_id: "bigproj".into(),
+            ..Default::default()
+        };
+        // Enough files that the serialized blob clears the limit several
+        // times over, as it does on any real project of size.
+        for i in 0..4_000 {
+            state
+                .file_hashes
+                .insert(format!("src/module_{i}/handler.rs"), format!("{i:016x}"));
+        }
+        let serialized_len = git::serialize_state(&state).chars().count();
+        assert!(
+            serialized_len > crate::librarian::content_limit(),
+            "fixture must exceed the limit to be meaningful ({serialized_len} chars)"
+        );
+
+        orch.save_state(&state).await.unwrap();
+
+        let loaded = orch
+            .load_state()
+            .await
+            .unwrap()
+            .expect("crawl state must still parse after a save/load round trip");
+        assert_eq!(
+            loaded.file_hashes.len(),
+            4_000,
+            "every file hash must survive; a truncated blob yields None and \
+             silently turns every later crawl into a full one"
+        );
+        assert_eq!(loaded.project_id, "bigproj");
     }
 
     #[tokio::test]

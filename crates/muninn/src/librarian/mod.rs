@@ -8,6 +8,47 @@ use crate::embedding::EmbeddingProvider;
 use crate::storage::{MemoryStorage, StorageResult};
 use crate::types::*;
 
+/// Ceiling on an entry's stored content, in characters.
+///
+/// Matches the remote's own `CHECK (char_length(content) <= 10000)`
+/// (`pg_sql/001_initial_schema.sql`). SQLite carries no equivalent CHECK, and
+/// that divergence is not cosmetic: an oversized entry saved locally and was
+/// then rejected by the remote on every push attempt, forever. Override with
+/// `RUNAR_MAX_CONTENT_CHARS` — but raising it past the remote's CHECK just
+/// moves the failure back to push time.
+pub const MAX_CONTENT_CHARS: usize = 10_000;
+
+pub fn content_limit() -> usize {
+    std::env::var("RUNAR_MAX_CONTENT_CHARS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_CONTENT_CHARS)
+}
+
+/// Bound an entry's content, returning the bounded text and the number of
+/// characters dropped.
+///
+/// The marker states the count, because a bare ellipsis leaves a reader unable
+/// to tell a lightly-clipped entry from one that lost 97% of its body. Every
+/// measurement is in chars: this repo has permanently broken a hook by
+/// comparing a byte length against a char budget.
+pub fn bound_content(content: &str, limit: usize) -> (String, usize) {
+    let total = content.chars().count();
+    if total <= limit {
+        return (content.to_string(), 0);
+    }
+    let dropped = total - limit;
+    let marker = format!("\n\n… [truncated {dropped} chars]");
+    // Spend part of the budget on the marker, so the result still fits the
+    // limit rather than overshooting it by the marker's length.
+    let body_budget = limit.saturating_sub(marker.chars().count());
+    (
+        format!("{}{marker}", crate::text::char_prefix(content, body_budget)),
+        dropped,
+    )
+}
+
 pub struct MemoryLibrarian {
     storage: Arc<dyn MemoryStorage>,
     embedding: Arc<dyn EmbeddingProvider>,
@@ -132,6 +173,27 @@ impl MemoryLibrarian {
             input.tags.push("redacted:secret".to_string());
         }
 
+        // Bound the content on the same chokepoint, and AFTER redaction so
+        // the limit applies to what actually gets stored — truncating first
+        // could cut a secret in half and hide it from the matchers.
+        //
+        // The remote enforces `char_length(content) <= 10000`; SQLite has no
+        // such CHECK, so an oversized entry used to save locally and then be
+        // rejected by the remote forever. 107 rows sat unsyncable for months
+        // behind a `db error` that named nothing.
+        let over_limit = if input.exact_content {
+            input.content.chars().count() > content_limit()
+        } else {
+            let (bounded, dropped) = bound_content(&input.content, content_limit());
+            if dropped > 0 {
+                input.content = bounded;
+                if !input.tags.iter().any(|t| t == "truncated") {
+                    input.tags.push("truncated".to_string());
+                }
+            }
+            false
+        };
+
         // Phase 5.7 — stamp author from `git config user.name` when the
         // caller did not pass an explicit value. Stays None if git isn't
         // configured; the storage column then remains NULL.
@@ -140,6 +202,7 @@ impl MemoryLibrarian {
         }
 
         let embed_text = format!("{} {}", input.title, input.content);
+        let input_chars = input.content.chars().count();
         let result = self.storage.save(input, &namespace).await?;
 
         if matches!(result.action, SaveAction::Created | SaveAction::Updated) {
@@ -169,8 +232,23 @@ impl MemoryLibrarian {
             // Phase 5.6.2 — outbox enqueue. Hybrid mode only; otherwise
             // no-op. Re-fetch the freshly saved row so the payload
             // reflects the post-save state (including supersession).
-            self.enqueue_outbox_for_entry(entry_id, OutboxOp::Insert)
-                .await;
+            //
+            // An `exact_content` entry over the limit is deliberately not
+            // queued: the remote's CHECK would reject it on every attempt
+            // until the dead-letter cap parked it, so queueing it only
+            // manufactures noise. Say so once, loudly, instead.
+            if over_limit {
+                tracing::warn!(
+                    entry = %entry_id,
+                    chars = input_chars,
+                    limit = content_limit(),
+                    "entry exceeds the remote content limit and will not sync \
+                     (exact_content is set, so it is stored whole locally)"
+                );
+            } else {
+                self.enqueue_outbox_for_entry(entry_id, OutboxOp::Insert)
+                    .await;
+            }
 
             // Auto-link is fire-and-forget (less critical)
             let storage = self.storage.clone();
@@ -1525,6 +1603,137 @@ mod tests {
         lib.deprecate(saved.id).await.unwrap();
 
         assert_eq!(storage.outbox_depth().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn bound_content_reports_what_it_dropped() {
+        let (out, dropped) = bound_content("short", 100);
+        assert_eq!(out, "short");
+        assert_eq!(dropped, 0, "under the limit is untouched");
+
+        let (out, dropped) = bound_content(&"x".repeat(500), 100);
+        assert_eq!(dropped, 400);
+        assert!(
+            out.contains("[truncated 400 chars]"),
+            "a bare ellipsis cannot distinguish a light clip from a gutting"
+        );
+        assert!(
+            out.chars().count() <= 100,
+            "the marker must fit INSIDE the budget, not overshoot it — got {}",
+            out.chars().count()
+        );
+    }
+
+    /// The repo has permanently broken a hook by measuring bytes against a
+    /// char budget. Content is arbitrary user text.
+    #[test]
+    fn bound_content_counts_chars_not_bytes() {
+        let cjk = "配置".repeat(50); // 100 chars, 300 bytes
+        let (out, dropped) = bound_content(&cjk, 100);
+        assert_eq!(dropped, 0, "100 chars is within a 100-char budget");
+        assert_eq!(out, cjk);
+
+        // And cutting mid-sequence must not panic.
+        for n in 1..40 {
+            let _ = bound_content("🐦‍⬛ raven with a ZWJ sequence", n);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_prose_is_bounded_and_tagged() {
+        let lib = test_librarian().await;
+        let saved = lib
+            .propose(MemoryEntryInput {
+                title: "huge".into(),
+                content: "y".repeat(50_000),
+                entry_type: EntryType::Note,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry = lib.get(saved.id).await.unwrap();
+        assert!(
+            entry.content.chars().count() <= content_limit(),
+            "stored content must satisfy the remote's CHECK, got {}",
+            entry.content.chars().count()
+        );
+        assert!(
+            entry.tags.iter().any(|t| t == "truncated"),
+            "must be marked"
+        );
+    }
+
+    /// The hazard this design exists to avoid. Crawl state is a JSON blob that
+    /// `git::deserialize_state` parses back with `serde_json::from_str(..).ok()`
+    /// — truncating it does not error, it returns None, which reads as "no
+    /// previous state" and silently downgrades every crawl to a full one.
+    #[tokio::test]
+    async fn exact_content_survives_whole_so_crawl_state_still_parses() {
+        let lib = test_librarian().await;
+        // A realistic shape: one big JSON object, far over the limit.
+        let hashes: String = (0..4000)
+            .map(|i| format!("\"src/f{i}.rs\":\"{i:016x}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let blob = format!("{{\"project_id\":\"p\",\"file_hashes\":{{{hashes}}}}}");
+        assert!(blob.chars().count() > content_limit() * 3);
+
+        let saved = lib
+            .propose(MemoryEntryInput {
+                title: "Crawl state: p".into(),
+                content: blob.clone(),
+                entry_type: EntryType::Context,
+                exact_content: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry = lib.get(saved.id).await.unwrap();
+        assert_eq!(entry.content, blob, "must round-trip byte for byte");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&entry.content).is_ok(),
+            "must still be parseable JSON — this is the whole point"
+        );
+        assert!(
+            !entry.tags.iter().any(|t| t == "truncated"),
+            "exempt entries are not clipped, so must not claim to be"
+        );
+    }
+
+    /// An exempt entry over the limit cannot satisfy the remote's CHECK, so
+    /// queueing it would only feed the dead-letter queue.
+    #[tokio::test]
+    async fn oversized_exact_content_is_not_queued_for_sync() {
+        let _env = crate::test_support::with_env("RUNAR_STORAGE_LOCAL", "sqlite");
+        let (lib, storage) = test_librarian_with_storage().await;
+
+        lib.propose(MemoryEntryInput {
+            title: "Crawl state: p".into(),
+            content: "z".repeat(50_000),
+            entry_type: EntryType::Context,
+            exact_content: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.outbox_depth().await.unwrap(),
+            0,
+            "an unsyncable entry must not be queued"
+        );
+
+        // A bounded entry of the same origin still syncs normally.
+        lib.propose(MemoryEntryInput {
+            title: "normal".into(),
+            content: "z".repeat(50_000),
+            entry_type: EntryType::Context,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(storage.outbox_depth().await.unwrap(), 1);
     }
 
     #[tokio::test]
