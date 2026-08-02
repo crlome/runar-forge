@@ -2440,6 +2440,78 @@ impl MemoryStorage for SqliteAdapter {
         Ok(())
     }
 
+    async fn unsendable_outbox_rows(
+        &self,
+        max_content_chars: usize,
+        limit: usize,
+    ) -> StorageResult<Vec<crate::types::UnsendableRow>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        // `length()` on a TEXT value counts characters in SQLite, which is
+        // the unit the remote's CHECK uses. Payload keys are camelCase, but
+        // `content` is spelled the same either way.
+        let mut stmt = db
+            .prepare(
+                "SELECT id, entry_id, op_kind,
+                        length(json_extract(row_payload, '$.content'))
+                 FROM sync_outbox
+                 WHERE confirmed_at IS NULL
+                   AND length(json_extract(row_payload, '$.content')) > ?1
+                 ORDER BY created_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![max_content_chars as i64, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(oid, eid, op, chars)| {
+                Ok(crate::types::UnsendableRow {
+                    outbox_id: Uuid::parse_str(&oid)
+                        .map_err(|e| StorageError::Database(e.to_string()))?,
+                    entry_id: Uuid::parse_str(&eid)
+                        .map_err(|e| StorageError::Database(e.to_string()))?,
+                    op_kind: crate::types::OutboxOp::parse(&op)
+                        .ok_or_else(|| StorageError::Database(format!("bad op_kind {op}")))?,
+                    content_chars: chars as usize,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_outbox_rows(&self, ids: &[Uuid]) -> StorageResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let tx = db.unchecked_transaction().map_err(db_err)?;
+        let mut removed = 0u64;
+        for id in ids {
+            removed += tx
+                .execute(
+                    "DELETE FROM sync_outbox WHERE id = ?1",
+                    params![id.to_string()],
+                )
+                .map_err(db_err)? as u64;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(removed)
+    }
+
     async fn outbox_depth(&self) -> StorageResult<usize> {
         let db = self
             .db
@@ -4763,6 +4835,91 @@ mod tests {
         assert!(row.last_error.is_none());
         let parsed: MemoryEntry = serde_json::from_value(row.row_payload).unwrap();
         assert!(parsed.deleted_at.is_some());
+    }
+
+    /// Unsendable is a property of the **payload**, not of the entry as it
+    /// stands now — the payload is what gets pushed, and it is a snapshot.
+    #[tokio::test]
+    async fn unsendable_rows_are_judged_by_payload_not_current_entry() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let queue = |eid: Uuid, content: &str| crate::types::OutboxInput {
+            entry_id: eid,
+            op_kind: crate::types::OutboxOp::Insert,
+            row_payload: serde_json::json!({"id": eid.to_string(), "content": content}),
+        };
+
+        let small = Uuid::new_v4();
+        let big = Uuid::new_v4();
+        let ok_id = adapter.enqueue_outbox(queue(small, "tiny")).await.unwrap();
+        let bad_id = adapter
+            .enqueue_outbox(queue(big, &"x".repeat(50)))
+            .await
+            .unwrap();
+
+        let found = adapter.unsendable_outbox_rows(20, 100).await.unwrap();
+        assert_eq!(found.len(), 1, "only the oversized payload");
+        assert_eq!(found[0].outbox_id, bad_id);
+        assert_eq!(found[0].entry_id, big);
+        assert_eq!(found[0].content_chars, 50, "reports the real size");
+
+        // Raising the limit past the payload makes it sendable again, so the
+        // predicate really is the limit and not something incidental.
+        assert!(adapter
+            .unsendable_outbox_rows(100, 100)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A confirmed row is out of scope — it already landed.
+        adapter.confirm_outbox(&[bad_id]).await.unwrap();
+        assert!(adapter
+            .unsendable_outbox_rows(20, 100)
+            .await
+            .unwrap()
+            .is_empty());
+        let _ = ok_id;
+    }
+
+    /// The purge must remove queue rows and nothing else. Deleting a
+    /// memory entry here would destroy data the user never asked to lose.
+    #[tokio::test]
+    async fn deleting_outbox_rows_leaves_memory_entries_intact() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        let entry = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "keep me".into(),
+                    content: "z".repeat(50),
+                    entry_type: crate::types::EntryType::Note,
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap()
+            .id;
+        let row = adapter
+            .enqueue_outbox(crate::types::OutboxInput {
+                entry_id: entry,
+                op_kind: crate::types::OutboxOp::Insert,
+                row_payload: serde_json::json!({"id": entry.to_string(), "content": "z".repeat(50)}),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(adapter.delete_outbox_rows(&[row]).await.unwrap(), 1);
+        assert_eq!(adapter.outbox_depth().await.unwrap(), 0);
+
+        let still_there = adapter.get(entry).await.expect("entry must survive");
+        assert_eq!(still_there.title, "keep me");
+        assert!(still_there.deleted_at.is_none(), "not even soft-deleted");
+
+        // Idempotent: deleting an id that is already gone removes nothing.
+        assert_eq!(adapter.delete_outbox_rows(&[row]).await.unwrap(), 0);
+        assert_eq!(adapter.delete_outbox_rows(&[]).await.unwrap(), 0);
     }
 
     #[tokio::test]

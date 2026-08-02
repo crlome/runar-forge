@@ -764,6 +764,22 @@ impl OutboxHealth {
     }
 }
 
+/// An outbox row the remote can never accept, because its payload's
+/// `content` exceeds the remote's own `CHECK (char_length(content) <= N)`.
+///
+/// Tested against the **payload**, not the entry's current content: the
+/// payload is what gets pushed, and it is a snapshot. An entry rewritten or
+/// deleted since the row was queued still carries its original oversized
+/// body in the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsendableRow {
+    pub outbox_id: Uuid,
+    pub entry_id: Uuid,
+    pub op_kind: OutboxOp,
+    /// Characters in the payload's `content`, for reporting.
+    pub content_chars: usize,
+}
+
 /// Singleton state row tracking the pull cursor + handshake metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {

@@ -2178,6 +2178,59 @@ impl MemoryStorage for PostgresAdapter {
         Ok(())
     }
 
+    async fn unsendable_outbox_rows(
+        &self,
+        max_content_chars: usize,
+        limit: usize,
+    ) -> StorageResult<Vec<crate::types::UnsendableRow>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT id, entry_id, op_kind,
+                        char_length(row_payload->>'content')::BIGINT AS chars
+                 FROM muninn.sync_outbox
+                 WHERE confirmed_at IS NULL
+                   AND char_length(row_payload->>'content') > $1
+                 ORDER BY created_at ASC
+                 LIMIT $2",
+                &[&(max_content_chars as i32), &(limit as i64)],
+            )
+            .await
+            .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                let oid: String = r.get("id");
+                let eid: String = r.get("entry_id");
+                let op: String = r.get("op_kind");
+                Ok(crate::types::UnsendableRow {
+                    outbox_id: Uuid::parse_str(&oid)
+                        .map_err(|e| StorageError::Database(e.to_string()))?,
+                    entry_id: Uuid::parse_str(&eid)
+                        .map_err(|e| StorageError::Database(e.to_string()))?,
+                    op_kind: crate::types::OutboxOp::parse(&op)
+                        .ok_or_else(|| StorageError::Database(format!("bad op_kind {op}")))?,
+                    content_chars: r.get::<_, i64>("chars") as usize,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_outbox_rows(&self, ids: &[Uuid]) -> StorageResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let client = self.get_client().await?;
+        let id_strs: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        let removed = client
+            .execute(
+                "DELETE FROM muninn.sync_outbox WHERE id = ANY($1)",
+                &[&id_strs],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(removed)
+    }
+
     async fn outbox_depth(&self) -> StorageResult<usize> {
         let client = self.get_client().await?;
         let row = client
