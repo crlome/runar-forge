@@ -175,8 +175,84 @@ impl PostgresAdapter {
     }
 }
 
+/// Turn a driver error into something a human can act on.
+///
+/// `tokio_postgres::Error::to_string()` renders the literal string
+/// `"db error"` for anything the server rejected — every detail the
+/// server sent lives in the attached `DbError`. Reporting only the
+/// outer string is why one sync_outbox row reached **64,634 attempts**
+/// without anyone being able to say what was wrong with it.
+///
+/// Format: `SQLSTATE message (detail; constraint on table.column)`,
+/// omitting parts the server did not send.
 fn db_err(e: tokio_postgres::Error) -> StorageError {
-    StorageError::Database(e.to_string())
+    let Some(db) = e.as_db_error() else {
+        // Connection/protocol/TLS failures have no DbError; the outer
+        // message is genuinely the whole story there.
+        return StorageError::Database(e.to_string());
+    };
+
+    StorageError::Database(format_db_error(
+        db.code().code(),
+        db.message(),
+        db.detail(),
+        db.hint(),
+        db.table(),
+        db.column(),
+        db.constraint(),
+    ))
+}
+
+/// Cap on the server-supplied `detail` string. See `format_db_error`.
+const MAX_DETAIL_CHARS: usize = 300;
+
+/// Truncate on a char boundary — `detail` carries row content, which is
+/// arbitrary UTF-8, and slicing it by byte index panics mid-codepoint.
+fn truncate_detail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}… [truncated]")
+}
+
+/// Split out from `db_err` because `tokio_postgres::error::DbError` has
+/// no public constructor, so the formatting is otherwise untestable.
+#[allow(clippy::too_many_arguments)]
+fn format_db_error(
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+    table: Option<&str>,
+    column: Option<&str>,
+    constraint: Option<&str>,
+) -> String {
+    let mut msg = format!("[{code}] {message}");
+    let mut context: Vec<String> = Vec::new();
+    if let Some(detail) = detail {
+        // Postgres puts the ENTIRE failing row in `detail` for a
+        // constraint violation. Entries here run to hundreds of KB, and
+        // this string is persisted to `sync_outbox.last_error` — which
+        // never passes through `redact::scrub`. Keep enough to identify
+        // the row, not enough to duplicate its body.
+        context.push(truncate_detail(detail, MAX_DETAIL_CHARS));
+    }
+    if let Some(hint) = hint {
+        context.push(format!("hint: {hint}"));
+    }
+    match (table, column) {
+        (Some(t), Some(c)) => context.push(format!("at {t}.{c}")),
+        (Some(t), None) => context.push(format!("at {t}")),
+        _ => {}
+    }
+    if let Some(constraint) = constraint {
+        context.push(format!("constraint {constraint}"));
+    }
+    if !context.is_empty() {
+        msg.push_str(&format!(" ({})", context.join("; ")));
+    }
+    msg
 }
 
 fn row_to_entry(row: &tokio_postgres::Row) -> MemoryEntry {
@@ -2486,6 +2562,101 @@ fn row_to_pending_observation(row: &tokio_postgres::Row) -> PendingObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point: a server rejection must name itself. The driver's
+    /// own `to_string()` renders "db error" and nothing else, which is how
+    /// an outbox row reached 64,634 attempts undiagnosed.
+    #[test]
+    fn a_server_rejection_reports_what_the_server_said() {
+        let msg = format_db_error(
+            "23505",
+            "duplicate key value violates unique constraint",
+            Some("Key (id)=(abc) already exists."),
+            None,
+            Some("memory_entries"),
+            None,
+            Some("memory_entries_pkey"),
+        );
+        assert!(msg.contains("23505"), "SQLSTATE is the searchable part");
+        assert!(msg.contains("duplicate key value"));
+        assert!(msg.contains("Key (id)=(abc) already exists."));
+        assert!(msg.contains("at memory_entries"));
+        assert!(msg.contains("constraint memory_entries_pkey"));
+        assert!(
+            !msg.contains("db error"),
+            "must not degrade to the driver's placeholder"
+        );
+    }
+
+    /// `detail` carries the whole failing row. It must be bounded before
+    /// it is persisted to `sync_outbox.last_error`, and it must not be
+    /// sliced by byte index — row content is arbitrary UTF-8 and the
+    /// repo has a history of truncation panics on multi-byte input.
+    #[test]
+    fn oversized_detail_is_bounded_on_a_char_boundary() {
+        let short = truncate_detail("plenty short", MAX_DETAIL_CHARS);
+        assert_eq!(short, "plenty short", "under the cap, keep it verbatim");
+
+        let huge = "é".repeat(5_000); // 2 bytes per char
+        let cut = truncate_detail(&huge, MAX_DETAIL_CHARS);
+        assert!(cut.ends_with("… [truncated]"));
+        assert_eq!(
+            cut.chars().filter(|c| *c == 'é').count(),
+            MAX_DETAIL_CHARS,
+            "cap counts chars, not bytes"
+        );
+
+        // Exactly at the cap is not truncated.
+        let exact = "x".repeat(MAX_DETAIL_CHARS);
+        assert_eq!(truncate_detail(&exact, MAX_DETAIL_CHARS), exact);
+
+        let msg = format_db_error(
+            "23514",
+            "violates check",
+            Some(&huge),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(msg.contains("[truncated]"));
+        assert!(msg.len() < 1_000, "bounded, got {}", msg.len());
+    }
+
+    /// Fields the server omitted must not leave empty parens or stray
+    /// separators behind.
+    #[test]
+    fn omitted_fields_leave_no_debris() {
+        assert_eq!(
+            format_db_error(
+                "42P01",
+                "relation does not exist",
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            "[42P01] relation does not exist"
+        );
+        assert_eq!(
+            format_db_error(
+                "22001",
+                "value too long",
+                None,
+                None,
+                Some("t"),
+                Some("c"),
+                None
+            ),
+            "[22001] value too long (at t.c)"
+        );
+        // column without table is meaningless on its own — drop it
+        assert_eq!(
+            format_db_error("22001", "value too long", None, None, None, Some("c"), None),
+            "[22001] value too long"
+        );
+    }
 
     /// Broken URL → pool acquire must time out within the configured window
     /// instead of hanging. Guards Phase 4.8 item 4.8.17 regression.
