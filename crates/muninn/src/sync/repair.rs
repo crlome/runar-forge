@@ -121,15 +121,32 @@ pub async fn cmd_repair(dry_run: bool, limit: usize, release_all: bool) -> Resul
         }
     } else {
         let mut enqueued = 0usize;
+        let mut unreadable = 0usize;
         for id in &orphans {
-            // The row is already soft-deleted, so the payload is the
-            // tombstone: an id the remote can resolve. The body is gone
-            // and is not what a delete needs.
+            // The payload must be the soft-deleted row itself: `push_one`
+            // deserializes into a full `MemoryEntry`, and the remote's
+            // resolver applies the deletion from that snapshot's
+            // `deleted_at`. An id stub would be unpushable.
+            let payload = match local.get_including_deleted(*id).await {
+                Ok(e) => match serde_json::to_value(&e) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, entry = %id, "tombstone serialize failed");
+                        unreadable += 1;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, entry = %id, "tombstone row unreadable");
+                    unreadable += 1;
+                    continue;
+                }
+            };
             let res = local
                 .enqueue_outbox(OutboxInput {
                     entry_id: *id,
                     op_kind: OutboxOp::Delete,
-                    row_payload: serde_json::json!({ "id": id.to_string() }),
+                    row_payload: payload,
                 })
                 .await;
             match res {
@@ -138,12 +155,50 @@ pub async fn cmd_repair(dry_run: bool, limit: usize, release_all: bool) -> Resul
             }
         }
         println!("\n  enqueued {enqueued} tombstone(s)");
+        if unreadable > 0 {
+            println!("  {unreadable} entr(ies) could not be read and were skipped");
+        }
         if orphans.len() == limit {
             println!(
                 "  hit the {limit}-row limit — re-run to continue \
                  (`--limit` raises it)"
             );
         }
+    }
+
+    // ── 3. delete rows queued with an unpushable payload ──────────
+    // An earlier build of this command enqueued id-only stubs. They can
+    // never deserialize, so they fail their way to the dead-letter queue
+    // instead of propagating the deletion.
+    let malformed = local
+        .malformed_delete_payloads(limit)
+        .await
+        .map_err(|e| anyhow!("malformed_delete_payloads: {e}"))?;
+    if malformed.is_empty() {
+        println!("  no delete rows carry an unpushable payload");
+    } else if dry_run {
+        println!(
+            "  would rewrite {} delete payload(s) that cannot deserialize",
+            malformed.len()
+        );
+    } else {
+        let mut fixed = 0usize;
+        for (outbox_id, entry_id) in &malformed {
+            let Ok(entry) = local.get_including_deleted(*entry_id).await else {
+                continue;
+            };
+            let Ok(payload) = serde_json::to_value(&entry) else {
+                continue;
+            };
+            if local
+                .rewrite_outbox_payload(*outbox_id, &payload)
+                .await
+                .is_ok()
+            {
+                fixed += 1;
+            }
+        }
+        println!("  rewrote {fixed} unpushable delete payload(s)");
     }
 
     if !dry_run {

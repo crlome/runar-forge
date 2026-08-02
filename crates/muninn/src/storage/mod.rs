@@ -56,6 +56,14 @@ pub trait MemoryStorage: Send + Sync {
     async fn save(&self, input: MemoryEntryInput, namespace: &str) -> StorageResult<SaveResult>;
     async fn get(&self, id: Uuid) -> StorageResult<MemoryEntry>;
 
+    /// Same as `get`, but sees soft-deleted rows too.
+    ///
+    /// Needed to build a sync tombstone: a `delete` outbox payload is a
+    /// full entry snapshot carrying `deleted_at`, and `get` filters
+    /// exactly the rows a tombstone is about. The remote's LWW resolver
+    /// applies the deletion from that snapshot like any other update.
+    async fn get_including_deleted(&self, id: Uuid) -> StorageResult<MemoryEntry>;
+
     /// Fetch the live entry for a (namespace, topic_key) pair, if any.
     async fn get_by_topic_key(
         &self,
@@ -323,6 +331,23 @@ pub trait MemoryStorage: Send + Sync {
     /// delete ops. Ordered oldest-deletion-first so a capped run makes
     /// deterministic progress.
     async fn deleted_entries_without_tombstone(&self, limit: usize) -> StorageResult<Vec<Uuid>>;
+
+    /// Unconfirmed `delete` rows whose payload is not a full entry, and
+    /// so can never be pushed — `push_one` deserializes into
+    /// `MemoryEntry`. Returns `(outbox_id, entry_id)` pairs.
+    ///
+    /// Detected structurally (missing `title`) rather than by reading
+    /// `last_error`, so rows that have not been attempted yet are found
+    /// too.
+    async fn malformed_delete_payloads(&self, limit: usize) -> StorageResult<Vec<(Uuid, Uuid)>>;
+
+    /// Replace an outbox row's payload and clear its failure state so it
+    /// re-enters the queue with a clean slate.
+    async fn rewrite_outbox_payload(
+        &self,
+        outbox_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> StorageResult<()>;
 
     /// Count of pending (unconfirmed) outbox rows.
     async fn outbox_depth(&self) -> StorageResult<usize>;

@@ -187,15 +187,22 @@ impl MemoryLibrarian {
     pub async fn deprecate(&self, id: Uuid) -> StorageResult<()> {
         // Phase 5.6.2 — soft-delete needs to propagate to remote.
         //
-        // Snapshot BEFORE deleting. `storage.get` filters
-        // `deleted_at IS NULL`, so reading after the delete returns
-        // NotFound and the enqueue silently bails — which is why zero
-        // `delete` rows had ever reached the outbox. Every deletion in
-        // the tree (dedup, retirement, crawler cleanup) funnels through
-        // here, so with no delete ops a remote drain would resurrect
-        // everything the local side had cleaned up.
-        let snapshot = self.outbox_snapshot(id).await;
+        // Snapshot AFTER deleting, through the reader that can see
+        // tombstones. Two constraints meet here:
+        //
+        //   - `storage.get` filters `deleted_at IS NULL`, so the
+        //     original delete-then-`get` returned NotFound and the
+        //     enqueue bailed silently. Zero delete ops had ever reached
+        //     the outbox, and every deletion in the tree (dedup,
+        //     retirement, crawler cleanup) funnels through here, so a
+        //     remote drain would resurrect all of it.
+        //   - `push_one` deserializes the payload as a full
+        //     `MemoryEntry`, so a stub is unpushable — and a pre-delete
+        //     snapshot would carry `deleted_at: None`, telling the
+        //     remote the entry is alive. The payload has to be the
+        //     deleted row itself.
         self.storage.delete(id).await?;
+        let snapshot = self.outbox_snapshot(id).await;
         self.enqueue_outbox_snapshot(id, OutboxOp::Delete, snapshot)
             .await;
         Ok(())
@@ -216,11 +223,14 @@ impl MemoryLibrarian {
 
     /// Serialize the current row for an outbox payload. `None` when the
     /// row is unreadable or unserializable, or when hybrid mode is off.
+    ///
+    /// Reads through `get_including_deleted` because a delete's payload
+    /// is the soft-deleted row itself.
     async fn outbox_snapshot(&self, entry_id: Uuid) -> Option<serde_json::Value> {
         if std::env::var("RUNAR_STORAGE_LOCAL").is_err() {
             return None;
         }
-        let entry = self.storage.get(entry_id).await.ok()?;
+        let entry = self.storage.get_including_deleted(entry_id).await.ok()?;
         match serde_json::to_value(&entry) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -240,12 +250,14 @@ impl MemoryLibrarian {
         if std::env::var("RUNAR_STORAGE_LOCAL").is_err() {
             return;
         }
-        // A delete must propagate even if the pre-delete snapshot could
-        // not be taken: the tombstone is the point, not the body.
-        let payload = match (payload, op_kind) {
-            (Some(v), _) => v,
-            (None, OutboxOp::Delete) => serde_json::json!({ "id": entry_id.to_string() }),
-            (None, _) => return, // can't outbox what we can't read
+        // No id-stub fallback: `push_one` deserializes the payload as a
+        // full `MemoryEntry`, so a stub is unpushable and would just
+        // fail its way to the dead-letter queue. Dropping the enqueue
+        // leaves the entry visible to `sync repair`, which can retry it
+        // once the row is readable again.
+        let Some(payload) = payload else {
+            tracing::warn!(entry = %entry_id, op = op_kind.as_str(), "outbox snapshot unavailable");
+            return;
         };
         if let Err(e) = self
             .storage
@@ -1473,15 +1485,23 @@ mod tests {
             "a soft-delete must enqueue a delete op, got {ops:?}"
         );
 
-        // The tombstone carries the entry id even though the row is gone.
         let del = rows
             .iter()
             .find(|r| r.entry_id == saved.id && r.op_kind == OutboxOp::Delete)
             .unwrap();
-        assert_eq!(
-            del.row_payload.get("id").and_then(|v| v.as_str()),
-            Some(saved.id.to_string().as_str()),
-            "delete payload must identify the entry"
+
+        // The payload must survive exactly what `push_one` does to it.
+        // An id-only stub passes every enqueue-side assertion and then
+        // fails on the wire with "missing field `title`" — which is how
+        // 200 tombstones dead-lettered against the live remote.
+        let round_tripped: crate::types::MemoryEntry =
+            serde_json::from_value(del.row_payload.clone())
+                .expect("delete payload must deserialize as a full MemoryEntry");
+        assert_eq!(round_tripped.id, saved.id);
+        assert!(
+            round_tripped.deleted_at.is_some(),
+            "the tombstone must carry deleted_at, or the remote resolver \
+             treats it as a live entry and the deletion never propagates"
         );
     }
 
