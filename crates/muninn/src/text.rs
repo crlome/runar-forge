@@ -14,6 +14,26 @@ pub fn char_prefix(s: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Char-boundary-safe prefix under a **byte** budget.
+///
+/// Use this when the budget is genuinely about bytes — an IO read cap, a
+/// column width, a wire limit — rather than a display length. Truncating to a
+/// char count instead would change how much is read for non-ASCII input.
+///
+/// `String::truncate(n)` and `&s[..n]` both panic when `n` lands inside a
+/// multibyte character. This floors to the nearest boundary at or below the
+/// budget, so it always returns at most `max_bytes` and never panics.
+pub fn byte_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Preview helper: at most `max_chars` characters, with `...` appended only
 /// when something was actually cut.
 ///
@@ -69,6 +89,43 @@ mod tests {
         let s = "配置ファイル";
         assert_eq!(truncate_ellipsis(s, 10), s);
         assert_eq!(truncate_ellipsis(s, 2), "配置...");
+    }
+
+    /// The shape that crashed `runar crawl`: a byte budget landing inside a
+    /// multibyte character. `String::truncate(8192)` / `&s[..8192]` both panic
+    /// there; this must not.
+    #[test]
+    fn byte_budget_inside_a_multibyte_char_floors_to_the_boundary() {
+        // U+2500 (3 bytes) — the `─` from this repo's `// ── Section ──`
+        // dividers, which is the real-world trigger.
+        let s = "a".repeat(8191) + &"─".repeat(20);
+        assert!(
+            !s.is_char_boundary(8192),
+            "fixture must straddle the budget"
+        );
+
+        let out = byte_prefix(&s, 8192);
+        assert_eq!(out.len(), 8191, "floors DOWN to the boundary");
+        assert!(out.len() <= 8192, "never exceeds the budget");
+        assert!(s.starts_with(out));
+
+        // Every offset across a multibyte run must be safe, not just this one.
+        for n in 0..s.len() + 4 {
+            let cut = byte_prefix(&s, n);
+            assert!(cut.len() <= n.min(s.len()));
+            assert!(s.starts_with(cut));
+        }
+    }
+
+    #[test]
+    fn byte_prefix_is_a_byte_budget_not_a_char_budget() {
+        let cjk = "配置ファイル"; // 6 chars, 18 bytes
+        assert_eq!(byte_prefix(cjk, 100), cjk, "under budget is untouched");
+        assert_eq!(byte_prefix(cjk, 18), cjk, "exactly at budget is untouched");
+        // 7 bytes = 2 whole chars (6 bytes) + 1 stray byte -> floors to 6.
+        assert_eq!(byte_prefix(cjk, 7), "配置");
+        assert_eq!(byte_prefix(cjk, 2), "", "no whole char fits");
+        assert_eq!(byte_prefix("", 0), "");
     }
 
     #[test]
