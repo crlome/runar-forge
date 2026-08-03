@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/runar-mark-dark.svg">
+  <img src="docs/img/runar-mark.svg" alt="" width="56" height="56">
+</picture>
+
 # RunarForge — Huginn & Muninn
 
 [![release](https://img.shields.io/github/v/release/crlome/runar-forge?label=release)](https://github.com/crlome/runar-forge/releases/latest)

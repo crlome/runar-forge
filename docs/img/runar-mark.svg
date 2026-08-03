@@ -1,0 +1,19 @@
+<!--
+  RunarForge mark, light-theme variant. Two ravens facing each other; the gap
+  between them carries the R.
+
+  Geometry is copied verbatim from the website's RavenMark component, minus the
+  rounded plate the favicon needs. The fill is hardcoded rather than
+  `currentColor` because GitHub renders README images through <img>, where an
+  SVG never inherits the page colour — `currentColor` would resolve to black and
+  disappear against the dark theme. Hence the companion runar-mark-dark.svg and
+  the <picture> element in README.md; edit the two together or the themes drift.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="RunarForge">
+  <g fill="#8E2A24">
+    <path d="M13.4 5C8.2 6.4 4 11 4 16.2c0 4.4 3 8.4 7.4 10.3l1.9-4.2c-2.8-1.2-4.6-3.5-4.6-6.1 0-2.9 2.1-5.4 5.2-6.4z"/>
+    <path d="M18.6 5c5.2 1.4 9.4 6 9.4 11.2 0 4.4-3 8.4-7.4 10.3l-1.9-4.2c2.8-1.2 4.6-3.5 4.6-6.1 0-2.9-2.1-5.4-5.2-6.4z"/>
+    <circle cx="10.6" cy="13.2" r="1.9"/>
+    <circle cx="21.4" cy="13.2" r="1.9"/>
+  </g>
+</svg>
