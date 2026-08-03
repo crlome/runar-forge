@@ -18,6 +18,7 @@
     "@runar-forge/cli-darwin-arm64": "0.7.1",
     "@runar-forge/cli-win32-x64": "0.7.1"
   },
+  "homepage": "https://runar-forge.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crlome/runar-forge.git"

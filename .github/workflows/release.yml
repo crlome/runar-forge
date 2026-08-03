@@ -214,6 +214,7 @@ jobs:
               '{name: $n, version: $v,
                 description: ("runar binary for " + $os + "-" + $cpu),
                 os: [$os], cpu: [$cpu], files: [$bin], license: "MIT",
+                homepage: "https://runar-forge.com",
                 repository: {type: "git", url: "git+https://github.com/crlome/runar-forge.git"}}' \
               > "$dir/package.json"
             echo "=== publishing @runar-forge/cli-${os}-${cpu}@${VERSION} ==="

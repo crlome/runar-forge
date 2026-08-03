@@ -21,6 +21,8 @@
 > Persistent, semantically-searchable memory for AI coding tools.
 > One static Rust binary. SQLite or PostgreSQL. MCP-compatible.
 
+**[runar-forge.com](https://runar-forge.com)**
+
 **`runar`** is a single-binary CLI that gives Claude Code, VS Code,
 OpenCode, Codex, Cursor, Windsurf, Trae, Gemini CLI, Continue.dev, Zed,
 Goose, Kimi — any MCP-aware AI tool — a memory that survives session
