@@ -133,6 +133,15 @@ enum Commands {
         /// Remove the auto-refresh hooks if they are installed.
         #[arg(long)]
         no_graph_autorefresh: bool,
+        /// Skip the guided /prd and /icebox skills, and remove them if
+        /// they are already installed. They are inert markdown rather than
+        /// hooks, so they are installed by default. Persisted to
+        /// ~/.runar-forge/.env so a later bare re-run keeps the choice.
+        #[arg(long)]
+        no_skills: bool,
+        /// Re-enable the guided skills after a previous --no-skills.
+        #[arg(long)]
+        with_skills: bool,
         /// Run `runar config wizard` first to (re)configure storage backend.
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
@@ -3238,6 +3247,8 @@ async fn main() -> anyhow::Result<()> {
             no_search_hints,
             with_graph_autorefresh,
             no_graph_autorefresh,
+            no_skills,
+            with_skills,
             configure,
             all_projects,
         } => {
@@ -3274,6 +3285,17 @@ async fn main() -> anyhow::Result<()> {
                         .map(|d| setup::graph_autorefresh_installed(&d))
                         .unwrap_or(false)
             };
+            // Skills are default-on, but `--no-skills` has to survive a
+            // later bare re-run, or turning them off would last exactly
+            // until the next `runar setup` — the shape of the v0.9.2 trap.
+            let skills = if no_skills {
+                false
+            } else {
+                with_skills
+                    || std::env::var("RUNAR_SKILLS")
+                        .map(|v| v != "false")
+                        .unwrap_or(true)
+            };
             {
                 let path = config_cmd::EnvFile::default_path();
                 if let Ok(mut env_file) = config_cmd::EnvFile::load(&path) {
@@ -3281,6 +3303,7 @@ async fn main() -> anyhow::Result<()> {
                         "RUNAR_AUTO_CAPTURE",
                         if auto_capture { "true" } else { "false" },
                     );
+                    env_file.upsert("RUNAR_SKILLS", if skills { "true" } else { "false" });
                     let _ = env_file.save_atomic();
                 }
             }
@@ -3339,6 +3362,7 @@ async fn main() -> anyhow::Result<()> {
                         auto_capture,
                         search_hints,
                         graph_autorefresh,
+                        skills,
                     )?;
                     println!("\nRunarForge — Claude Code Setup\n");
                     println!(
@@ -3373,6 +3397,37 @@ async fn main() -> anyhow::Result<()> {
                         println!("     SessionStart:      code-graph auto-refresh");
                     }
                     println!();
+                    if !result.skills.written.is_empty() {
+                        println!(
+                            "  Skills installed in .claude/skills/: {}",
+                            result
+                                .skills
+                                .written
+                                .iter()
+                                .map(|s| format!("/{s}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    if !result.skills.removed.is_empty() {
+                        println!(
+                            "  Skills removed (--no-skills): {}",
+                            result.skills.removed.join(", ")
+                        );
+                    }
+                    if !result.skills.adopted.is_empty() {
+                        println!(
+                            "  Skills left untouched — the managed marker is gone, so they \
+                             are yours now: {}",
+                            result.skills.adopted.join(", ")
+                        );
+                    }
+                    if !result.skills.written.is_empty()
+                        || !result.skills.adopted.is_empty()
+                        || !result.skills.removed.is_empty()
+                    {
+                        println!();
+                    }
                     println!("  Binary: {}", result.binary_path);
                     println!(
                         "  Memory protocol added to {}\n",

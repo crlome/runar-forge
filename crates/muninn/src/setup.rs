@@ -73,6 +73,9 @@ pub struct ClaudeCodeSetup {
     pub search_hints: bool,
     /// Likewise for the opt-in auto-refresh hooks.
     pub graph_autorefresh: bool,
+    /// Which managed skills were written, and which were left alone
+    /// because the user had taken ownership of them.
+    pub skills: SkillOutcome,
 }
 
 pub fn detect_project_id() -> String {
@@ -296,6 +299,7 @@ pub fn setup_claude_code(
     with_auto_capture: bool,
     with_search_hints: bool,
     with_graph_autorefresh: bool,
+    with_skills: bool,
 ) -> anyhow::Result<ClaudeCodeSetup> {
     let home = home_dir();
 
@@ -376,6 +380,18 @@ pub fn setup_claude_code(
         f.write_all(MEMORY_SECTION.as_bytes())?;
     }
 
+    // Step 4: the guided /prd and /icebox skills. Installed by default —
+    // they are inert markdown, not a hook, so they cost nothing at runtime
+    // and cannot fire unasked the way the search-hint PreToolUse hook can.
+    let skills = if with_skills {
+        install_skills(&cwd)?
+    } else {
+        SkillOutcome {
+            removed: uninstall_skills(&cwd)?,
+            ..Default::default()
+        }
+    };
+
     Ok(ClaudeCodeSetup {
         project_id: project_id.to_string(),
         claude_json_path,
@@ -384,6 +400,7 @@ pub fn setup_claude_code(
         binary_path,
         search_hints: with_search_hints,
         graph_autorefresh: with_graph_autorefresh,
+        skills,
     })
 }
 
@@ -461,6 +478,9 @@ pub struct HookMigration {
     pub dir: PathBuf,
     pub project_id: String,
     pub had_legacy_pre_tool_use: bool,
+    /// Managed skills rewritten in this project. Zero when the project
+    /// never had them — migration never enrolls.
+    pub skills_refreshed: usize,
 }
 
 /// Re-point every already-installed project at the current hook layout.
@@ -531,10 +551,21 @@ pub fn migrate_installed_hooks() -> anyhow::Result<MigrationOutcome> {
         sobj.insert("hooks".into(), Value::Object(hooks_obj));
         write_json_pretty(&settings_path, &settings)?;
 
+        // Same restraint as the hooks above: refresh the managed skills for
+        // a project that already has them, and never create them for one
+        // that does not. A migration re-points what a project opted into;
+        // enrollment is a separate, explicit act.
+        let skills_refreshed = if skills_installed(&dir) {
+            install_skills(&dir).map(|o| o.written.len()).unwrap_or(0)
+        } else {
+            0
+        };
+
         migrated.push(HookMigration {
             dir,
             project_id,
             had_legacy_pre_tool_use,
+            skills_refreshed,
         });
     }
     Ok(MigrationOutcome { migrated, skipped })
@@ -856,6 +887,91 @@ fn filter_runar_hooks(hooks: Vec<Value>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+// ── Skills ──────────────────────────────────────────────────────────
+
+/// The guided `/prd` and `/icebox` flows. These are conversation scripts
+/// only — every piece of state they touch lives behind the `muninn_plan_*`
+/// and `muninn_icebox_*` tools, which ship with the binary. Deleting or
+/// editing a skill file degrades the interview; it cannot corrupt a plan.
+const SKILLS: &[(&str, &str)] = &[
+    ("prd", include_str!("../templates/prd_skill.md")),
+    ("icebox", include_str!("../templates/icebox_skill.md")),
+];
+
+/// First line of every skill this installs. Presence of this marker is what
+/// makes a file ours to overwrite.
+pub const SKILL_MANAGED_MARKER: &str = "<!-- managed by runar setup;";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SkillOutcome {
+    pub written: Vec<String>,
+    /// Skills left alone because the user removed the managed marker,
+    /// taking ownership of the file.
+    pub adopted: Vec<String>,
+    /// Skills deleted by `--no-skills`. Kept separate from `adopted`:
+    /// "we removed these" and "these are yours now, untouched" are
+    /// opposite outcomes and must not print as the same line.
+    pub removed: Vec<String>,
+}
+
+/// Write the managed skills into `<dir>/.claude/skills/<name>/SKILL.md`.
+///
+/// Refreshed on every setup run, like the hooks: a skill that drifts from
+/// the tools it drives is worse than no skill, since it fails in a way that
+/// looks like the tool misbehaving. The escape hatch is deliberate and
+/// one-way — delete the marker line and the file becomes yours, and setup
+/// will never touch it again.
+pub fn install_skills(dir: &Path) -> anyhow::Result<SkillOutcome> {
+    let mut outcome = SkillOutcome::default();
+    for (name, body) in SKILLS {
+        let skill_dir = dir.join(".claude").join("skills").join(name);
+        let path = skill_dir.join("SKILL.md");
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if !existing.contains(SKILL_MANAGED_MARKER) {
+                outcome.adopted.push((*name).to_string());
+                continue;
+            }
+        }
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(&path, body)?;
+        outcome.written.push((*name).to_string());
+    }
+    Ok(outcome)
+}
+
+/// Remove the managed skills, leaving any the user has taken ownership of.
+pub fn uninstall_skills(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for (name, _) in SKILLS {
+        let skill_dir = dir.join(".claude").join("skills").join(name);
+        let path = skill_dir.join("SKILL.md");
+        let Ok(existing) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !existing.contains(SKILL_MANAGED_MARKER) {
+            continue;
+        }
+        fs::remove_file(&path)?;
+        // Only if nothing else of the user's is in there.
+        let _ = fs::remove_dir(&skill_dir);
+        removed.push((*name).to_string());
+    }
+    Ok(removed)
+}
+
+/// Has this project ever had the managed skills installed? Used by
+/// `--all-projects`, which refreshes what a project already opted into and
+/// never enrolls it in something new.
+pub fn skills_installed(dir: &Path) -> bool {
+    SKILLS.iter().any(|(name, _)| {
+        dir.join(".claude")
+            .join("skills")
+            .join(name)
+            .join("SKILL.md")
+            .exists()
+    })
 }
 
 const MEMORY_SECTION: &str = "
@@ -1587,5 +1703,116 @@ mod tests {
             assert!(content.contains("RUNAR_STORAGE=sqlite"));
             assert!(content.contains("RUNAR_SQLITE_PATH="));
         });
+    }
+
+    // ── Managed skills ──────────────────────────────────────────
+
+    fn skill_path(dir: &Path, name: &str) -> PathBuf {
+        dir.join(".claude")
+            .join("skills")
+            .join(name)
+            .join("SKILL.md")
+    }
+
+    #[test]
+    fn install_skills_writes_every_skill_with_its_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = install_skills(tmp.path()).unwrap();
+
+        assert_eq!(
+            outcome.written,
+            vec!["prd".to_string(), "icebox".to_string()]
+        );
+        assert!(outcome.adopted.is_empty());
+        for name in ["prd", "icebox"] {
+            let body = fs::read_to_string(skill_path(tmp.path(), name)).unwrap();
+            assert!(
+                body.contains(SKILL_MANAGED_MARKER),
+                "{name} must carry the marker, or the next run cannot tell it is ours"
+            );
+            assert!(body.contains("---"), "{name} needs skill frontmatter");
+        }
+    }
+
+    #[test]
+    fn a_rerun_refreshes_a_managed_skill_that_drifted() {
+        // A skill that has drifted from the tools it drives fails in a way
+        // that looks like the tool misbehaving, so setup owns it.
+        let tmp = tempfile::tempdir().unwrap();
+        install_skills(tmp.path()).unwrap();
+        let path = skill_path(tmp.path(), "prd");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{SKILL_MANAGED_MARKER} -->\nlocal edits\n")).unwrap();
+
+        let outcome = install_skills(tmp.path()).unwrap();
+        assert!(outcome.written.contains(&"prd".to_string()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn removing_the_marker_takes_ownership_and_setup_stops_touching_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_skills(tmp.path()).unwrap();
+        let path = skill_path(tmp.path(), "icebox");
+        fs::write(&path, "# my own icebox skill\n").unwrap();
+
+        let outcome = install_skills(tmp.path()).unwrap();
+        assert_eq!(outcome.adopted, vec!["icebox".to_string()]);
+        assert_eq!(outcome.written, vec!["prd".to_string()]);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# my own icebox skill\n",
+            "an adopted file must survive verbatim"
+        );
+
+        // And uninstall must not delete it either.
+        let removed = uninstall_skills(tmp.path()).unwrap();
+        assert_eq!(removed, vec!["prd".to_string()]);
+        assert!(
+            path.exists(),
+            "uninstall must never delete a user's own file"
+        );
+    }
+
+    #[test]
+    fn removed_and_adopted_are_reported_as_different_outcomes() {
+        // "we deleted these" and "these are yours now, untouched" are
+        // opposite results; collapsing them into one field printed a
+        // removal as though nothing had happened.
+        let tmp = tempfile::tempdir().unwrap();
+        install_skills(tmp.path()).unwrap();
+        fs::write(skill_path(tmp.path(), "icebox"), "mine now\n").unwrap();
+
+        let outcome = SkillOutcome {
+            removed: uninstall_skills(tmp.path()).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(outcome.removed, vec!["prd".to_string()]);
+        assert!(outcome.adopted.is_empty());
+        assert!(outcome.written.is_empty());
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_managed_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_skills(tmp.path()).unwrap();
+        assert!(skills_installed(tmp.path()));
+
+        let removed = uninstall_skills(tmp.path()).unwrap();
+        assert_eq!(removed, vec!["prd".to_string(), "icebox".to_string()]);
+        assert!(!skills_installed(tmp.path()));
+        // Idempotent: a second run is a no-op rather than an error.
+        assert!(uninstall_skills(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn skills_installed_is_false_for_a_project_that_never_had_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!skills_installed(tmp.path()));
+        // This is the predicate `--all-projects` gates on: enrolling all 28
+        // hook-carrying projects in something they never asked for is the
+        // restraint that stopped the v0.9.2 trap repeating.
+        fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        assert!(!skills_installed(tmp.path()));
     }
 }
