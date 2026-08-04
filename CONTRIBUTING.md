@@ -66,6 +66,19 @@ A PR cannot merge until `test (ubuntu-latest)`, `test (macos-latest)`,
 and `test (windows-latest)` are all green and the branch is up to date
 with `main`.
 
+## Testing
+
+Green CI is the floor, not the bar. A change that adds behaviour brings
+tests with it, and there is a checklist for what those have to cover:
+
+**[docs/TESTING.md](docs/TESTING.md)** — read it before your first PR.
+
+The short version: tests live inline in the file they cover; anything
+touching `RUNAR_HOME` or env vars goes through `test_support`; storage
+tests replay the real migrations rather than hand-building tables; and
+before you call a test done, break the thing it guards and confirm it
+fails. A test that passes with and without your fix is documentation.
+
 ## Commit messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/),
