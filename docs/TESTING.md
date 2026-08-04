@@ -110,6 +110,23 @@ So: when a behaviour exists in both adapters,
 "The other backend probably does the same thing" is how the divergence got
 in.
 
+### Live-Postgres tests
+
+The Postgres adapter's SQL cannot be reached by an in-memory test, so those
+tests are `#[ignore]`d and run against a real server:
+
+```sh
+docker compose --profile postgresql up -d postgres
+RUNAR_TEST_PG_URL=postgresql://runar:runar_password@localhost:5432/runar_memory \
+  cargo test -p runar-muninn --lib -- --ignored
+```
+
+CI runs the same thing in the `postgres` job. They share one database, so
+each test scopes itself to a unique namespace rather than truncating tables
+— they must be safe to run concurrently. They panic rather than skip when
+the URL is absent, so a misconfigured job fails loudly instead of passing
+with zero tests run.
+
 ## Mutation-check your own tests
 
 Before you call a test done, break the thing it guards and confirm it fails:

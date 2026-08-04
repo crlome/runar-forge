@@ -203,6 +203,32 @@ fn db_err(e: tokio_postgres::Error) -> StorageError {
     ))
 }
 
+/// Did this statement fail only because another connection created the same
+/// object at the same moment?
+///
+/// `CREATE TABLE IF NOT EXISTS` and friends are **not** atomic in Postgres:
+/// two sessions can both pass the existence check and then race on the
+/// catalog, and the loser gets a unique violation on a `pg_catalog` index
+/// rather than a quiet no-op. The migration runner is exactly where this
+/// bites, because every runar process initializes its remote on startup —
+/// an MCP server's auto-sync loop and a `runar sync push` on the same
+/// machine are enough, never mind two teammates' first sync.
+///
+/// Losing that race means the object now exists, which is the state the
+/// statement wanted. Anything else is a real failure and must propagate.
+fn is_concurrent_create_race(e: &tokio_postgres::Error) -> bool {
+    let Some(db) = e.as_db_error() else {
+        return false;
+    };
+    matches!(
+        db.code().code(),
+        // unique_violation — on a pg_catalog index, i.e. the catalog race
+        "23505"
+        // duplicate_table / duplicate_object / duplicate_schema
+        | "42P07" | "42710" | "42P06"
+    )
+}
+
 /// Cap on the server-supplied `detail` string. See `format_db_error`.
 const MAX_DETAIL_CHARS: usize = 300;
 
@@ -341,11 +367,16 @@ impl MemoryStorage for PostgresAdapter {
     async fn initialize(&self) -> StorageResult<()> {
         let client = self.get_client().await?;
 
-        // Ensure migration table exists first
-        client
-            .batch_execute(PG_MIGRATIONS[0].1)
-            .await
-            .map_err(db_err)?;
+        // Ensure migration table exists first. Tolerating the catalog race
+        // here is not optional: this runs unconditionally on every
+        // `initialize`, so it is the statement most likely to meet a
+        // concurrent creator. See `is_concurrent_create_race`.
+        if let Err(e) = client.batch_execute(PG_MIGRATIONS[0].1).await {
+            if !is_concurrent_create_race(&e) {
+                return Err(db_err(e));
+            }
+            tracing::debug!("migration table created concurrently; continuing");
+        }
 
         let rows = client
             .query(
@@ -362,7 +393,15 @@ impl MemoryStorage for PostgresAdapter {
                 continue;
             }
             tracing::info!(version, "applying PostgreSQL migration");
-            client.batch_execute(sql).await.map_err(db_err)?;
+            if let Err(e) = client.batch_execute(sql).await {
+                if !is_concurrent_create_race(&e) {
+                    return Err(db_err(e));
+                }
+                // Another process applied this migration between our read
+                // of the ledger and this statement. Fall through to record
+                // it: the schema change we wanted is in place either way.
+                tracing::debug!(version, "migration applied concurrently; continuing");
+            }
             client
                 .execute(
                     "INSERT INTO muninn.schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -2755,4 +2794,328 @@ mod tests {
         );
         std::env::remove_var("RUNAR_DB_CONNECT_TIMEOUT_MS");
     }
+
+    // ── Live-Postgres tests ─────────────────────────────────────
+    //
+    // Everything above this line tests string formatting and pool
+    // behaviour; none of it touches SQL. This adapter is ~2,700 lines
+    // implementing the same trait as the SQLite one, and the two have
+    // diverged silently before — `update` accepted a JSON array for
+    // `tags` here and erased the column there.
+    //
+    // These are `#[ignore]`d so the default `cargo test` stays
+    // dependency-free, and run against a real server in CI:
+    //
+    //   RUNAR_TEST_PG_URL=postgresql://... cargo test -p runar-muninn -- --ignored
+    //
+    // They share one database, so each test scopes itself to a unique
+    // namespace rather than truncating tables — parallel runs must not
+    // delete each other's rows.
+
+    fn live_pg(namespace: &str) -> Option<PostgresAdapter> {
+        let url = std::env::var("RUNAR_TEST_PG_URL").ok()?;
+        PostgresAdapter::new(&url, namespace).ok()
+    }
+
+    /// Unique per test, so tests can run concurrently against one server.
+    fn ns(tag: &str) -> String {
+        format!("pgtest-{tag}-{}", Uuid::new_v4().simple())
+    }
+
+    // Both idents are passed in rather than introduced by the macro:
+    // macro-hygiene means a `namespace` bound inside the expansion is a
+    // different identifier from the one the test body writes.
+    macro_rules! pg_test {
+        ($name:ident, $tag:literal, |$adapter:ident, $namespace:ident| $body:block) => {
+            #[tokio::test]
+            #[ignore = "requires RUNAR_TEST_PG_URL"]
+            async fn $name() {
+                let $namespace = ns($tag);
+                let Some($adapter) = live_pg(&$namespace) else {
+                    panic!("RUNAR_TEST_PG_URL must be set to run --ignored tests");
+                };
+                $adapter.initialize().await.unwrap();
+                $body
+            }
+        };
+    }
+
+    pg_test!(
+        pg_migrations_replay_to_head,
+        "migrate",
+        |adapter, namespace| {
+            // `initialize` already ran the migrations; a second run must be a
+            // no-op rather than an error. The runner executes element 0
+            // unconditionally, which is exactly the shape that breaks on
+            // re-entry if it is not idempotent.
+            adapter.initialize().await.unwrap();
+            let client = adapter.get_client().await.unwrap();
+            let rows = client
+                .query("SELECT version FROM muninn.schema_migrations", &[])
+                .await
+                .unwrap();
+            let versions: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+            // Element 0 bootstraps the ledger itself and is deliberately never
+            // recorded in it — it runs unconditionally on every initialize.
+            for (expected, _) in PG_MIGRATIONS.iter().skip(1) {
+                assert!(
+                    versions.iter().any(|v| v == expected),
+                    "migration {expected} was never recorded"
+                );
+            }
+            assert!(
+                !versions.iter().any(|v| v == PG_MIGRATIONS[0].0),
+                "the bootstrap migration must stay out of the ledger, or a \
+             re-run would skip the statement that creates the ledger"
+            );
+        }
+    );
+
+    pg_test!(
+        pg_concurrent_initialize_does_not_race,
+        "concurrent",
+        |adapter, namespace| {
+            // Every runar process initializes its remote on startup, so two
+            // initializing at once is ordinary — an MCP auto-sync loop and a
+            // `runar sync push`, or two teammates' first sync. `CREATE TABLE
+            // IF NOT EXISTS` is not atomic in Postgres, so the loser of the
+            // catalog race gets a unique violation rather than a no-op.
+            let url = std::env::var("RUNAR_TEST_PG_URL").unwrap();
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let url = url.clone();
+                let ns = namespace.clone();
+                handles.push(tokio::spawn(async move {
+                    PostgresAdapter::new(&url, &ns).unwrap().initialize().await
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .unwrap()
+                    .expect("a concurrent initialize must not fail");
+            }
+            let _ = &adapter;
+        }
+    );
+
+    pg_test!(pg_save_get_and_soft_delete, "crud", |adapter, namespace| {
+        let saved = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "Postgres round trip".into(),
+                    content: "content that goes to a real server".into(),
+                    entry_type: EntryType::Decision,
+                    tags: vec!["alpha".into(), "beta".into()],
+                    ..Default::default()
+                },
+                &namespace,
+            )
+            .await
+            .unwrap();
+
+        let entry = adapter.get(saved.id).await.unwrap();
+        assert_eq!(entry.title, "Postgres round trip");
+        assert_eq!(entry.tags, vec!["alpha".to_string(), "beta".to_string()]);
+
+        adapter.delete(saved.id).await.unwrap();
+        assert!(
+            adapter.get(saved.id).await.is_err(),
+            "a soft-deleted row must be invisible to get"
+        );
+        // …but a tombstone still has to be readable, or sync cannot build
+        // a delete payload. This is the bug that left zero delete ops.
+        let tombstone = adapter.get_including_deleted(saved.id).await.unwrap();
+        assert!(tombstone.deleted_at.is_some());
+    });
+
+    pg_test!(
+        pg_topic_key_supersedes_in_place,
+        "topickey",
+        |adapter, namespace| {
+            let key = "decision:pg-parity";
+            let first = adapter
+                .save(
+                    MemoryEntryInput {
+                        title: "v1".into(),
+                        content: "first take".into(),
+                        entry_type: EntryType::Decision,
+                        topic_key: Some(key.into()),
+                        ..Default::default()
+                    },
+                    &namespace,
+                )
+                .await
+                .unwrap();
+            let second = adapter
+                .save(
+                    MemoryEntryInput {
+                        title: "v2".into(),
+                        content: "second take".into(),
+                        entry_type: EntryType::Decision,
+                        topic_key: Some(key.into()),
+                        ..Default::default()
+                    },
+                    &namespace,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(second.action, SaveAction::Updated);
+            assert!(second.superseded.is_some());
+            let live = adapter
+                .get_by_topic_key(&namespace, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(live.id, second.id);
+            assert_ne!(live.id, first.id);
+        }
+    );
+
+    pg_test!(
+        pg_update_accepts_both_tag_shapes,
+        "tags",
+        |adapter, namespace| {
+            // The parity contract with the SQLite adapter, asserted on the
+            // side that already accepted both forms — so a future change here
+            // cannot quietly narrow it back.
+            let saved = adapter
+                .save(
+                    MemoryEntryInput {
+                        title: "Taggable".into(),
+                        content: "body".into(),
+                        entry_type: EntryType::Note,
+                        tags: vec!["original".into()],
+                        ..Default::default()
+                    },
+                    &namespace,
+                )
+                .await
+                .unwrap();
+
+            let updated = adapter
+                .update(saved.id, serde_json::json!({ "tags": ["alpha", "beta"] }))
+                .await
+                .unwrap();
+            assert_eq!(updated.tags, vec!["alpha".to_string(), "beta".to_string()]);
+
+            let updated = adapter
+                .update(saved.id, serde_json::json!({ "tags": "[\"gamma\"]" }))
+                .await
+                .unwrap();
+            assert_eq!(updated.tags, vec!["gamma".to_string()]);
+        }
+    );
+
+    pg_test!(
+        pg_list_by_topic_prefix_is_scoped_and_ordered,
+        "prefix",
+        |adapter, namespace| {
+            for (key, title) in [
+                ("plan:pg:02-design", "Design"),
+                ("plan:pg:00-problem", "Problem"),
+                ("plan:pg:01-goals", "Goals"),
+                ("icebox:unrelated", "Not a plan"),
+            ] {
+                adapter
+                    .save(
+                        MemoryEntryInput {
+                            title: title.into(),
+                            content: format!("body for {key}"),
+                            entry_type: EntryType::Plan,
+                            topic_key: Some(key.into()),
+                            ..Default::default()
+                        },
+                        &namespace,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let sections = adapter
+                .list_by_topic_prefix(&namespace, "plan:pg:")
+                .await
+                .unwrap();
+            assert_eq!(
+                sections
+                    .iter()
+                    .map(|e| e.title.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Problem", "Goals", "Design"]
+            );
+
+            // Namespace scoping is what keeps two projects' plans apart.
+            assert!(adapter
+                .list_by_topic_prefix("some-other-namespace", "plan:pg:")
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    );
+
+    pg_test!(
+        pg_search_finds_saved_content,
+        "search",
+        |adapter, namespace| {
+            adapter
+                .save(
+                    MemoryEntryInput {
+                        title: "Outbox coalescing dropped claimed rows".into(),
+                        content: "claim_outbox stamped claimed_at on every row it returned".into(),
+                        entry_type: EntryType::Bug,
+                        ..Default::default()
+                    },
+                    &namespace,
+                )
+                .await
+                .unwrap();
+
+            let hits = adapter
+                .search(SearchQuery {
+                    query: "outbox coalescing".into(),
+                    limit: Some(10),
+                    namespace: Some(namespace.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                hits.iter().any(|h| h.title.contains("coalescing")),
+                "full-text search must reach a row written moments ago"
+            );
+        }
+    );
+
+    pg_test!(
+        pg_namespaces_do_not_leak_into_each_other,
+        "isolation",
+        |adapter, namespace| {
+            adapter
+                .save(
+                    MemoryEntryInput {
+                        title: "Mine".into(),
+                        content: "belongs to this namespace".into(),
+                        entry_type: EntryType::Note,
+                        ..Default::default()
+                    },
+                    &namespace,
+                )
+                .await
+                .unwrap();
+
+            let others = adapter
+                .list(ListFilters {
+                    namespace: Some(format!("{namespace}-neighbour")),
+                    limit: Some(50),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                others.is_empty(),
+                "a neighbouring namespace must not see these rows"
+            );
+        }
+    );
 }
