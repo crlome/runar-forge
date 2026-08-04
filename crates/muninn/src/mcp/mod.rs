@@ -684,6 +684,7 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
 
     // Sections arrive either pre-split or as one markdown document. The
     // markdown form is what a /prd conversation naturally produces.
+    let mut untracked: Vec<String> = Vec::new();
     let sections: Vec<crate::plans::SectionInput> = match args.get("sections") {
         Some(Value::Array(items)) => items
             .iter()
@@ -705,7 +706,11 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
             })
             .collect(),
         _ => match arg_str(args, "markdown") {
-            Some(md) => crate::plans::parse_markdown(md).sections,
+            Some(md) => {
+                let parsed = crate::plans::parse_markdown(md);
+                untracked = parsed.untracked_phase_headings;
+                parsed.sections
+            }
             None => Vec::new(),
         },
     };
@@ -716,14 +721,24 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(serde_json::json!({
+    let tracked = sections.iter().filter(|s| s.phase.is_some()).count();
+    let mut response = serde_json::json!({
         "status": "saved",
         "slug": slug,
         "entriesWritten": entries,
         "sections": sections.len(),
+        "trackedPhases": tracked,
         "hint": "track execution with muninn_plan_set_status(slug, phase, phaseStatus)",
-    })
-    .to_string())
+    });
+    if !untracked.is_empty() {
+        response["warning"] = serde_json::json!(format!(
+            "{} heading(s) name a phase but sit below `##`, so they are body text and are \
+             NOT tracked: {}. Promote them to `## Phase N — name`.",
+            untracked.len(),
+            untracked.join("; ")
+        ));
+    }
+    Ok(response.to_string())
 }
 
 async fn tool_plan_list(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {

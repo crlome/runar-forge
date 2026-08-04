@@ -836,7 +836,7 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                 )
             })?;
 
-            let (title, overview, sections) = match &file {
+            let (title, overview, sections, untracked) = match &file {
                 Some(path) => {
                     let text = std::fs::read_to_string(path)
                         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
@@ -847,13 +847,19 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                             path.display()
                         )
                     })?;
-                    (title, parsed.overview, parsed.sections)
+                    (
+                        title,
+                        parsed.overview,
+                        parsed.sections,
+                        parsed.untracked_phase_headings,
+                    )
                 }
                 None => (
                     title.ok_or_else(|| {
                         anyhow::anyhow!("give a title, or --file to read one from markdown")
                     })?,
                     String::new(),
+                    Vec::new(),
                     Vec::new(),
                 ),
             };
@@ -873,6 +879,22 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                 println!("  tracked phases: {phases}");
             }
             println!("  project: {project_id}");
+            if !untracked.is_empty() {
+                println!(
+                    "\n  WARNING — {} heading(s) name a phase but sit below `##`, so they \
+                     are body text and will NOT be tracked:",
+                    untracked.len()
+                );
+                for heading in untracked.iter().take(8) {
+                    println!("    ### {heading}");
+                }
+                if untracked.len() > 8 {
+                    println!("    … and {} more", untracked.len() - 8);
+                }
+                println!(
+                    "  Promote them to `## Phase N — name` to track progress across sessions."
+                );
+            }
         }
 
         PlanAction::List { status, project } => {

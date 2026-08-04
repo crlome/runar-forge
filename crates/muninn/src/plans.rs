@@ -361,6 +361,16 @@ pub struct ParsedMarkdown {
     pub title: Option<String>,
     pub overview: String,
     pub sections: Vec<SectionInput>,
+    /// Headings that name a phase but sit at a level other than `##`, so
+    /// they were folded into their parent section and are **not** tracked.
+    ///
+    /// Nesting phases under a `## Phases` umbrella is the most natural way
+    /// to write this document and produces zero tracked phases in silence
+    /// — which is the failure this whole feature exists to avoid. The
+    /// callers surface these as a warning rather than guessing, because
+    /// promoting them automatically would make an `### Phase 2` inside a
+    /// worked example into executable work.
+    pub untracked_phase_headings: Vec<String>,
 }
 
 /// Parse a plan written as markdown: a leading `# Title`, prose before the
@@ -376,8 +386,16 @@ pub fn parse_markdown(text: &str) -> ParsedMarkdown {
     let mut overview = String::new();
     let mut sections: Vec<SectionInput> = Vec::new();
     let mut current: Option<(String, String)> = None;
+    let mut untracked_phase_headings = Vec::new();
 
     for line in text.lines() {
+        // Any deeper heading naming a phase is body text by the rule below,
+        // but silently so — record it for the caller to warn about.
+        if let Some(rest) = line.strip_prefix("### ") {
+            if parse_phase_number(rest).is_some() {
+                untracked_phase_headings.push(rest.trim().to_string());
+            }
+        }
         if let Some(rest) = line.strip_prefix("## ") {
             if let Some((heading, body)) = current.take() {
                 sections.push(section_from_heading(&heading, &body));
@@ -409,6 +427,7 @@ pub fn parse_markdown(text: &str) -> ParsedMarkdown {
         title,
         overview: overview.trim().to_string(),
         sections,
+        untracked_phase_headings,
     }
 }
 
@@ -943,6 +962,52 @@ What could go wrong.
             "only headings naming a phase become tracked work"
         );
         assert_eq!(parsed.sections[1].content, "Add the entry types.");
+    }
+
+    #[test]
+    fn phases_nested_below_a_heading_are_reported_rather_than_lost() {
+        // Found by dogfooding: this campaign's own plan nested its phases
+        // under `## Phases`, produced zero tracked phases, and said
+        // nothing. Silently untracked work is exactly the failure the
+        // phase mechanism exists to prevent.
+        let md = "\
+# Campaign
+
+## Phases
+
+### Phase 1 — types
+
+do the types
+
+### Phase 2 — storage
+
+do the storage
+
+## Risks
+
+none
+";
+        let parsed = parse_markdown(md);
+        assert!(
+            parsed.sections.iter().all(|s| s.phase.is_none()),
+            "a `###` heading stays body text — promoting it would make an \
+             `### Phase 2` inside a worked example into executable work"
+        );
+        assert_eq!(
+            parsed.untracked_phase_headings,
+            vec![
+                "Phase 1 — types".to_string(),
+                "Phase 2 — storage".to_string()
+            ],
+            "…but the author has to be told"
+        );
+    }
+
+    #[test]
+    fn a_correctly_written_plan_warns_about_nothing() {
+        let parsed = parse_markdown("# P\n\n## Phase 1 — go\n\nbody\n");
+        assert_eq!(parsed.sections[0].phase, Some(1));
+        assert!(parsed.untracked_phase_headings.is_empty());
     }
 
     #[test]
