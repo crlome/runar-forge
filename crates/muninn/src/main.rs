@@ -428,6 +428,62 @@ enum Commands {
         #[command(subcommand)]
         action: IceboxAction,
     },
+
+    /// Product requirements documents / implementation plans. Stored as
+    /// memory entries so they sync to the team remote, and excluded from
+    /// automatic injection so intended work never reads as recorded fact.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Store a plan, optionally read from a markdown file.
+    Create {
+        /// Plan title. Taken from the file's `# Heading` when omitted.
+        title: Option<String>,
+        /// Markdown file; each `## Heading` becomes a section, and a
+        /// heading naming a phase becomes a tracked phase.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Stable id; derived from the title otherwise
+        #[arg(long)]
+        slug: Option<String>,
+        /// draft | approved | in-progress | completed | abandoned
+        #[arg(long, default_value = "draft")]
+        status: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// List plans with their status and phase progress.
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Print a plan as markdown.
+    Show {
+        slug: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Advance a plan, or one of its phases with --phase.
+    Status {
+        slug: String,
+        /// New status. For a phase: pending | in-progress | done.
+        status: String,
+        /// Move this phase instead of the plan itself.
+        #[arg(long)]
+        phase: Option<usize>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -751,6 +807,156 @@ fn default_db_path() -> String {
 /// cwd — rare). Keeps manual CLI use ergonomic while hook invocations still
 /// win because `runar setup claude-code` bakes the explicit pid into every
 /// hook command.
+/// `runar plan …` — the CLI half of the PRD surface, sharing every
+/// convention with the `muninn_plan_*` MCP tools through `PlanStore`.
+async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
+    use runar_muninn::plans::{parse_markdown, PhaseStatus, PlanStatus, PlanStore};
+
+    match action {
+        PlanAction::Create {
+            title,
+            file,
+            slug,
+            status,
+            project,
+        } => {
+            let status = PlanStatus::parse(&status).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown status '{status}' (use: {})",
+                    PlanStatus::all().join("|")
+                )
+            })?;
+
+            let (title, overview, sections) = match &file {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+                    let parsed = parse_markdown(&text);
+                    let title = title.or(parsed.title).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} has no `# Title` heading — pass a title argument",
+                            path.display()
+                        )
+                    })?;
+                    (title, parsed.overview, parsed.sections)
+                }
+                None => (
+                    title.ok_or_else(|| {
+                        anyhow::anyhow!("give a title, or --file to read one from markdown")
+                    })?,
+                    String::new(),
+                    Vec::new(),
+                ),
+            };
+
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let (slug, entries) = store
+                .create_plan(&title, slug.as_deref(), &overview, &sections, status)
+                .await?;
+
+            println!("Stored plan: {title}");
+            println!("  slug: {slug}");
+            println!("  sections: {} ({entries} entries)", sections.len());
+            let phases = sections.iter().filter(|s| s.phase.is_some()).count();
+            if phases > 0 {
+                println!("  tracked phases: {phases}");
+            }
+            println!("  project: {project_id}");
+        }
+
+        PlanAction::List { status, project } => {
+            let filter = match status {
+                Some(s) => Some(PlanStatus::parse(&s).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown status '{s}' (use: {})",
+                        PlanStatus::all().join("|")
+                    )
+                })?),
+                None => None,
+            };
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let plans = store.list_plans(filter).await?;
+            if plans.is_empty() {
+                println!("No plans in {project_id}.");
+                return Ok(());
+            }
+            println!("{} plan(s) in {project_id}:\n", plans.len());
+            for plan in &plans {
+                let progress = if plan.phases_total > 0 {
+                    format!(" {}/{} phases", plan.phases_done, plan.phases_total)
+                } else {
+                    String::new()
+                };
+                println!("[{}] {} ({}){progress}", plan.status, plan.title, plan.slug);
+            }
+        }
+
+        PlanAction::Show { slug, project } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let doc = store
+                .get_plan(&slug)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no plan with slug '{slug}'"))?;
+            print!("{}", doc.render());
+        }
+
+        PlanAction::Status {
+            slug,
+            status,
+            phase,
+            project,
+        } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+
+            let doc = match phase {
+                // With --phase the status word names a phase state, not a
+                // plan state; the two vocabularies overlap on in-progress
+                // and would otherwise be ambiguous.
+                Some(n) => {
+                    let ps = PhaseStatus::parse(&status).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown phase status '{status}' (use: {})",
+                            PhaseStatus::all().join("|")
+                        )
+                    })?;
+                    store
+                        .set_plan_status(&slug, None, Some(n), Some(ps))
+                        .await?
+                }
+                None => {
+                    let ps = PlanStatus::parse(&status).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown status '{status}' (use: {})",
+                            PlanStatus::all().join("|")
+                        )
+                    })?;
+                    store.set_plan_status(&slug, Some(ps), None, None).await?
+                }
+            };
+
+            let (done, total) = doc.phase_progress();
+            println!("[{}] {} ({})", doc.status, doc.title, doc.slug);
+            if total > 0 {
+                println!("  phases: {done}/{total}");
+                if done == total && !doc.status.is_closed() {
+                    println!(
+                        "  every phase is done — `runar plan status {slug} completed` to close it"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `runar icebox …` — the CLI half of the backlog surface. The MCP tools
 /// and this share every convention through `plans::PlanStore`, so an item
 /// filed by an agent and one filed by hand are the same row.
@@ -3717,6 +3923,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Icebox { action } => cmd_icebox(action).await?,
+        Commands::Plan { action } => cmd_plan(action).await?,
         Commands::Sync { action } => match action {
             SyncAction::Init { force } => sync_cmd::cmd_init(force).await?,
             SyncAction::Push { limit, dry_run } => sync_cmd::cmd_push(limit, dry_run).await?,

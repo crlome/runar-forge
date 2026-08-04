@@ -355,6 +355,85 @@ pub fn split_section(content: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+/// A plan parsed out of a markdown document.
+#[derive(Debug, Clone)]
+pub struct ParsedMarkdown {
+    pub title: Option<String>,
+    pub overview: String,
+    pub sections: Vec<SectionInput>,
+}
+
+/// Parse a plan written as markdown: a leading `# Title`, prose before the
+/// first `## Heading` as the overview, and one section per `##`.
+///
+/// A heading naming a phase (`## Phase 2 — storage`, `## Phase 2: storage`)
+/// becomes an executable phase; every other section is prose. That rule is
+/// deliberately syntactic rather than clever: a plan author can see from the
+/// heading alone whether a section will be tracked, and no section is
+/// silently promoted into work.
+pub fn parse_markdown(text: &str) -> ParsedMarkdown {
+    let mut title = None;
+    let mut overview = String::new();
+    let mut sections: Vec<SectionInput> = Vec::new();
+    let mut current: Option<(String, String)> = None;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            if let Some((heading, body)) = current.take() {
+                sections.push(section_from_heading(&heading, &body));
+            }
+            current = Some((rest.trim().to_string(), String::new()));
+        } else if let Some(rest) = line.strip_prefix("# ") {
+            if title.is_none() && current.is_none() {
+                title = Some(rest.trim().to_string());
+                continue;
+            }
+            // A `#` after the first section is body text, not a title.
+            if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        } else {
+            overview.push_str(line);
+            overview.push('\n');
+        }
+    }
+    if let Some((heading, body)) = current {
+        sections.push(section_from_heading(&heading, &body));
+    }
+
+    ParsedMarkdown {
+        title,
+        overview: overview.trim().to_string(),
+        sections,
+    }
+}
+
+fn section_from_heading(heading: &str, body: &str) -> SectionInput {
+    let body = body.trim().to_string();
+    match parse_phase_number(heading) {
+        Some(n) => SectionInput::phase(n, heading, body),
+        None => SectionInput::prose(heading, body),
+    }
+}
+
+/// Pull `N` out of a heading naming a phase. Case-insensitive; tolerates
+/// the separators these documents actually use (`—`, `-`, `:`, `.`).
+fn parse_phase_number(heading: &str) -> Option<usize> {
+    let lower = heading.to_lowercase();
+    let idx = lower.find("phase")?;
+    lower[idx + "phase".len()..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 /// The key for part `part` (1-based) of `parts` total. A single-part section
 /// keeps the bare section key, so the common case carries no suffix noise.
 pub fn part_key(section_key: &str, part: usize, parts: usize) -> String {
@@ -816,6 +895,85 @@ mod tests {
             Some(("auth", Some("00-intro")))
         );
         assert_eq!(parse_plan_key("icebox:auth"), None);
+    }
+
+    #[test]
+    fn markdown_parses_title_overview_and_sections() {
+        let md = "\
+# Icebox campaign
+
+Takes four items from the backlog.
+Sync is the hard requirement.
+
+## Context
+
+Why this is being done.
+
+## Phase 1 — types
+
+Add the entry types.
+
+## Phase 2: storage
+
+Add the prefix query.
+
+## Risks
+
+What could go wrong.
+";
+        let parsed = parse_markdown(md);
+        assert_eq!(parsed.title.as_deref(), Some("Icebox campaign"));
+        assert!(parsed.overview.contains("Sync is the hard requirement"));
+        assert!(
+            !parsed.overview.contains("Why this is being done"),
+            "prose after the first heading belongs to that section"
+        );
+        assert_eq!(
+            parsed
+                .sections
+                .iter()
+                .map(|s| (s.title.as_str(), s.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Context", None),
+                ("Phase 1 — types", Some(1)),
+                ("Phase 2: storage", Some(2)),
+                ("Risks", None),
+            ],
+            "only headings naming a phase become tracked work"
+        );
+        assert_eq!(parsed.sections[1].content, "Add the entry types.");
+    }
+
+    #[test]
+    fn markdown_without_a_title_is_still_parsed() {
+        let parsed = parse_markdown("## Only a section\n\nbody\n");
+        assert!(parsed.title.is_none());
+        assert_eq!(parsed.sections.len(), 1);
+        assert_eq!(parsed.sections[0].content, "body");
+    }
+
+    #[test]
+    fn a_hash_inside_a_section_is_body_not_a_title() {
+        // Markdown bodies contain `# comments` in shell blocks; treating
+        // one as the document title would silently rename the plan.
+        let parsed = parse_markdown("# Real\n\n## S\n\n# not a title\n");
+        assert_eq!(parsed.title.as_deref(), Some("Real"));
+        assert!(parsed.sections[0].content.contains("# not a title"));
+    }
+
+    #[test]
+    fn phase_numbers_survive_the_separators_these_documents_use() {
+        for heading in [
+            "Phase 3 — storage",
+            "phase 3: storage",
+            "PHASE 3. storage",
+            "Phase 3",
+        ] {
+            assert_eq!(parse_phase_number(heading), Some(3), "{heading}");
+        }
+        assert_eq!(parse_phase_number("Phased rollout"), None);
+        assert_eq!(parse_phase_number("Risks"), None);
     }
 
     #[test]
