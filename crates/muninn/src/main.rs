@@ -420,6 +420,67 @@ enum Commands {
         #[command(subcommand)]
         action: SyncAction,
     },
+
+    /// Deferred backlog items. Stored as memory entries, so they sync to
+    /// the team remote — but excluded from automatic injection, so a
+    /// parked idea never reads as a fact about the code.
+    Icebox {
+        #[command(subcommand)]
+        action: IceboxAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IceboxAction {
+    /// Capture an idea or piece of deferred work.
+    Add {
+        /// Short statement of the item
+        title: String,
+        /// Why it matters and what is already known
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Stable id; derived from the title otherwise
+        #[arg(long)]
+        slug: Option<String>,
+        /// Comma-separated extra tags
+        #[arg(long)]
+        tags: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// List backlog items, newest first.
+    List {
+        /// open | promoted | dropped
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Print one item in full.
+    Show {
+        slug: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Mark an item as promoted into a plan.
+    Promote {
+        slug: String,
+        /// Slug of the plan this item became
+        #[arg(long)]
+        plan: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Mark an item as decided against.
+    Drop {
+        slug: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -690,6 +751,119 @@ fn default_db_path() -> String {
 /// cwd — rare). Keeps manual CLI use ergonomic while hook invocations still
 /// win because `runar setup claude-code` bakes the explicit pid into every
 /// hook command.
+/// `runar icebox …` — the CLI half of the backlog surface. The MCP tools
+/// and this share every convention through `plans::PlanStore`, so an item
+/// filed by an agent and one filed by hand are the same row.
+async fn cmd_icebox(action: IceboxAction) -> anyhow::Result<()> {
+    use runar_muninn::plans::{IceboxStatus, PlanStore};
+
+    fn parse_status(s: &str) -> anyhow::Result<IceboxStatus> {
+        IceboxStatus::parse(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown status '{s}' (use: {})",
+                IceboxStatus::all().join("|")
+            )
+        })
+    }
+
+    fn print_item(item: &runar_muninn::plans::IceboxItem, full: bool) {
+        let promoted = item
+            .promoted_to
+            .as_ref()
+            .map(|p| format!(" → plan:{p}"))
+            .unwrap_or_default();
+        println!("[{}] {} ({}){promoted}", item.status, item.title, item.slug);
+        if full {
+            println!("\n{}\n", item.content.trim());
+            if !item.tags.is_empty() {
+                println!("tags: {}", item.tags.join(", "));
+            }
+            println!("updated: {}", item.updated_at.to_rfc3339());
+        }
+    }
+
+    match action {
+        IceboxAction::Add {
+            title,
+            message,
+            slug,
+            tags,
+            project,
+        } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let parsed_tags: Vec<String> = tags
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let content = message.unwrap_or_else(|| title.clone());
+            let slug = store
+                .add_icebox(&title, &content, slug.as_deref(), &parsed_tags)
+                .await?;
+            println!("Filed: {title}");
+            println!("  slug: {slug}");
+            println!("  project: {project_id}");
+        }
+
+        IceboxAction::List { status, project } => {
+            let project_id = resolve_project_id(project);
+            let filter = status.as_deref().map(parse_status).transpose()?;
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let items = store.list_icebox(filter).await?;
+            if items.is_empty() {
+                println!("No icebox items in {project_id}.");
+                return Ok(());
+            }
+            println!("{} item(s) in {project_id}:\n", items.len());
+            for item in &items {
+                print_item(item, false);
+            }
+        }
+
+        IceboxAction::Show { slug, project } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let item = store
+                .get_icebox(&slug)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no icebox item with slug '{slug}'"))?;
+            print_item(&item, true);
+        }
+
+        IceboxAction::Promote {
+            slug,
+            plan,
+            project,
+        } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let item = store
+                .set_icebox_status(&slug, IceboxStatus::Promoted, plan.as_deref())
+                .await?;
+            print_item(&item, false);
+        }
+
+        IceboxAction::Drop { slug, project } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let item = store
+                .set_icebox_status(&slug, IceboxStatus::Dropped, None)
+                .await?;
+            print_item(&item, false);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_project_id(arg: Option<String>) -> String {
     if let Some(p) = arg.filter(|s| !s.is_empty()) {
         return p;
@@ -3542,6 +3716,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::Icebox { action } => cmd_icebox(action).await?,
         Commands::Sync { action } => match action {
             SyncAction::Init { force } => sync_cmd::cmd_init(force).await?,
             SyncAction::Push { limit, dry_run } => sync_cmd::cmd_push(limit, dry_run).await?,

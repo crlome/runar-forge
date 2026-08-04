@@ -296,6 +296,10 @@ async fn handle_tool_call(
         "muninn_stats" => tool_stats(args, librarian).await,
         "muninn_merge_projects" => tool_merge_projects(args, librarian).await,
         "muninn_debug" => tool_debug(args, librarian).await,
+        "muninn_icebox_add" => tool_icebox_add(args, librarian).await,
+        "muninn_icebox_list" => tool_icebox_list(args, librarian).await,
+        "muninn_icebox_get" => tool_icebox_get(args, librarian).await,
+        "muninn_icebox_set_status" => tool_icebox_set_status(args, librarian).await,
         "curator_ask" => tool_curator_ask(args, curator).await,
         "curator_topics" => tool_curator_topics(args, curator).await,
         "curator_decisions" => tool_curator_decisions(args, curator).await,
@@ -533,6 +537,104 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
     }
 
     Ok(response.to_string())
+}
+
+// ── Icebox ──────────────────────────────────────────────────────────
+
+fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
+    arg_str(args, key).ok_or_else(|| format!("missing required field: {key}"))
+}
+
+fn icebox_store<'a>(args: &Value, lib: &'a MemoryLibrarian) -> crate::plans::PlanStore<'a> {
+    crate::plans::PlanStore::new(lib, arg_str(args, "projectId").map(|s| s.to_string()))
+}
+
+fn icebox_json(item: &crate::plans::IceboxItem) -> Value {
+    serde_json::json!({
+        "slug": item.slug,
+        "title": item.title,
+        "content": item.content,
+        "status": item.status.as_str(),
+        "promotedTo": item.promoted_to,
+        "tags": item.tags,
+        "updatedAt": item.updated_at.to_rfc3339(),
+    })
+}
+
+async fn tool_icebox_add(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let title = required_str(args, "title")?;
+    let content = arg_str(args, "content").unwrap_or(title);
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let store = icebox_store(args, lib);
+    let slug = store
+        .add_icebox(title, content, arg_str(args, "slug"), &tags)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "status": "saved",
+        "slug": slug,
+        "hint": "promote it later with muninn_icebox_set_status(status: \"promoted\")",
+    })
+    .to_string())
+}
+
+async fn tool_icebox_list(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let status = match arg_str(args, "status") {
+        Some(s) => Some(crate::plans::IceboxStatus::parse(s).ok_or_else(|| {
+            format!(
+                "unknown status '{s}' (use: {:?})",
+                crate::plans::IceboxStatus::all()
+            )
+        })?),
+        None => None,
+    };
+    let items = icebox_store(args, lib)
+        .list_icebox(status)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "count": items.len(),
+        "items": items.iter().map(icebox_json).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+async fn tool_icebox_get(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let item = icebox_store(args, lib)
+        .get_icebox(slug)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no icebox item with slug '{slug}'"))?;
+    Ok(icebox_json(&item).to_string())
+}
+
+async fn tool_icebox_set_status(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let status_str = required_str(args, "status")?;
+    let status = crate::plans::IceboxStatus::parse(status_str).ok_or_else(|| {
+        format!(
+            "unknown status '{status_str}' (use: {:?})",
+            crate::plans::IceboxStatus::all()
+        )
+    })?;
+    let item = icebox_store(args, lib)
+        .set_icebox_status(slug, status, arg_str(args, "promotedTo"))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(icebox_json(&item).to_string())
 }
 
 async fn tool_search(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
@@ -1865,6 +1967,68 @@ fn tool_definitions() -> Vec<ToolInfo> {
                 "additionalProperties": false,
             }),
         },
+        // ── Icebox tools ───────────────────────────────────────────
+        //
+        // Icebox items are stored as memory entries but are excluded from
+        // every automatic injection path, so these tools are the only way
+        // an agent sees the backlog. That is deliberate: a deferred idea is
+        // not a fact about the code.
+        ToolInfo {
+            name: "muninn_icebox_add".into(),
+            description: "Capture a deferred idea, backlog item or piece of future work. Use when the user says \"file this\", \"add to the icebox\", \"let's do this later\", or parks an idea mid-task.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short statement of the item" },
+                    "content": { "type": "string", "description": "Why it matters and any constraints already known. Defaults to the title." },
+                    "slug": { "type": "string", "description": "Optional stable id; derived from the title otherwise" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional extra tags" },
+                    "projectId": { "type": "string", "description": "Project this item belongs to" },
+                },
+                "required": ["title"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_icebox_list".into(),
+            description: "List icebox items, optionally filtered by status. Use when the user asks what is on the backlog or what to work on next.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["open", "promoted", "dropped"], "description": "Filter by status; omit for all" },
+                    "projectId": { "type": "string", "description": "Project to scope to" },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_icebox_get".into(),
+            description: "Read one icebox item in full by slug.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Item slug, as returned by muninn_icebox_list" },
+                    "projectId": { "type": "string", "description": "Project to scope to" },
+                },
+                "required": ["slug"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_icebox_set_status".into(),
+            description: "Move an icebox item to promoted (work has started, usually as a plan) or dropped (decided against). Set promotedTo to the plan slug when promoting.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Item slug" },
+                    "status": { "type": "string", "enum": ["open", "promoted", "dropped"], "description": "New status" },
+                    "promotedTo": { "type": "string", "description": "Slug of the plan this item became" },
+                    "projectId": { "type": "string", "description": "Project to scope to" },
+                },
+                "required": ["slug", "status"],
+                "additionalProperties": false,
+            }),
+        },
         // ── Curator tools ──────────────────────────────────────────
         ToolInfo {
             name: "curator_ask".into(),
@@ -2075,6 +2239,116 @@ mod tests {
         assert!(!looks_like_storage_err("missing required field: title"));
         assert!(!looks_like_storage_err("unknown tool: muninn_foo"));
         assert!(!looks_like_storage_err("invalid UUID: not-a-uuid"));
+    }
+
+    async fn icebox_test_lib() -> MemoryLibrarian {
+        let storage =
+            std::sync::Arc::new(crate::storage::sqlite::SqliteAdapter::in_memory("test").unwrap());
+        crate::storage::MemoryStorage::initialize(&*storage)
+            .await
+            .unwrap();
+        MemoryLibrarian::new(
+            storage,
+            std::sync::Arc::new(crate::embedding::DisabledEmbeddingProvider),
+            "test",
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn icebox_tools_round_trip_through_the_response_shape() {
+        // Asserts on the JSON an MCP client actually parses, not on the
+        // store beneath it: a handler that succeeds but returns the wrong
+        // shape is indistinguishable from a broken tool at the client.
+        let lib = icebox_test_lib().await;
+
+        let added: Value = serde_json::from_str(
+            &tool_icebox_add(
+                &serde_json::json!({ "title": "Ship the soak gate", "content": "delay the tag" }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(added["status"], "saved");
+        assert_eq!(added["slug"], "ship-the-soak-gate");
+
+        let listed: Value = serde_json::from_str(
+            &tool_icebox_list(&serde_json::json!({}), &lib)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["items"][0]["status"], "open");
+
+        let got: Value = serde_json::from_str(
+            &tool_icebox_get(&serde_json::json!({ "slug": "ship-the-soak-gate" }), &lib)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["content"], "delay the tag");
+
+        let promoted: Value = serde_json::from_str(
+            &tool_icebox_set_status(
+                &serde_json::json!({
+                    "slug": "ship-the-soak-gate",
+                    "status": "promoted",
+                    "promotedTo": "soak-gate",
+                }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted["status"], "promoted");
+        assert_eq!(promoted["promotedTo"], "soak-gate");
+    }
+
+    #[tokio::test]
+    async fn icebox_tools_reject_bad_input_rather_than_guessing() {
+        let lib = icebox_test_lib().await;
+
+        assert!(tool_icebox_add(&serde_json::json!({}), &lib)
+            .await
+            .unwrap_err()
+            .contains("title"));
+        assert!(
+            tool_icebox_get(&serde_json::json!({ "slug": "nope" }), &lib)
+                .await
+                .is_err()
+        );
+        let err = tool_icebox_list(&serde_json::json!({ "status": "frozen" }), &lib)
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown status"), "{err}");
+        assert!(tool_icebox_set_status(
+            &serde_json::json!({ "slug": "nope", "status": "dropped" }),
+            &lib
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn icebox_tools_are_declared_and_dispatchable() {
+        // A handler with no ToolInfo is invisible to clients; a ToolInfo
+        // with no dispatch arm is worse — advertised and always failing.
+        let names: Vec<String> = tool_definitions().into_iter().map(|t| t.name).collect();
+        for expected in [
+            "muninn_icebox_add",
+            "muninn_icebox_list",
+            "muninn_icebox_get",
+            "muninn_icebox_set_status",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} is not declared in tool_definitions()"
+            );
+        }
     }
 
     #[test]

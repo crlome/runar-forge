@@ -806,6 +806,21 @@ impl MemoryLibrarian {
         self.storage.get_by_topic_key(ns, topic_key).await
     }
 
+    /// Every live entry under a `topic_key` prefix, in key order.
+    ///
+    /// The read path for documents chunked across several entries — plans
+    /// and icebox items. Like `get_by_topic_key` this is a metadata lookup
+    /// and deliberately touches no access counters: assembling a document
+    /// is not a retrieval of each of its parts.
+    pub async fn list_by_topic_prefix(
+        &self,
+        project_id: Option<&str>,
+        prefix: &str,
+    ) -> StorageResult<Vec<MemoryEntry>> {
+        let ns = self.scope(None, project_id);
+        self.storage.list_by_topic_prefix(ns, prefix).await
+    }
+
     pub async fn list(&self, filters: ListFilters) -> StorageResult<Vec<MemoryEntry>> {
         let mut f = filters;
         if f.namespace.is_none() {
@@ -1113,6 +1128,28 @@ impl MemoryLibrarian {
             .mark_verified(id, verified_by.as_deref())
             .await?;
         // Phase 5.6.2 — verified flip is a row mutation; push it.
+        self.enqueue_outbox_for_entry(id, OutboxOp::Update).await;
+        Ok(entry)
+    }
+
+    /// Replace an entry's tags in place, keeping its id, and push the row.
+    ///
+    /// The write path for state that lives in tags — a plan's status, a
+    /// phase's progress. Re-saving through `propose` cannot do this: the
+    /// exact-duplicate guard hashes title and content only, so a tags-only
+    /// change short-circuits as `Duplicate` and the new tags are silently
+    /// discarded. Advancing a phase would then appear to succeed and change
+    /// nothing, which is the failure mode this whole feature exists to
+    /// avoid.
+    ///
+    /// Keeping the id also keeps cross-references stable: an icebox item
+    /// that names the plan it was promoted into must not acquire a new id
+    /// every time its status moves.
+    pub async fn retag(&self, id: Uuid, tags: Vec<String>) -> StorageResult<MemoryEntry> {
+        let entry = self
+            .storage
+            .update(id, serde_json::json!({ "tags": tags }))
+            .await?;
         self.enqueue_outbox_for_entry(id, OutboxOp::Update).await;
         Ok(entry)
     }

@@ -558,6 +558,34 @@ impl MemoryStorage for SqliteAdapter {
     }
 
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry> {
+        // `tags` is a JSON text column here and TEXT[] in postgres, and the
+        // postgres adapter accepts either a JSON array value or a
+        // JSON-encoded array string. Normalize to the string form up front
+        // so both backends accept the same input: binding below reads
+        // `as_str()`, so an array value used to bind the empty string and
+        // silently erase every tag on the row.
+        let mut updates = updates;
+        if let Some(tags) = updates.get("tags") {
+            let parsed: Option<Vec<String>> = match tags {
+                serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+                other => serde_json::from_value(other.clone()).ok(),
+            };
+            match parsed {
+                Some(list) => {
+                    updates["tags"] = serde_json::Value::String(
+                        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()),
+                    );
+                }
+                // Unparseable: drop the field rather than write junk over a
+                // good value. Postgres reaches the same outcome by leaving
+                // `tags_val` as None.
+                None => {
+                    if let Some(obj) = updates.as_object_mut() {
+                        obj.remove("tags");
+                    }
+                }
+            }
+        }
         {
             let db = self
                 .db
@@ -4291,6 +4319,50 @@ mod tests {
         assert_ne!(found.id, first.id);
         assert_eq!(found.title, "Auth flow v2");
         assert!(found.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_accepts_tags_as_an_array_or_an_encoded_string() {
+        // Parity contract with the postgres adapter, which accepts both
+        // forms (`postgres.rs`, "tags is TEXT[] ... accept either"). This
+        // side bound `as_str()` on the raw value, so an array bound the
+        // empty string and erased every tag — a silent wipe, since the
+        // update reported success.
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let saved = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "Taggable".into(),
+                    content: "body".into(),
+                    entry_type: EntryType::Note,
+                    tags: vec!["original".into()],
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let updated = adapter
+            .update(saved.id, serde_json::json!({ "tags": ["alpha", "beta"] }))
+            .await
+            .unwrap();
+        assert_eq!(updated.tags, vec!["alpha".to_string(), "beta".to_string()]);
+
+        let updated = adapter
+            .update(saved.id, serde_json::json!({ "tags": "[\"gamma\"]" }))
+            .await
+            .unwrap();
+        assert_eq!(updated.tags, vec!["gamma".to_string()]);
+
+        // Junk must leave the good value alone rather than overwrite it.
+        let updated = adapter
+            .update(saved.id, serde_json::json!({ "tags": 42 }))
+            .await
+            .unwrap();
+        assert_eq!(updated.tags, vec!["gamma".to_string()]);
     }
 
     #[tokio::test]
