@@ -553,6 +553,28 @@ impl MemoryStorage for PostgresAdapter {
         Ok(row.as_ref().map(row_to_entry))
     }
 
+    async fn list_by_topic_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<MemoryEntry>> {
+        let client = self.get_client().await?;
+        let pattern = super::escape_like_prefix(prefix);
+        let rows = client
+            .query(
+                "SELECT * FROM muninn.memory_entries
+                 WHERE namespace = $1
+                   AND topic_key LIKE $2 ESCAPE '\\'
+                   AND deleted_at IS NULL
+                 ORDER BY topic_key ASC, created_at ASC",
+                &[&namespace, &pattern],
+            )
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows.iter().map(row_to_entry).collect())
+    }
+
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry> {
         let client = self.get_client().await?;
 

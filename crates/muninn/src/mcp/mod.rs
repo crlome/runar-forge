@@ -1702,8 +1702,8 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "content": { "type": "string", "description": "Full content of the memory (10-10,000 chars)" },
                     "type": {
                         "type": "string",
-                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt"],
-                        "description": "Category of this memory"
+                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt", "plan", "icebox"],
+                        "description": "Category of this memory. Prefer the muninn_plan_* / muninn_icebox_* tools over saving \"plan\"/\"icebox\" directly — they own the topic-key and status conventions."
                     },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags for filtering (max 10)" },
                     "projectId": { "type": "string", "description": "Optional project this memory belongs to" },

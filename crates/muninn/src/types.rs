@@ -21,6 +21,19 @@ pub enum EntryType {
     Note,
     AutoChange,
     UserPrompt,
+    /// A product requirements document / implementation plan, stored one
+    /// entry per section under `plan:<slug>[:<nn>-<section>]`.
+    ///
+    /// Deliberately excluded from every automatic injection path (recall and
+    /// the SessionStart packet): a plan is work that has not happened yet, so
+    /// injecting it states a future as if it were a recorded fact, and a
+    /// multi-section document would crowd out the entries recall exists to
+    /// surface. Reachable through `runar plan` / `muninn_plan_*` and through
+    /// an explicit search, which is user-initiated by definition.
+    Plan,
+    /// A deferred backlog item, one entry per item under `icebox:<slug>`.
+    /// Excluded from automatic injection for the same reason as `Plan`.
+    Icebox,
 }
 
 impl EntryType {
@@ -39,7 +52,23 @@ impl EntryType {
             Self::Note => "note",
             Self::AutoChange => "auto-change",
             Self::UserPrompt => "user-prompt",
+            Self::Plan => "plan",
+            Self::Icebox => "icebox",
         }
+    }
+
+    /// Types that must never reach a model through an *automatic* channel —
+    /// the UserPromptSubmit recall arm or the SessionStart context packet.
+    ///
+    /// `UserPrompt` and `Session` are captured input rather than knowledge.
+    /// `Plan` and `Icebox` are intended future work: correct as a record,
+    /// false as a statement about the code. All four remain reachable through
+    /// explicit search and their own tools.
+    pub fn excluded_from_injection(&self) -> bool {
+        matches!(
+            self,
+            Self::UserPrompt | Self::Session | Self::Plan | Self::Icebox
+        )
     }
 }
 

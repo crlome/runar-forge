@@ -32,6 +32,23 @@ pub fn content_hash(title: &str, content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Escape the LIKE wildcards in a literal prefix, for use with
+/// `LIKE ? ESCAPE '\'`. Shared by both backends so the two cannot drift on
+/// what a prefix means: without this, a topic key containing `_` — which
+/// every kebab-case slug may — matches any single character and silently
+/// widens the result set.
+pub fn escape_like_prefix(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + 8);
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("entry not found: {0}")]
@@ -71,6 +88,26 @@ pub trait MemoryStorage: Send + Sync {
         namespace: &str,
         topic_key: &str,
     ) -> StorageResult<Option<MemoryEntry>>;
+
+    /// Fetch every live entry whose `topic_key` starts with `prefix`,
+    /// ordered by `topic_key` so a chunked document comes back in section
+    /// order.
+    ///
+    /// This is the read path for documents stored as several entries under
+    /// one key prefix (`plan:<slug>:<nn>-<section>`). Filtering by tag was
+    /// the obvious alternative and is not usable: `ListFilters.tags` is
+    /// applied only as a librarian post-filter and `list()` ignores it
+    /// entirely, because tags are a JSON text column whose representation
+    /// differs between the two backends. `topic_key` is a plain indexed
+    /// column in both.
+    ///
+    /// `prefix` is matched literally — implementations must escape `%` and
+    /// `_` so a key containing them cannot widen the match.
+    async fn list_by_topic_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<MemoryEntry>>;
 
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry>;
 

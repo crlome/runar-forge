@@ -532,6 +532,31 @@ impl MemoryStorage for SqliteAdapter {
         .map_err(db_err)
     }
 
+    async fn list_by_topic_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<MemoryEntry>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let pattern = super::escape_like_prefix(prefix);
+        let mut stmt = db
+            .prepare(
+                "SELECT * FROM memory_entries
+                 WHERE namespace = ?1
+                   AND topic_key LIKE ?2 ESCAPE '\\'
+                   AND deleted_at IS NULL
+                 ORDER BY topic_key ASC, created_at ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![namespace, pattern], row_to_entry)
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    }
+
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry> {
         {
             let db = self
@@ -4266,6 +4291,139 @@ mod tests {
         assert_ne!(found.id, first.id);
         assert_eq!(found.title, "Auth flow v2");
         assert!(found.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_by_topic_prefix_returns_sections_in_order() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        // Saved out of order on purpose — the caller relies on the query's
+        // ORDER BY to reassemble a chunked document, not on write order.
+        for (key, title) in [
+            ("plan:auth:02-design", "Design"),
+            ("plan:auth:00-problem", "Problem"),
+            ("plan:auth:01-goals", "Goals"),
+        ] {
+            adapter
+                .save(
+                    MemoryEntryInput {
+                        title: title.into(),
+                        content: format!("section body for {key}"),
+                        entry_type: EntryType::Plan,
+                        topic_key: Some(key.into()),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+        }
+
+        let sections = adapter
+            .list_by_topic_prefix("test", "plan:auth:")
+            .await
+            .unwrap();
+        assert_eq!(
+            sections
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Problem", "Goals", "Design"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_topic_prefix_scopes_namespace_and_skips_deleted() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let doomed = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "dropped item".into(),
+                    content: "no longer wanted".into(),
+                    entry_type: EntryType::Icebox,
+                    topic_key: Some("icebox:dropped".into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        adapter
+            .save(
+                MemoryEntryInput {
+                    title: "live item".into(),
+                    content: "still open".into(),
+                    entry_type: EntryType::Icebox,
+                    topic_key: Some("icebox:live".into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        adapter
+            .save(
+                MemoryEntryInput {
+                    title: "other project item".into(),
+                    content: "different namespace".into(),
+                    entry_type: EntryType::Icebox,
+                    topic_key: Some("icebox:elsewhere".into()),
+                    ..Default::default()
+                },
+                "other-ns",
+            )
+            .await
+            .unwrap();
+
+        adapter.delete(doomed.id).await.unwrap();
+
+        let items = adapter
+            .list_by_topic_prefix("test", "icebox:")
+            .await
+            .unwrap();
+        assert_eq!(
+            items.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            vec!["live item"],
+            "prefix listing must be namespace-scoped and skip soft-deleted rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_topic_prefix_treats_wildcards_literally() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        // `plan_a` and `plan-a` differ by one character, and `_` is a LIKE
+        // wildcard. Without escaping, a prefix of "plan_a" matches both and
+        // one plan's sections leak into another's.
+        for key in ["plan_a:00-intro", "plan-a:00-intro"] {
+            adapter
+                .save(
+                    MemoryEntryInput {
+                        title: key.into(),
+                        content: format!("body {key}"),
+                        entry_type: EntryType::Plan,
+                        topic_key: Some(key.into()),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+        }
+
+        let items = adapter
+            .list_by_topic_prefix("test", "plan_a:")
+            .await
+            .unwrap();
+        assert_eq!(
+            items.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            vec!["plan_a:00-intro"],
+            "`_` must be escaped rather than matching any character"
+        );
     }
 
     #[tokio::test]

@@ -3241,8 +3241,10 @@ async fn main() -> anyhow::Result<()> {
                 "context" => types::EntryType::Context,
                 "preference" => types::EntryType::Preference,
                 "note" => types::EntryType::Note,
+                "plan" => types::EntryType::Plan,
+                "icebox" => types::EntryType::Icebox,
                 other => anyhow::bail!(
-                    "unknown type '{other}' (use: decision|pattern|bug|rule|business-rule|architecture|tech-debt|context|preference|note)"
+                    "unknown type '{other}' (use: decision|pattern|bug|rule|business-rule|architecture|tech-debt|context|preference|note|plan|icebox)"
                 ),
             };
             let parsed_tags: Vec<String> = tags
