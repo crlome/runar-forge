@@ -709,7 +709,7 @@ impl<'a> PlanStore<'a> {
                 updated_at: entry.updated_at,
             });
         }
-        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         Ok(summaries)
     }
 
@@ -810,7 +810,7 @@ impl<'a> PlanStore<'a> {
             .filter_map(icebox_from_entry)
             .filter(|i| status_filter.is_none_or(|want| want == i.status))
             .collect();
-        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        items.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
         Ok(items)
     }
 
