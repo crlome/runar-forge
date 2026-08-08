@@ -133,6 +133,15 @@ enum Commands {
         /// Remove the auto-refresh hooks if they are installed.
         #[arg(long)]
         no_graph_autorefresh: bool,
+        /// Skip the guided /prd and /icebox skills, and remove them if
+        /// they are already installed. They are inert markdown rather than
+        /// hooks, so they are installed by default. Persisted to
+        /// ~/.runar-forge/.env so a later bare re-run keeps the choice.
+        #[arg(long)]
+        no_skills: bool,
+        /// Re-enable the guided skills after a previous --no-skills.
+        #[arg(long)]
+        with_skills: bool,
         /// Run `runar config wizard` first to (re)configure storage backend.
         /// Phase 5.5 — replaces the manual ".env edit then setup" flow.
         #[arg(long)]
@@ -420,6 +429,123 @@ enum Commands {
         #[command(subcommand)]
         action: SyncAction,
     },
+
+    /// Deferred backlog items. Stored as memory entries, so they sync to
+    /// the team remote — but excluded from automatic injection, so a
+    /// parked idea never reads as a fact about the code.
+    Icebox {
+        #[command(subcommand)]
+        action: IceboxAction,
+    },
+
+    /// Product requirements documents / implementation plans. Stored as
+    /// memory entries so they sync to the team remote, and excluded from
+    /// automatic injection so intended work never reads as recorded fact.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Store a plan, optionally read from a markdown file.
+    Create {
+        /// Plan title. Taken from the file's `# Heading` when omitted.
+        title: Option<String>,
+        /// Markdown file; each `## Heading` becomes a section, and a
+        /// heading naming a phase becomes a tracked phase.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Stable id; derived from the title otherwise
+        #[arg(long)]
+        slug: Option<String>,
+        /// draft | approved | in-progress | completed | abandoned
+        #[arg(long, default_value = "draft")]
+        status: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// List plans with their status and phase progress.
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Print a plan as markdown.
+    Show {
+        slug: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Advance a plan, or one of its phases with --phase.
+    Status {
+        slug: String,
+        /// New status. For a phase: pending | in-progress | done.
+        status: String,
+        /// Move this phase instead of the plan itself.
+        #[arg(long)]
+        phase: Option<usize>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IceboxAction {
+    /// Capture an idea or piece of deferred work.
+    Add {
+        /// Short statement of the item
+        title: String,
+        /// Why it matters and what is already known
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Stable id; derived from the title otherwise
+        #[arg(long)]
+        slug: Option<String>,
+        /// Comma-separated extra tags
+        #[arg(long)]
+        tags: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// List backlog items, newest first.
+    List {
+        /// open | promoted | dropped
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Print one item in full.
+    Show {
+        slug: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Mark an item as promoted into a plan.
+    Promote {
+        slug: String,
+        /// Slug of the plan this item became
+        #[arg(long)]
+        plan: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Mark an item as decided against.
+    Drop {
+        slug: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -690,6 +816,291 @@ fn default_db_path() -> String {
 /// cwd — rare). Keeps manual CLI use ergonomic while hook invocations still
 /// win because `runar setup claude-code` bakes the explicit pid into every
 /// hook command.
+/// `runar plan …` — the CLI half of the PRD surface, sharing every
+/// convention with the `muninn_plan_*` MCP tools through `PlanStore`.
+async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
+    use runar_muninn::plans::{parse_markdown, PhaseStatus, PlanStatus, PlanStore};
+
+    match action {
+        PlanAction::Create {
+            title,
+            file,
+            slug,
+            status,
+            project,
+        } => {
+            let status = PlanStatus::parse(&status).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown status '{status}' (use: {})",
+                    PlanStatus::all().join("|")
+                )
+            })?;
+
+            let (title, overview, sections, untracked) = match &file {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+                    let parsed = parse_markdown(&text);
+                    let title = title.or(parsed.title).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} has no `# Title` heading — pass a title argument",
+                            path.display()
+                        )
+                    })?;
+                    (
+                        title,
+                        parsed.overview,
+                        parsed.sections,
+                        parsed.untracked_phase_headings,
+                    )
+                }
+                None => (
+                    title.ok_or_else(|| {
+                        anyhow::anyhow!("give a title, or --file to read one from markdown")
+                    })?,
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
+
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let (slug, entries) = store
+                .create_plan(&title, slug.as_deref(), &overview, &sections, status)
+                .await?;
+
+            println!("Stored plan: {title}");
+            println!("  slug: {slug}");
+            println!("  sections: {} ({entries} entries)", sections.len());
+            let phases = sections.iter().filter(|s| s.phase.is_some()).count();
+            if phases > 0 {
+                println!("  tracked phases: {phases}");
+            }
+            println!("  project: {project_id}");
+            if !untracked.is_empty() {
+                println!(
+                    "\n  WARNING — {} heading(s) name a phase but sit below `##`, so they \
+                     are body text and will NOT be tracked:",
+                    untracked.len()
+                );
+                for heading in untracked.iter().take(8) {
+                    println!("    ### {heading}");
+                }
+                if untracked.len() > 8 {
+                    println!("    … and {} more", untracked.len() - 8);
+                }
+                println!(
+                    "  Promote them to `## Phase N — name` to track progress across sessions."
+                );
+            }
+        }
+
+        PlanAction::List { status, project } => {
+            let filter = match status {
+                Some(s) => Some(PlanStatus::parse(&s).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown status '{s}' (use: {})",
+                        PlanStatus::all().join("|")
+                    )
+                })?),
+                None => None,
+            };
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let plans = store.list_plans(filter).await?;
+            if plans.is_empty() {
+                println!("No plans in {project_id}.");
+                return Ok(());
+            }
+            println!("{} plan(s) in {project_id}:\n", plans.len());
+            for plan in &plans {
+                let progress = if plan.phases_total > 0 {
+                    format!(" {}/{} phases", plan.phases_done, plan.phases_total)
+                } else {
+                    String::new()
+                };
+                println!("[{}] {} ({}){progress}", plan.status, plan.title, plan.slug);
+            }
+        }
+
+        PlanAction::Show { slug, project } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let doc = store
+                .get_plan(&slug)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no plan with slug '{slug}'"))?;
+            print!("{}", doc.render());
+        }
+
+        PlanAction::Status {
+            slug,
+            status,
+            phase,
+            project,
+        } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+
+            let doc = match phase {
+                // With --phase the status word names a phase state, not a
+                // plan state; the two vocabularies overlap on in-progress
+                // and would otherwise be ambiguous.
+                Some(n) => {
+                    let ps = PhaseStatus::parse(&status).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown phase status '{status}' (use: {})",
+                            PhaseStatus::all().join("|")
+                        )
+                    })?;
+                    store
+                        .set_plan_status(&slug, None, Some(n), Some(ps))
+                        .await?
+                }
+                None => {
+                    let ps = PlanStatus::parse(&status).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown status '{status}' (use: {})",
+                            PlanStatus::all().join("|")
+                        )
+                    })?;
+                    store.set_plan_status(&slug, Some(ps), None, None).await?
+                }
+            };
+
+            let (done, total) = doc.phase_progress();
+            println!("[{}] {} ({})", doc.status, doc.title, doc.slug);
+            if total > 0 {
+                println!("  phases: {done}/{total}");
+                if done == total && !doc.status.is_closed() {
+                    println!(
+                        "  every phase is done — `runar plan status {slug} completed` to close it"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `runar icebox …` — the CLI half of the backlog surface. The MCP tools
+/// and this share every convention through `plans::PlanStore`, so an item
+/// filed by an agent and one filed by hand are the same row.
+async fn cmd_icebox(action: IceboxAction) -> anyhow::Result<()> {
+    use runar_muninn::plans::{IceboxStatus, PlanStore};
+
+    fn parse_status(s: &str) -> anyhow::Result<IceboxStatus> {
+        IceboxStatus::parse(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown status '{s}' (use: {})",
+                IceboxStatus::all().join("|")
+            )
+        })
+    }
+
+    fn print_item(item: &runar_muninn::plans::IceboxItem, full: bool) {
+        let promoted = item
+            .promoted_to
+            .as_ref()
+            .map(|p| format!(" → plan:{p}"))
+            .unwrap_or_default();
+        println!("[{}] {} ({}){promoted}", item.status, item.title, item.slug);
+        if full {
+            println!("\n{}\n", item.content.trim());
+            if !item.tags.is_empty() {
+                println!("tags: {}", item.tags.join(", "));
+            }
+            println!("updated: {}", item.updated_at.to_rfc3339());
+        }
+    }
+
+    match action {
+        IceboxAction::Add {
+            title,
+            message,
+            slug,
+            tags,
+            project,
+        } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let parsed_tags: Vec<String> = tags
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let content = message.unwrap_or_else(|| title.clone());
+            let slug = store
+                .add_icebox(&title, &content, slug.as_deref(), &parsed_tags)
+                .await?;
+            println!("Filed: {title}");
+            println!("  slug: {slug}");
+            println!("  project: {project_id}");
+        }
+
+        IceboxAction::List { status, project } => {
+            let project_id = resolve_project_id(project);
+            let filter = status.as_deref().map(parse_status).transpose()?;
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id.clone()));
+            let items = store.list_icebox(filter).await?;
+            if items.is_empty() {
+                println!("No icebox items in {project_id}.");
+                return Ok(());
+            }
+            println!("{} item(s) in {project_id}:\n", items.len());
+            for item in &items {
+                print_item(item, false);
+            }
+        }
+
+        IceboxAction::Show { slug, project } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let item = store
+                .get_icebox(&slug)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no icebox item with slug '{slug}'"))?;
+            print_item(&item, true);
+        }
+
+        IceboxAction::Promote {
+            slug,
+            plan,
+            project,
+        } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let item = store
+                .set_icebox_status(&slug, IceboxStatus::Promoted, plan.as_deref())
+                .await?;
+            print_item(&item, false);
+        }
+
+        IceboxAction::Drop { slug, project } => {
+            let project_id = resolve_project_id(project);
+            let librarian = create_librarian().await?;
+            let store = PlanStore::new(&librarian, Some(project_id));
+            let item = store
+                .set_icebox_status(&slug, IceboxStatus::Dropped, None)
+                .await?;
+            print_item(&item, false);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_project_id(arg: Option<String>) -> String {
     if let Some(p) = arg.filter(|s| !s.is_empty()) {
         return p;
@@ -2858,6 +3269,8 @@ async fn main() -> anyhow::Result<()> {
             no_search_hints,
             with_graph_autorefresh,
             no_graph_autorefresh,
+            no_skills,
+            with_skills,
             configure,
             all_projects,
         } => {
@@ -2894,6 +3307,17 @@ async fn main() -> anyhow::Result<()> {
                         .map(|d| setup::graph_autorefresh_installed(&d))
                         .unwrap_or(false)
             };
+            // Skills are default-on, but `--no-skills` has to survive a
+            // later bare re-run, or turning them off would last exactly
+            // until the next `runar setup` — the shape of the v0.9.2 trap.
+            let skills = if no_skills {
+                false
+            } else {
+                with_skills
+                    || std::env::var("RUNAR_SKILLS")
+                        .map(|v| v != "false")
+                        .unwrap_or(true)
+            };
             {
                 let path = config_cmd::EnvFile::default_path();
                 if let Ok(mut env_file) = config_cmd::EnvFile::load(&path) {
@@ -2901,6 +3325,7 @@ async fn main() -> anyhow::Result<()> {
                         "RUNAR_AUTO_CAPTURE",
                         if auto_capture { "true" } else { "false" },
                     );
+                    env_file.upsert("RUNAR_SKILLS", if skills { "true" } else { "false" });
                     let _ = env_file.save_atomic();
                 }
             }
@@ -2959,6 +3384,7 @@ async fn main() -> anyhow::Result<()> {
                         auto_capture,
                         search_hints,
                         graph_autorefresh,
+                        skills,
                     )?;
                     println!("\nRunarForge — Claude Code Setup\n");
                     println!(
@@ -2993,6 +3419,37 @@ async fn main() -> anyhow::Result<()> {
                         println!("     SessionStart:      code-graph auto-refresh");
                     }
                     println!();
+                    if !result.skills.written.is_empty() {
+                        println!(
+                            "  Skills installed in .claude/skills/: {}",
+                            result
+                                .skills
+                                .written
+                                .iter()
+                                .map(|s| format!("/{s}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    if !result.skills.removed.is_empty() {
+                        println!(
+                            "  Skills removed (--no-skills): {}",
+                            result.skills.removed.join(", ")
+                        );
+                    }
+                    if !result.skills.adopted.is_empty() {
+                        println!(
+                            "  Skills left untouched — the managed marker is gone, so they \
+                             are yours now: {}",
+                            result.skills.adopted.join(", ")
+                        );
+                    }
+                    if !result.skills.written.is_empty()
+                        || !result.skills.adopted.is_empty()
+                        || !result.skills.removed.is_empty()
+                    {
+                        println!();
+                    }
                     println!("  Binary: {}", result.binary_path);
                     println!(
                         "  Memory protocol added to {}\n",
@@ -3241,8 +3698,10 @@ async fn main() -> anyhow::Result<()> {
                 "context" => types::EntryType::Context,
                 "preference" => types::EntryType::Preference,
                 "note" => types::EntryType::Note,
+                "plan" => types::EntryType::Plan,
+                "icebox" => types::EntryType::Icebox,
                 other => anyhow::bail!(
-                    "unknown type '{other}' (use: decision|pattern|bug|rule|business-rule|architecture|tech-debt|context|preference|note)"
+                    "unknown type '{other}' (use: decision|pattern|bug|rule|business-rule|architecture|tech-debt|context|preference|note|plan|icebox)"
                 ),
             };
             let parsed_tags: Vec<String> = tags
@@ -3540,6 +3999,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::Icebox { action } => cmd_icebox(action).await?,
+        Commands::Plan { action } => cmd_plan(action).await?,
         Commands::Sync { action } => match action {
             SyncAction::Init { force } => sync_cmd::cmd_init(force).await?,
             SyncAction::Push { limit, dry_run } => sync_cmd::cmd_push(limit, dry_run).await?,

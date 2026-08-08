@@ -35,3 +35,4 @@ plans/*
 .claude/settings.json
 
 internal_documents/*
+.claude/skills/

@@ -133,6 +133,11 @@ pub fn run_wizard() -> anyhow::Result<WizardResult> {
             std::env::current_dir()
                 .map(|d| setup::graph_autorefresh_installed(&d))
                 .unwrap_or(false),
+            // Skills are inert markdown and default-on, but honour a
+            // persisted `--no-skills` the same way the Setup command does.
+            std::env::var("RUNAR_SKILLS")
+                .map(|v| v != "false")
+                .unwrap_or(true),
         ) {
             Ok(result) => {
                 println!("  MCP registered:  {}", result.claude_json_path.display());

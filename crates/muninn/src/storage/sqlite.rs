@@ -532,7 +532,60 @@ impl MemoryStorage for SqliteAdapter {
         .map_err(db_err)
     }
 
+    async fn list_by_topic_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<MemoryEntry>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let pattern = super::escape_like_prefix(prefix);
+        let mut stmt = db
+            .prepare(
+                "SELECT * FROM memory_entries
+                 WHERE namespace = ?1
+                   AND topic_key LIKE ?2 ESCAPE '\\'
+                   AND deleted_at IS NULL
+                 ORDER BY topic_key ASC, created_at ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![namespace, pattern], row_to_entry)
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    }
+
     async fn update(&self, id: Uuid, updates: serde_json::Value) -> StorageResult<MemoryEntry> {
+        // `tags` is a JSON text column here and TEXT[] in postgres, and the
+        // postgres adapter accepts either a JSON array value or a
+        // JSON-encoded array string. Normalize to the string form up front
+        // so both backends accept the same input: binding below reads
+        // `as_str()`, so an array value used to bind the empty string and
+        // silently erase every tag on the row.
+        let mut updates = updates;
+        if let Some(tags) = updates.get("tags") {
+            let parsed: Option<Vec<String>> = match tags {
+                serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+                other => serde_json::from_value(other.clone()).ok(),
+            };
+            match parsed {
+                Some(list) => {
+                    updates["tags"] = serde_json::Value::String(
+                        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()),
+                    );
+                }
+                // Unparseable: drop the field rather than write junk over a
+                // good value. Postgres reaches the same outcome by leaving
+                // `tags_val` as None.
+                None => {
+                    if let Some(obj) = updates.as_object_mut() {
+                        obj.remove("tags");
+                    }
+                }
+            }
+        }
         {
             let db = self
                 .db
@@ -4266,6 +4319,183 @@ mod tests {
         assert_ne!(found.id, first.id);
         assert_eq!(found.title, "Auth flow v2");
         assert!(found.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_accepts_tags_as_an_array_or_an_encoded_string() {
+        // Parity contract with the postgres adapter, which accepts both
+        // forms (`postgres.rs`, "tags is TEXT[] ... accept either"). This
+        // side bound `as_str()` on the raw value, so an array bound the
+        // empty string and erased every tag — a silent wipe, since the
+        // update reported success.
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let saved = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "Taggable".into(),
+                    content: "body".into(),
+                    entry_type: EntryType::Note,
+                    tags: vec!["original".into()],
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let updated = adapter
+            .update(saved.id, serde_json::json!({ "tags": ["alpha", "beta"] }))
+            .await
+            .unwrap();
+        assert_eq!(updated.tags, vec!["alpha".to_string(), "beta".to_string()]);
+
+        let updated = adapter
+            .update(saved.id, serde_json::json!({ "tags": "[\"gamma\"]" }))
+            .await
+            .unwrap();
+        assert_eq!(updated.tags, vec!["gamma".to_string()]);
+
+        // Junk must leave the good value alone rather than overwrite it.
+        let updated = adapter
+            .update(saved.id, serde_json::json!({ "tags": 42 }))
+            .await
+            .unwrap();
+        assert_eq!(updated.tags, vec!["gamma".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_by_topic_prefix_returns_sections_in_order() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        // Saved out of order on purpose — the caller relies on the query's
+        // ORDER BY to reassemble a chunked document, not on write order.
+        for (key, title) in [
+            ("plan:auth:02-design", "Design"),
+            ("plan:auth:00-problem", "Problem"),
+            ("plan:auth:01-goals", "Goals"),
+        ] {
+            adapter
+                .save(
+                    MemoryEntryInput {
+                        title: title.into(),
+                        content: format!("section body for {key}"),
+                        entry_type: EntryType::Plan,
+                        topic_key: Some(key.into()),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+        }
+
+        let sections = adapter
+            .list_by_topic_prefix("test", "plan:auth:")
+            .await
+            .unwrap();
+        assert_eq!(
+            sections
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Problem", "Goals", "Design"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_topic_prefix_scopes_namespace_and_skips_deleted() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        let doomed = adapter
+            .save(
+                MemoryEntryInput {
+                    title: "dropped item".into(),
+                    content: "no longer wanted".into(),
+                    entry_type: EntryType::Icebox,
+                    topic_key: Some("icebox:dropped".into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        adapter
+            .save(
+                MemoryEntryInput {
+                    title: "live item".into(),
+                    content: "still open".into(),
+                    entry_type: EntryType::Icebox,
+                    topic_key: Some("icebox:live".into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        adapter
+            .save(
+                MemoryEntryInput {
+                    title: "other project item".into(),
+                    content: "different namespace".into(),
+                    entry_type: EntryType::Icebox,
+                    topic_key: Some("icebox:elsewhere".into()),
+                    ..Default::default()
+                },
+                "other-ns",
+            )
+            .await
+            .unwrap();
+
+        adapter.delete(doomed.id).await.unwrap();
+
+        let items = adapter
+            .list_by_topic_prefix("test", "icebox:")
+            .await
+            .unwrap();
+        assert_eq!(
+            items.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            vec!["live item"],
+            "prefix listing must be namespace-scoped and skip soft-deleted rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_topic_prefix_treats_wildcards_literally() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+
+        // `plan_a` and `plan-a` differ by one character, and `_` is a LIKE
+        // wildcard. Without escaping, a prefix of "plan_a" matches both and
+        // one plan's sections leak into another's.
+        for key in ["plan_a:00-intro", "plan-a:00-intro"] {
+            adapter
+                .save(
+                    MemoryEntryInput {
+                        title: key.into(),
+                        content: format!("body {key}"),
+                        entry_type: EntryType::Plan,
+                        topic_key: Some(key.into()),
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+        }
+
+        let items = adapter
+            .list_by_topic_prefix("test", "plan_a:")
+            .await
+            .unwrap();
+        assert_eq!(
+            items.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            vec!["plan_a:00-intro"],
+            "`_` must be escaped rather than matching any character"
+        );
     }
 
     #[tokio::test]

@@ -9,14 +9,16 @@
 [![npm](https://img.shields.io/npm/v/@runar-forge/cli?label=npm)](https://www.npmjs.com/package/@runar-forge/cli)
 [![CI](https://img.shields.io/github/actions/workflow/status/crlome/runar-forge/ci.yml?branch=main&label=CI)](https://github.com/crlome/runar-forge/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/crlome/runar-forge)](LICENSE)
-![tests](https://img.shields.io/badge/tests-633%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-600%2B%20passing-brightgreen)
 ![languages](https://img.shields.io/badge/languages-5-orange)
 ![platforms](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-supported-lightgrey)
 
 <!-- release/npm/CI/license are live. tests/languages/platforms are static
-     strings and will drift; re-check them at release time — `tests` against
-     the preflight `cargo test -p runar-muninn --lib` count, `languages`
-     against the tree-sitter grammars in crates/muninn/Cargo.toml. -->
+     strings and will drift; re-check them at release time — `languages`
+     against the tree-sitter grammars in crates/muninn/Cargo.toml. `tests`
+     was an exact count and rotted between two releases, so it is now a
+     floor: bump the threshold only when it is actually wrong, never per
+     PR. Contributor testing guidance lives in docs/TESTING.md. -->
 
 > Persistent, semantically-searchable memory for AI coding tools.
 > One static Rust binary. SQLite or PostgreSQL. MCP-compatible.

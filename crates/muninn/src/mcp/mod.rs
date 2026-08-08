@@ -296,6 +296,15 @@ async fn handle_tool_call(
         "muninn_stats" => tool_stats(args, librarian).await,
         "muninn_merge_projects" => tool_merge_projects(args, librarian).await,
         "muninn_debug" => tool_debug(args, librarian).await,
+        "muninn_icebox_add" => tool_icebox_add(args, librarian).await,
+        "muninn_icebox_list" => tool_icebox_list(args, librarian).await,
+        "muninn_icebox_get" => tool_icebox_get(args, librarian).await,
+        "muninn_icebox_set_status" => tool_icebox_set_status(args, librarian).await,
+        "muninn_plan_create" => tool_plan_create(args, librarian).await,
+        "muninn_plan_list" => tool_plan_list(args, librarian).await,
+        "muninn_plan_get" => tool_plan_get(args, librarian).await,
+        "muninn_plan_save_section" => tool_plan_save_section(args, librarian).await,
+        "muninn_plan_set_status" => tool_plan_set_status(args, librarian).await,
         "curator_ask" => tool_curator_ask(args, curator).await,
         "curator_topics" => tool_curator_topics(args, curator).await,
         "curator_decisions" => tool_curator_decisions(args, curator).await,
@@ -532,6 +541,314 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         });
     }
 
+    Ok(response.to_string())
+}
+
+// ── Icebox ──────────────────────────────────────────────────────────
+
+fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
+    arg_str(args, key).ok_or_else(|| format!("missing required field: {key}"))
+}
+
+fn icebox_store<'a>(args: &Value, lib: &'a MemoryLibrarian) -> crate::plans::PlanStore<'a> {
+    crate::plans::PlanStore::new(lib, arg_str(args, "projectId").map(|s| s.to_string()))
+}
+
+fn icebox_json(item: &crate::plans::IceboxItem) -> Value {
+    serde_json::json!({
+        "slug": item.slug,
+        "title": item.title,
+        "content": item.content,
+        "status": item.status.as_str(),
+        "promotedTo": item.promoted_to,
+        "tags": item.tags,
+        "updatedAt": item.updated_at.to_rfc3339(),
+    })
+}
+
+async fn tool_icebox_add(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let title = required_str(args, "title")?;
+    let content = arg_str(args, "content").unwrap_or(title);
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let store = icebox_store(args, lib);
+    let slug = store
+        .add_icebox(title, content, arg_str(args, "slug"), &tags)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "status": "saved",
+        "slug": slug,
+        "hint": "promote it later with muninn_icebox_set_status(status: \"promoted\")",
+    })
+    .to_string())
+}
+
+async fn tool_icebox_list(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let status = match arg_str(args, "status") {
+        Some(s) => Some(crate::plans::IceboxStatus::parse(s).ok_or_else(|| {
+            format!(
+                "unknown status '{s}' (use: {:?})",
+                crate::plans::IceboxStatus::all()
+            )
+        })?),
+        None => None,
+    };
+    let items = icebox_store(args, lib)
+        .list_icebox(status)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "count": items.len(),
+        "items": items.iter().map(icebox_json).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+async fn tool_icebox_get(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let item = icebox_store(args, lib)
+        .get_icebox(slug)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no icebox item with slug '{slug}'"))?;
+    Ok(icebox_json(&item).to_string())
+}
+
+async fn tool_icebox_set_status(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let status_str = required_str(args, "status")?;
+    let status = crate::plans::IceboxStatus::parse(status_str).ok_or_else(|| {
+        format!(
+            "unknown status '{status_str}' (use: {:?})",
+            crate::plans::IceboxStatus::all()
+        )
+    })?;
+    let item = icebox_store(args, lib)
+        .set_icebox_status(slug, status, arg_str(args, "promotedTo"))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(icebox_json(&item).to_string())
+}
+
+// ── Plans (PRDs) ────────────────────────────────────────────────────
+
+fn plan_status_arg(args: &Value, key: &str) -> Result<Option<crate::plans::PlanStatus>, String> {
+    match arg_str(args, key) {
+        Some(s) => crate::plans::PlanStatus::parse(s).map(Some).ok_or_else(|| {
+            format!(
+                "unknown status '{s}' (use: {})",
+                crate::plans::PlanStatus::all().join("|")
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
+fn plan_doc_json(doc: &crate::plans::PlanDocument) -> Value {
+    let (done, total) = doc.phase_progress();
+    serde_json::json!({
+        "slug": doc.slug,
+        "title": doc.title,
+        "status": doc.status.as_str(),
+        "closed": doc.status.is_closed(),
+        "overview": doc.overview,
+        "phasesDone": done,
+        "phasesTotal": total,
+        "sections": doc.sections.iter().map(|s| serde_json::json!({
+            "topicKey": s.topic_key,
+            "index": s.index,
+            "title": s.title,
+            "content": s.content,
+            "phase": s.phase,
+            "phaseStatus": s.phase_status.as_str(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let title = required_str(args, "title")?;
+    let overview = arg_str(args, "overview").unwrap_or("");
+    let status = plan_status_arg(args, "status")?.unwrap_or_default();
+
+    // Sections arrive either pre-split or as one markdown document. The
+    // markdown form is what a /prd conversation naturally produces.
+    let mut untracked: Vec<String> = Vec::new();
+    let sections: Vec<crate::plans::SectionInput> = match args.get("sections") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Section")
+                    .to_string();
+                let content = item
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match item.get("phase").and_then(|v| v.as_u64()) {
+                    Some(n) => crate::plans::SectionInput::phase(n as usize, title, content),
+                    None => crate::plans::SectionInput::prose(title, content),
+                }
+            })
+            .collect(),
+        _ => match arg_str(args, "markdown") {
+            Some(md) => {
+                let parsed = crate::plans::parse_markdown(md);
+                untracked = parsed.untracked_phase_headings;
+                parsed.sections
+            }
+            None => Vec::new(),
+        },
+    };
+
+    let store = icebox_store(args, lib);
+    let (slug, entries) = store
+        .create_plan(title, arg_str(args, "slug"), overview, &sections, status)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let tracked = sections.iter().filter(|s| s.phase.is_some()).count();
+    let mut response = serde_json::json!({
+        "status": "saved",
+        "slug": slug,
+        "entriesWritten": entries,
+        "sections": sections.len(),
+        "trackedPhases": tracked,
+        "hint": "track execution with muninn_plan_set_status(slug, phase, phaseStatus)",
+    });
+    if !untracked.is_empty() {
+        response["warning"] = serde_json::json!(format!(
+            "{} heading(s) name a phase but sit below `##`, so they are body text and are \
+             NOT tracked: {}. Promote them to `## Phase N — name`.",
+            untracked.len(),
+            untracked.join("; ")
+        ));
+    }
+    Ok(response.to_string())
+}
+
+async fn tool_plan_list(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let filter = plan_status_arg(args, "status")?;
+    let plans = icebox_store(args, lib)
+        .list_plans(filter)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "count": plans.len(),
+        "plans": plans.iter().map(|p| serde_json::json!({
+            "slug": p.slug,
+            "title": p.title,
+            "status": p.status.as_str(),
+            "closed": p.status.is_closed(),
+            "phasesDone": p.phases_done,
+            "phasesTotal": p.phases_total,
+            "updatedAt": p.updated_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+async fn tool_plan_get(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let doc = icebox_store(args, lib)
+        .get_plan(slug)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no plan with slug '{slug}'"))?;
+
+    if args
+        .get("render")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(serde_json::json!({
+            "slug": doc.slug,
+            "status": doc.status.as_str(),
+            "closed": doc.status.is_closed(),
+            "markdown": doc.render(),
+        })
+        .to_string());
+    }
+    Ok(plan_doc_json(&doc).to_string())
+}
+
+async fn tool_plan_save_section(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let title = required_str(args, "title")?;
+    let content = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required field: content".to_string())?;
+    let index = args
+        .get("index")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing required field: index".to_string())? as usize;
+    let phase = args
+        .get("phase")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    let key = icebox_store(args, lib)
+        .save_section(slug, index, title, content, phase)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({ "status": "saved", "topicKey": key }).to_string())
+}
+
+async fn tool_plan_set_status(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
+    let slug = required_str(args, "slug")?;
+    let status = plan_status_arg(args, "status")?;
+    let phase = args
+        .get("phase")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let phase_status = match arg_str(args, "phaseStatus") {
+        Some(s) => Some(crate::plans::PhaseStatus::parse(s).ok_or_else(|| {
+            format!(
+                "unknown phaseStatus '{s}' (use: {})",
+                crate::plans::PhaseStatus::all().join("|")
+            )
+        })?),
+        None => None,
+    };
+    if status.is_none() && !(phase.is_some() && phase_status.is_some()) {
+        return Err(
+            "give either status, or both phase and phaseStatus — a phase number with no status changes nothing"
+                .to_string(),
+        );
+    }
+
+    let doc = icebox_store(args, lib)
+        .set_plan_status(slug, status, phase, phase_status)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (done, total) = doc.phase_progress();
+    let mut response = plan_doc_json(&doc);
+    // Never auto-close a plan: whether the work is actually finished is the
+    // user's call, and a plan that closes itself is a plan that cannot be
+    // reopened for the thing everyone forgot.
+    if total > 0 && done == total && !doc.status.is_closed() {
+        response["hint"] = serde_json::json!(
+            "every phase is done — ask the user before setting status to completed"
+        );
+    }
     Ok(response.to_string())
 }
 
@@ -1702,8 +2019,8 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "content": { "type": "string", "description": "Full content of the memory (10-10,000 chars)" },
                     "type": {
                         "type": "string",
-                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt"],
-                        "description": "Category of this memory"
+                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt", "plan", "icebox"],
+                        "description": "Category of this memory. Prefer the muninn_plan_* / muninn_icebox_* tools over saving \"plan\"/\"icebox\" directly — they own the topic-key and status conventions."
                     },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags for filtering (max 10)" },
                     "projectId": { "type": "string", "description": "Optional project this memory belongs to" },
@@ -1862,6 +2179,163 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "entryId": { "type": "string", "description": "Filter by entry ID" },
                     "prune": { "type": "boolean", "description": "Delete entries older than 7 days" },
                 },
+                "additionalProperties": false,
+            }),
+        },
+        // ── Icebox tools ───────────────────────────────────────────
+        //
+        // Icebox items are stored as memory entries but are excluded from
+        // every automatic injection path, so these tools are the only way
+        // an agent sees the backlog. That is deliberate: a deferred idea is
+        // not a fact about the code.
+        ToolInfo {
+            name: "muninn_icebox_add".into(),
+            description: "Capture a deferred idea, backlog item or piece of future work. Use when the user says \"file this\", \"add to the icebox\", \"let's do this later\", or parks an idea mid-task.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short statement of the item" },
+                    "content": { "type": "string", "description": "Why it matters and any constraints already known. Defaults to the title." },
+                    "slug": { "type": "string", "description": "Optional stable id; derived from the title otherwise" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional extra tags" },
+                    "projectId": { "type": "string", "description": "Project this item belongs to" },
+                },
+                "required": ["title"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_icebox_list".into(),
+            description: "List icebox items, optionally filtered by status. Use when the user asks what is on the backlog or what to work on next.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["open", "promoted", "dropped"], "description": "Filter by status; omit for all" },
+                    "projectId": { "type": "string", "description": "Project to scope to" },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_icebox_get".into(),
+            description: "Read one icebox item in full by slug.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Item slug, as returned by muninn_icebox_list" },
+                    "projectId": { "type": "string", "description": "Project to scope to" },
+                },
+                "required": ["slug"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_icebox_set_status".into(),
+            description: "Move an icebox item to promoted (work has started, usually as a plan) or dropped (decided against). Set promotedTo to the plan slug when promoting.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Item slug" },
+                    "status": { "type": "string", "enum": ["open", "promoted", "dropped"], "description": "New status" },
+                    "promotedTo": { "type": "string", "description": "Slug of the plan this item became" },
+                    "projectId": { "type": "string", "description": "Project to scope to" },
+                },
+                "required": ["slug", "status"],
+                "additionalProperties": false,
+            }),
+        },
+        // ── Plan (PRD) tools ───────────────────────────────────────
+        //
+        // Like the icebox tools, these are the only route to a plan: plans
+        // are excluded from automatic injection because a plan describes
+        // work that has not happened, and stating it as context would be
+        // stating a future as a fact.
+        ToolInfo {
+            name: "muninn_plan_create".into(),
+            description: "Store a product requirements document / implementation plan. Interview the user first — do not transcribe the initial request. Split anything larger than one session into phases so progress survives a restart.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Plan title" },
+                    "slug": { "type": "string", "description": "Optional stable id; derived from the title otherwise" },
+                    "overview": { "type": "string", "description": "Problem statement and goals — the plan's summary" },
+                    "markdown": { "type": "string", "description": "Whole plan as markdown; each '## Heading' becomes a section, and a heading naming a phase ('## Phase 2 — storage') becomes a tracked phase" },
+                    "sections": {
+                        "type": "array",
+                        "description": "Sections given explicitly, instead of markdown",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "content": { "type": "string" },
+                                "phase": { "type": "number", "description": "Set when this section is executable work to track" },
+                            },
+                            "required": ["title", "content"],
+                        },
+                    },
+                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"], "description": "Initial status (default: draft)" },
+                    "projectId": { "type": "string" },
+                },
+                "required": ["title"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_plan_list".into(),
+            description: "List stored plans with their status and phase progress. Check this before starting work: a plan whose status is completed or abandoned must not be executed again.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"] },
+                    "projectId": { "type": "string" },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_plan_get".into(),
+            description: "Read a plan in full, sections in order. Call this when resuming work so already-done phases are not repeated.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "render": { "type": "boolean", "description": "Return the plan as one markdown document instead of structured sections" },
+                    "projectId": { "type": "string" },
+                },
+                "required": ["slug"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_plan_save_section".into(),
+            description: "Add or replace one section of an existing plan, leaving the rest untouched. Content longer than the entry cap is split across parts rather than truncated.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "index": { "type": "number", "description": "Section ordinal; determines reading order" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "phase": { "type": "number", "description": "Set when this section is executable work to track" },
+                    "projectId": { "type": "string" },
+                },
+                "required": ["slug", "index", "title", "content"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolInfo {
+            name: "muninn_plan_set_status".into(),
+            description: "Advance a plan or one of its phases. Set phase + phaseStatus at the start and end of each phase during execution; set status to record the plan's own state. Ask the user before marking a plan completed.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"], "description": "New plan status" },
+                    "phase": { "type": "number", "description": "Phase to move; requires phaseStatus" },
+                    "phaseStatus": { "type": "string", "enum": ["pending", "in-progress", "done"] },
+                    "projectId": { "type": "string" },
+                },
+                "required": ["slug"],
                 "additionalProperties": false,
             }),
         },
@@ -2075,6 +2549,242 @@ mod tests {
         assert!(!looks_like_storage_err("missing required field: title"));
         assert!(!looks_like_storage_err("unknown tool: muninn_foo"));
         assert!(!looks_like_storage_err("invalid UUID: not-a-uuid"));
+    }
+
+    async fn icebox_test_lib() -> MemoryLibrarian {
+        let storage =
+            std::sync::Arc::new(crate::storage::sqlite::SqliteAdapter::in_memory("test").unwrap());
+        crate::storage::MemoryStorage::initialize(&*storage)
+            .await
+            .unwrap();
+        MemoryLibrarian::new(
+            storage,
+            std::sync::Arc::new(crate::embedding::DisabledEmbeddingProvider),
+            "test",
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn icebox_tools_round_trip_through_the_response_shape() {
+        // Asserts on the JSON an MCP client actually parses, not on the
+        // store beneath it: a handler that succeeds but returns the wrong
+        // shape is indistinguishable from a broken tool at the client.
+        let lib = icebox_test_lib().await;
+
+        let added: Value = serde_json::from_str(
+            &tool_icebox_add(
+                &serde_json::json!({ "title": "Ship the soak gate", "content": "delay the tag" }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(added["status"], "saved");
+        assert_eq!(added["slug"], "ship-the-soak-gate");
+
+        let listed: Value = serde_json::from_str(
+            &tool_icebox_list(&serde_json::json!({}), &lib)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["items"][0]["status"], "open");
+
+        let got: Value = serde_json::from_str(
+            &tool_icebox_get(&serde_json::json!({ "slug": "ship-the-soak-gate" }), &lib)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["content"], "delay the tag");
+
+        let promoted: Value = serde_json::from_str(
+            &tool_icebox_set_status(
+                &serde_json::json!({
+                    "slug": "ship-the-soak-gate",
+                    "status": "promoted",
+                    "promotedTo": "soak-gate",
+                }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted["status"], "promoted");
+        assert_eq!(promoted["promotedTo"], "soak-gate");
+    }
+
+    #[tokio::test]
+    async fn icebox_tools_reject_bad_input_rather_than_guessing() {
+        let lib = icebox_test_lib().await;
+
+        assert!(tool_icebox_add(&serde_json::json!({}), &lib)
+            .await
+            .unwrap_err()
+            .contains("title"));
+        assert!(
+            tool_icebox_get(&serde_json::json!({ "slug": "nope" }), &lib)
+                .await
+                .is_err()
+        );
+        let err = tool_icebox_list(&serde_json::json!({ "status": "frozen" }), &lib)
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown status"), "{err}");
+        assert!(tool_icebox_set_status(
+            &serde_json::json!({ "slug": "nope", "status": "dropped" }),
+            &lib
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_tools_carry_a_plan_from_markdown_through_execution() {
+        let lib = icebox_test_lib().await;
+
+        let created: Value = serde_json::from_str(
+            &tool_plan_create(
+                &serde_json::json!({
+                    "title": "Soak gate",
+                    "overview": "stop tagging untested builds",
+                    "markdown": "## Context\n\ntwo same-day patches\n\n## Phase 1 — checklist\n\nwrite it\n\n## Phase 2 — skill\n\nedit it\n",
+                    "status": "approved",
+                }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["slug"], "soak-gate");
+        assert_eq!(created["sections"], 3);
+
+        let listed: Value =
+            serde_json::from_str(&tool_plan_list(&serde_json::json!({}), &lib).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["plans"][0]["phasesTotal"], 2);
+        assert_eq!(listed["plans"][0]["phasesDone"], 0);
+        assert_eq!(listed["plans"][0]["closed"], false);
+
+        let advanced: Value = serde_json::from_str(
+            &tool_plan_set_status(
+                &serde_json::json!({ "slug": "soak-gate", "phase": 1, "phaseStatus": "done" }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(advanced["phasesDone"], 1);
+        assert!(
+            advanced.get("hint").is_none(),
+            "the completion hint must not fire while work remains"
+        );
+
+        let finished: Value = serde_json::from_str(
+            &tool_plan_set_status(
+                &serde_json::json!({ "slug": "soak-gate", "phase": 2, "phaseStatus": "done" }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(finished["phasesDone"], 2);
+        assert_eq!(finished["status"], "approved", "a plan never closes itself");
+        assert!(
+            finished["hint"].as_str().unwrap().contains("ask the user"),
+            "all phases done must prompt for confirmation, not act"
+        );
+
+        let closed: Value = serde_json::from_str(
+            &tool_plan_set_status(
+                &serde_json::json!({ "slug": "soak-gate", "status": "completed" }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(closed["closed"], true);
+
+        let rendered: Value = serde_json::from_str(
+            &tool_plan_get(
+                &serde_json::json!({ "slug": "soak-gate", "render": true }),
+                &lib,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let md = rendered["markdown"].as_str().unwrap();
+        assert!(md.contains("# Soak gate"));
+        assert!(md.contains("## Phase 1 — checklist"));
+        assert!(md.contains("two same-day patches"));
+    }
+
+    #[tokio::test]
+    async fn plan_tools_reject_input_that_would_change_nothing() {
+        let lib = icebox_test_lib().await;
+        tool_plan_create(&serde_json::json!({ "title": "Real plan" }), &lib)
+            .await
+            .unwrap();
+
+        // A phase number with no phaseStatus is the shape most likely to be
+        // sent by mistake, and the one that would silently no-op.
+        let err = tool_plan_set_status(
+            &serde_json::json!({ "slug": "real-plan", "phase": 1 }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("phaseStatus"), "{err}");
+
+        assert!(tool_plan_get(&serde_json::json!({ "slug": "nope" }), &lib)
+            .await
+            .is_err());
+        let err = tool_plan_list(&serde_json::json!({ "status": "shipped" }), &lib)
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown status"), "{err}");
+        assert!(
+            tool_plan_save_section(
+                &serde_json::json!({ "slug": "real-plan", "index": 0 }),
+                &lib
+            )
+            .await
+            .is_err(),
+            "a section with no title or content must be refused"
+        );
+    }
+
+    #[test]
+    fn icebox_tools_are_declared_and_dispatchable() {
+        // A handler with no ToolInfo is invisible to clients; a ToolInfo
+        // with no dispatch arm is worse — advertised and always failing.
+        let names: Vec<String> = tool_definitions().into_iter().map(|t| t.name).collect();
+        for expected in [
+            "muninn_icebox_add",
+            "muninn_icebox_list",
+            "muninn_icebox_get",
+            "muninn_icebox_set_status",
+            "muninn_plan_create",
+            "muninn_plan_list",
+            "muninn_plan_get",
+            "muninn_plan_save_section",
+            "muninn_plan_set_status",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} is not declared in tool_definitions()"
+            );
+        }
     }
 
     #[test]

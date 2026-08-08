@@ -21,6 +21,7 @@ pub mod identity;
 pub mod librarian;
 pub mod maintenance;
 pub mod mcp;
+pub mod plans;
 pub mod protocol;
 pub mod redact;
 pub mod setup;

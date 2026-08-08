@@ -552,15 +552,16 @@ impl MemoryLibrarian {
     ) -> StorageResult<Vec<MemoryEntry>> {
         let started = std::time::Instant::now();
         // Over-fetch, then drop the types that are captured *input* rather
-        // than knowledge. Without this the arm recalls the very prompt it was
-        // triggered by — user prompts are the largest and most textually
-        // similar cohort in the corpus, and a 0.5× rank multiplier is not
-        // enough to keep them out of the top 8.
+        // than knowledge, plus the ones that describe work not yet done.
+        // Without this the arm recalls the very prompt it was triggered by —
+        // user prompts are the largest and most textually similar cohort in
+        // the corpus, and a 0.5× rank multiplier is not enough to keep them
+        // out of the top 8. See `EntryType::excluded_from_injection`.
         let entries: Vec<MemoryEntry> = self
             .fused_search_inner(prompt, limit * 3, None, project_id, None, None, false)
             .await?
             .into_iter()
-            .filter(|e| !matches!(e.entry_type, EntryType::UserPrompt | EntryType::Session))
+            .filter(|e| !e.entry_type.excluded_from_injection())
             .take(limit)
             .collect();
 
@@ -805,6 +806,21 @@ impl MemoryLibrarian {
         self.storage.get_by_topic_key(ns, topic_key).await
     }
 
+    /// Every live entry under a `topic_key` prefix, in key order.
+    ///
+    /// The read path for documents chunked across several entries — plans
+    /// and icebox items. Like `get_by_topic_key` this is a metadata lookup
+    /// and deliberately touches no access counters: assembling a document
+    /// is not a retrieval of each of its parts.
+    pub async fn list_by_topic_prefix(
+        &self,
+        project_id: Option<&str>,
+        prefix: &str,
+    ) -> StorageResult<Vec<MemoryEntry>> {
+        let ns = self.scope(None, project_id);
+        self.storage.list_by_topic_prefix(ns, prefix).await
+    }
+
     pub async fn list(&self, filters: ListFilters) -> StorageResult<Vec<MemoryEntry>> {
         let mut f = filters;
         if f.namespace.is_none() {
@@ -896,7 +912,7 @@ impl MemoryLibrarian {
             })
             .await?
             .into_iter()
-            .filter(|e| !matches!(e.entry_type, EntryType::UserPrompt | EntryType::Session))
+            .filter(|e| !e.entry_type.excluded_from_injection())
             .take(CONTEXT_ENTRY_LIMIT)
             .collect();
 
@@ -1112,6 +1128,28 @@ impl MemoryLibrarian {
             .mark_verified(id, verified_by.as_deref())
             .await?;
         // Phase 5.6.2 — verified flip is a row mutation; push it.
+        self.enqueue_outbox_for_entry(id, OutboxOp::Update).await;
+        Ok(entry)
+    }
+
+    /// Replace an entry's tags in place, keeping its id, and push the row.
+    ///
+    /// The write path for state that lives in tags — a plan's status, a
+    /// phase's progress. Re-saving through `propose` cannot do this: the
+    /// exact-duplicate guard hashes title and content only, so a tags-only
+    /// change short-circuits as `Duplicate` and the new tags are silently
+    /// discarded. Advancing a phase would then appear to succeed and change
+    /// nothing, which is the failure mode this whole feature exists to
+    /// avoid.
+    ///
+    /// Keeping the id also keeps cross-references stable: an icebox item
+    /// that names the plan it was promoted into must not acquire a new id
+    /// every time its status moves.
+    pub async fn retag(&self, id: Uuid, tags: Vec<String>) -> StorageResult<MemoryEntry> {
+        let entry = self
+            .storage
+            .update(id, serde_json::json!({ "tags": tags }))
+            .await?;
         self.enqueue_outbox_for_entry(id, OutboxOp::Update).await;
         Ok(entry)
     }
@@ -2555,6 +2593,116 @@ Here's a summary of what we did.\n\
                 .iter()
                 .any(|e| e.entry_type == EntryType::Decision),
             "the decision must survive 40 newer prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_packet_excludes_plans_and_icebox_items() {
+        let lib = test_librarian().await;
+
+        // A plan describes work that has not happened. Injected into a
+        // session packet it reads as a statement about the code, which is
+        // the same failure as a stale code graph: confident and wrong.
+        for i in 0..10 {
+            lib.propose(MemoryEntryInput {
+                title: format!("Plan section {i}"),
+                content: format!("phase {i}: rewrite the auth middleware"),
+                entry_type: EntryType::Plan,
+                topic_key: Some(format!("plan:auth:{i:02}-phase")),
+                project_id: Some("proj_a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            lib.propose(MemoryEntryInput {
+                title: format!("Icebox item {i}"),
+                content: format!("someday: refactor thing {i}"),
+                entry_type: EntryType::Icebox,
+                topic_key: Some(format!("icebox:thing-{i}")),
+                project_id: Some("proj_a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        lib.propose(MemoryEntryInput {
+            title: "Decision: bound content on the write path".into(),
+            content: "propose truncates after redaction so a secret cannot be halved".into(),
+            entry_type: EntryType::Decision,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let packet = lib.get_context(None, Some("proj_a"), 3).await.unwrap();
+
+        assert!(
+            packet
+                .recent_entries
+                .iter()
+                .all(|e| e.entry_type != EntryType::Plan && e.entry_type != EntryType::Icebox),
+            "intended future work must never reach a session packet"
+        );
+        assert!(
+            packet
+                .recent_entries
+                .iter()
+                .any(|e| e.entry_type == EntryType::Decision),
+            "the decision must survive 20 newer plan/icebox entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_excludes_plans_and_icebox_items() {
+        let lib = test_librarian().await;
+
+        // Same words as the prompt below, so relevance ranking alone would
+        // put these first — exclusion has to be by type, not by score.
+        lib.propose(MemoryEntryInput {
+            title: "Plan: sync outbox dead lettering".into(),
+            content: "phase one adds a reaper for stale outbox claims".into(),
+            entry_type: EntryType::Plan,
+            topic_key: Some("plan:outbox:00-reaper".into()),
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        lib.propose(MemoryEntryInput {
+            title: "Icebox: sync outbox dead lettering".into(),
+            content: "outbox claims can go stale and wedge the queue".into(),
+            entry_type: EntryType::Icebox,
+            topic_key: Some("icebox:outbox-dead-lettering".into()),
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        lib.propose(MemoryEntryInput {
+            title: "Bug: stale outbox claims were never released".into(),
+            content: "claim_outbox stamped claimed_at on rows coalescing then dropped".into(),
+            entry_type: EntryType::Bug,
+            project_id: Some("proj_a".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let recalled = lib
+            .recall_for_prompt("stale outbox claims dead lettering", 8, Some("proj_a"))
+            .await
+            .unwrap();
+
+        assert!(
+            recalled
+                .iter()
+                .all(|e| e.entry_type != EntryType::Plan && e.entry_type != EntryType::Icebox),
+            "recall must not serve plans or icebox items, however relevant"
+        );
+        assert!(
+            recalled.iter().any(|e| e.entry_type == EntryType::Bug),
+            "the recorded bug is what recall exists to surface"
         );
     }
 
