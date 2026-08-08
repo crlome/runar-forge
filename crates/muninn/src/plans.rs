@@ -484,12 +484,34 @@ fn section_from_entry(entry: &MemoryEntry) -> Option<PlanSection> {
     })
 }
 
+/// Does this key belong to `slug` — its meta entry or one of its sections?
+///
+/// Both halves matter. Without the exact-match arm a caller handed every
+/// `plan:` key merges one plan's sections into another; without the `:`
+/// on the section arm, `plan:auth` claims `plan:auth-flow:00-intro`,
+/// because one slug is a prefix of the other.
+fn key_belongs_to(slug: &str, key: &str) -> bool {
+    let meta = plan_meta_key(slug);
+    key == meta || key.starts_with(&format!("{meta}:"))
+}
+
 fn plan_from_entries(slug: &str, entries: &[MemoryEntry]) -> Option<PlanDocument> {
     let meta_key = plan_meta_key(slug);
     let meta = entries
         .iter()
         .find(|e| e.topic_key.as_deref() == Some(meta_key.as_str()))?;
-    let mut sections: Vec<PlanSection> = entries.iter().filter_map(section_from_entry).collect();
+    // Scope here rather than at the call sites: `list_plans` passes every
+    // `plan:` entry in the namespace, and merging their phases together
+    // made each plan report the union of all of them.
+    let mut sections: Vec<PlanSection> = entries
+        .iter()
+        .filter(|e| {
+            e.topic_key
+                .as_deref()
+                .is_some_and(|k| key_belongs_to(slug, k))
+        })
+        .filter_map(section_from_entry)
+        .collect();
     // The storage query orders by topic_key, which is already reading order;
     // sort again so a caller that assembled the slice by hand is safe too.
     sections.sort_by(|a, b| a.topic_key.cmp(&b.topic_key));
@@ -1314,6 +1336,121 @@ none
         );
         let one = plans.iter().find(|p| p.slug == "plan-one").unwrap();
         assert_eq!((one.phases_done, one.phases_total), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn one_plans_phases_never_leak_into_another() {
+        // Found by dogfooding: with two plans stored, `plan list` reported
+        // the same merged progress for both — a completed 8/8 plan read as
+        // 2/8 once a second, unstarted plan existed. `list_plans` hands
+        // every `plan:` entry to `plan_from_entries`, which collected
+        // sections without checking whose they were.
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+
+        store
+            .create_plan(
+                "First",
+                None,
+                "o",
+                &[
+                    SectionInput::phase(1, "a", "x"),
+                    SectionInput::phase(2, "b", "y"),
+                ],
+                PlanStatus::InProgress,
+            )
+            .await
+            .unwrap();
+        store
+            .create_plan(
+                "Second",
+                None,
+                "o",
+                &[
+                    SectionInput::phase(1, "c", "x"),
+                    SectionInput::phase(2, "d", "y"),
+                    SectionInput::phase(3, "e", "z"),
+                ],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+        for phase in [1, 2] {
+            store
+                .set_plan_status("first", None, Some(phase), Some(PhaseStatus::Done))
+                .await
+                .unwrap();
+        }
+
+        let plans = store.list_plans(None).await.unwrap();
+        let first = plans.iter().find(|p| p.slug == "first").unwrap();
+        let second = plans.iter().find(|p| p.slug == "second").unwrap();
+        assert_eq!(
+            (first.phases_done, first.phases_total),
+            (2, 2),
+            "a finished plan must stay finished when another plan exists"
+        );
+        assert_eq!(
+            (second.phases_done, second.phases_total),
+            (0, 3),
+            "an untouched plan must not inherit the other's completed phases"
+        );
+
+        // And the sections themselves must not be merged.
+        let doc = store.get_plan("first").await.unwrap().unwrap();
+        assert_eq!(doc.sections.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_slug_that_prefixes_another_does_not_claim_its_sections() {
+        // `plan:auth` is a prefix of `plan:auth-flow`, so a prefix query
+        // alone pulls the longer plan's sections into the shorter one.
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+
+        store
+            .create_plan(
+                "auth",
+                Some("auth"),
+                "o",
+                &[SectionInput::prose("Only mine", "x")],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+        store
+            .create_plan(
+                "auth flow",
+                Some("auth-flow"),
+                "o",
+                &[
+                    SectionInput::prose("Theirs one", "y"),
+                    SectionInput::prose("Theirs two", "z"),
+                ],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+
+        let doc = store.get_plan("auth").await.unwrap().unwrap();
+        assert_eq!(
+            doc.sections
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Only mine"],
+            "`plan:auth` must not absorb `plan:auth-flow`'s sections"
+        );
+        assert_eq!(
+            store
+                .get_plan("auth-flow")
+                .await
+                .unwrap()
+                .unwrap()
+                .sections
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
