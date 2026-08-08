@@ -1140,12 +1140,21 @@ fn check_graph_autorefresh() -> Check {
             lines.push(format!("most skipped: {reason} ({n})"));
         }
         if stats.errors > 0 {
+            let rate = stats.error_rate().unwrap_or(0);
             lines.push(format!(
-                "{} error(s), most recent: {}",
+                "{} error(s) = {rate}% of runs (kill: over {}%), most recent: {}",
                 stats.errors,
+                crate::codegraph::refresh::ERROR_RATE_KILL_PCT,
                 stats.last_error.clone().unwrap_or_default()
             ));
-            failing.push("recorded errors".to_string());
+            // A rate, not a count. These stats accumulate for the life of
+            // the file and never reset, so `errors > 0` latched on the
+            // first transient failure and could never return to green —
+            // which made the check useless precisely when it was being
+            // read as the soak's whole report.
+            if rate > crate::codegraph::refresh::ERROR_RATE_KILL_PCT {
+                failing.push(format!("error rate {rate}%"));
+            }
         }
     }
     let body = lines.join("\n     ");

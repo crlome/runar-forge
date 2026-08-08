@@ -430,7 +430,31 @@ impl RefreshStats {
         let rank = (self.durations_ms.len() * p).div_ceil(100).max(1);
         self.durations_ms.get(rank - 1).copied()
     }
+
+    /// Of the children that ran, how many failed — as a percentage.
+    ///
+    /// Deliberately a **rate**, not a count. These stats accumulate for the
+    /// life of the file and are never reset, so any check phrased as
+    /// "errors == 0" latches on the first transient failure and can never
+    /// return to green, however healthy the following thousand runs are.
+    /// One `database is locked` four days ago is not a reason to keep
+    /// reporting a fault today.
+    ///
+    /// Denominator matches `work_rate`: every child that actually ran,
+    /// which is refreshes plus skips plus errors. Debounced fires never
+    /// started work and cannot have failed.
+    pub fn error_rate(&self) -> Option<usize> {
+        let ran = self.refreshes + self.skipped.iter().map(|(_, n)| n).sum::<usize>() + self.errors;
+        (self.errors * 100).checked_div(ran)
+    }
 }
+
+/// Error-rate percentage at which auto-refresh stops being worth its place.
+///
+/// The graduation bar recorded when the soak was scheduled: "kill criteria:
+/// error rate over 5%". Named here so the doctor check and the soak runbook
+/// cannot drift apart on the number.
+pub const ERROR_RATE_KILL_PCT: usize = 5;
 
 /// Read the recorded rows.
 ///
@@ -1462,6 +1486,60 @@ mod tests {
         assert_eq!(s.percentile_ms(95), Some(5_000));
         // 5 of 6 children found work.
         assert_eq!(s.work_rate(), Some(83));
+        // 1 error out of 7 children that ran (5 refreshes + 1 skip + 1
+        // error) — well under the kill threshold, so this soak is healthy
+        // despite having a non-zero error count.
+        assert_eq!(s.error_rate(), Some(14));
+    }
+
+    #[test]
+    fn error_rate_is_a_rate_so_one_old_failure_cannot_latch() {
+        // The defect this replaced: the doctor check failed on
+        // `errors > 0`, and these stats never reset, so a single transient
+        // `database is locked` pinned the check to FAILED forever — while
+        // the soak it was supposed to report on was passing every stated
+        // criterion.
+        let healthy = RefreshStats {
+            refreshes: 450,
+            skipped: vec![("nothing changed".into(), 200)],
+            errors: 1,
+            ..Default::default()
+        };
+        assert_eq!(healthy.error_rate(), Some(0), "1 in 651 rounds to 0%");
+        assert!(
+            healthy.error_rate().unwrap() <= ERROR_RATE_KILL_PCT,
+            "a single old failure among hundreds of good runs must not fail the check"
+        );
+
+        // …but a genuinely broken hook still trips it.
+        let broken = RefreshStats {
+            refreshes: 40,
+            skipped: vec![("nothing changed".into(), 10)],
+            errors: 50,
+            ..Default::default()
+        };
+        assert_eq!(broken.error_rate(), Some(50));
+        assert!(broken.error_rate().unwrap() > ERROR_RATE_KILL_PCT);
+    }
+
+    #[test]
+    fn error_rate_ignores_debounced_fires() {
+        // Debounced fires never started a child, so they cannot have
+        // failed; counting them would dilute the rate and hide a hook that
+        // fails every time it actually runs.
+        let s = RefreshStats {
+            spawns: 2,
+            debounced: 998,
+            refreshes: 0,
+            errors: 2,
+            ..Default::default()
+        };
+        assert_eq!(s.error_rate(), Some(100));
+    }
+
+    #[test]
+    fn error_rate_is_none_when_nothing_ran() {
+        assert_eq!(RefreshStats::default().error_rate(), None);
     }
 
     /// A soak already running must not be discarded by an upgrade that adds
