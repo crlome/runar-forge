@@ -1,8 +1,9 @@
-<!-- managed by runar setup; edits will be overwritten. Remove this line to take ownership of the file. -->
 ---
 name: icebox
 description: Capture a deferred idea, backlog item or piece of future work into the project icebox, and list or promote what is already filed. Use when the user says "file this", "add to the icebox", "let's do this later", "park that", "what's on the backlog", or asks what to work on next.
 ---
+
+<!-- managed by runar setup; edits will be overwritten. Remove this line to take ownership of the file. -->
 
 # /icebox — capture now, decide later
 

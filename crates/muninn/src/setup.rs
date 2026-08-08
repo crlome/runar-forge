@@ -900,8 +900,17 @@ const SKILLS: &[(&str, &str)] = &[
     ("icebox", include_str!("../templates/icebox_skill.md")),
 ];
 
-/// First line of every skill this installs. Presence of this marker is what
-/// makes a file ours to overwrite.
+/// Marks a skill file as ours to overwrite. Matched anywhere in the file,
+/// so its position is free — and it must sit **below** the YAML
+/// frontmatter, never above it.
+///
+/// Above the frontmatter it is not a comment in a markdown file, it is the
+/// first line of the file, and the skill loader stops treating the `---`
+/// block as frontmatter at all. The observed result was the marker text
+/// itself being served as each skill's description — and the description is
+/// exactly what decides whether a skill triggers on "write a PRD". The
+/// skills installed, looked fine on disk, and silently could not be invoked
+/// for the right reasons.
 pub const SKILL_MANAGED_MARKER: &str = "<!-- managed by runar setup;";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1731,6 +1740,47 @@ mod tests {
                 "{name} must carry the marker, or the next run cannot tell it is ours"
             );
             assert!(body.contains("---"), "{name} needs skill frontmatter");
+        }
+    }
+
+    #[test]
+    fn frontmatter_comes_first_and_the_marker_sits_below_it() {
+        // Shipped the other way round once. The marker above the `---`
+        // stops the block being frontmatter at all, and the loader then
+        // served the marker text as the skill's description — which is the
+        // field that decides whether the skill ever triggers. It installed
+        // cleanly and read fine on disk; only the loaded description showed
+        // it.
+        let tmp = tempfile::tempdir().unwrap();
+        install_skills(tmp.path()).unwrap();
+
+        for name in ["prd", "icebox"] {
+            let body = fs::read_to_string(skill_path(tmp.path(), name)).unwrap();
+            let mut lines = body.lines();
+            assert_eq!(
+                lines.next(),
+                Some("---"),
+                "{name}: frontmatter must open on line 1"
+            );
+            let close = body
+                .match_indices("\n---")
+                .next()
+                .expect("frontmatter must close")
+                .0;
+            assert!(
+                body.find(SKILL_MANAGED_MARKER).unwrap() > close,
+                "{name}: the marker must sit below the frontmatter"
+            );
+            let front = &body[..close];
+            assert!(front.contains("name: "), "{name}: needs a name field");
+            assert!(
+                front.contains("description: "),
+                "{name}: needs a description — it is the trigger"
+            );
+            assert!(
+                !front.contains(SKILL_MANAGED_MARKER),
+                "{name}: the marker must not be inside the frontmatter either"
+            );
         }
     }
 

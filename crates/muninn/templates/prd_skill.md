@@ -1,8 +1,9 @@
-<!-- managed by runar setup; edits will be overwritten. Remove this line to take ownership of the file. -->
 ---
 name: prd
 description: Turn a feature request into a product requirements document through a structured interview, then store it as a plan in runar and/or a markdown file. Use when the user says "write a PRD", "plan this feature", "spec this out", "let's design X before building it", or asks to turn an icebox item into real work.
 ---
+
+<!-- managed by runar setup; edits will be overwritten. Remove this line to take ownership of the file. -->
 
 # /prd — requirements interview, then a stored plan
 
