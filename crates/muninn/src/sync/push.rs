@@ -61,6 +61,10 @@ pub struct PushSummary {
     /// Rows confirmed because a newer row for the same entry subsumed
     /// them, rather than because they were pushed.
     pub subsumed: usize,
+    /// Rows this binary could not parse, released without spending an
+    /// attempt. Non-zero means the queue holds rows written by a newer
+    /// runar than the one pushing — upgrade rather than investigate.
+    pub unparseable: usize,
 }
 
 /// Log loudly once a row has failed this many times.
@@ -222,7 +226,22 @@ pub async fn cmd_push(limit: usize, dry_run: bool) -> Result<()> {
             }
             Err(e) => {
                 summary.failures += 1;
-                if let Err(fe) = local.fail_outbox(row.id, &format!("{e}")).await {
+                // A payload this binary cannot parse is a version problem,
+                // not a data problem: release it untouched so a newer
+                // binary drains it, rather than spending an attempt that
+                // can only ever fail for this build.
+                if e.downcast_ref::<UnparseablePayload>().is_some() {
+                    summary.unparseable += 1;
+                    tracing::warn!(
+                        entry = %row.entry_id,
+                        error = %e,
+                        "outbox row is unparseable by this binary — releasing without \
+                         penalty; upgrade runar, or run `runar sync repair` if it persists"
+                    );
+                    if let Err(re) = local.release_outbox(&[row.id]).await {
+                        tracing::warn!(error = %re, "release_outbox for unparseable row failed");
+                    }
+                } else if let Err(fe) = local.fail_outbox(row.id, &format!("{e}")).await {
                     tracing::warn!(error = %fe, "fail_outbox bookkeeping failed");
                 }
                 // Release the subsumed rows too — they were claimed and
@@ -252,6 +271,13 @@ pub async fn cmd_push(limit: usize, dry_run: bool) -> Result<()> {
         "push complete: pushed={} conflicts={} failures={} subsumed={} (claimed={})",
         summary.pushed, summary.conflicts, summary.failures, summary.subsumed, summary.claimed
     );
+    if summary.unparseable > 0 {
+        println!(
+            "  {} row(s) written by a NEWER runar than this one — released unpushed, \
+             no attempts spent. Upgrade this install; they drain on the next push.",
+            summary.unparseable
+        );
+    }
 
     let health = local
         .outbox_health(attempt_cap)
@@ -296,9 +322,33 @@ fn coalesce_latest(rows: Vec<OutboxRow>) -> (Vec<OutboxRow>, HashMap<Uuid, Vec<U
     (out, subsumed)
 }
 
+/// A payload this binary cannot parse.
+///
+/// Distinct from every other push failure, and the distinction is the whole
+/// point: a remote rejection means the data is bad and retrying will not
+/// help, so burning an attempt toward the dead-letter cap is right. A local
+/// deserialize failure means **this binary is too old for a row its own
+/// machine wrote** — an upgrade fixes it, and dead-lettering it instead
+/// strands the row forever at exactly the moment it becomes pushable.
+///
+/// Observed live: 32 rows written by a build that knew `EntryType::Plan`,
+/// claimed by an auto-sync loop still running the previous release, which
+/// burned all ten attempts over four days. The current binary parses them
+/// perfectly and could never reach them.
+#[derive(Debug)]
+struct UnparseablePayload(String);
+
+impl std::fmt::Display for UnparseablePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "payload deserialize: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnparseablePayload {}
+
 async fn push_one(row: &OutboxRow, remote: &dyn MemoryStorage) -> Result<ApplyOutcome> {
     let entry: MemoryEntry = serde_json::from_value(row.row_payload.clone())
-        .map_err(|e| anyhow!("payload deserialize: {e}"))?;
+        .map_err(|e| UnparseablePayload(e.to_string()))?;
     remote
         .apply_remote_entry(entry)
         .await
@@ -323,6 +373,53 @@ mod tests {
             confirmed_at: None,
             created_at: Utc::now() - Duration::seconds(age_secs),
         }
+    }
+
+    /// The failure this classification exists for. A row carrying an entry
+    /// type this build does not know must be recognised as *unparseable*,
+    /// not as a bad payload — the two are handled oppositely, and getting
+    /// it wrong dead-lettered 32 live rows written by a newer binary on the
+    /// same machine.
+    #[tokio::test]
+    async fn an_unknown_entry_type_is_classified_as_unparseable() {
+        let entry_id = Uuid::new_v4();
+        let mut row = outbox_row(entry_id, 10);
+        // A full, otherwise-valid entry whose only unknown is the type —
+        // exactly what a newer runar writes for a variant this one lacks.
+        row.row_payload = serde_json::json!({
+            "id": entry_id.to_string(),
+            "namespace": "test",
+            "title": "A plan from a newer binary",
+            "content": "body",
+            "type": "a-type-this-build-does-not-know",
+            "tags": [],
+            "layer": 3,
+            "createdAt": Utc::now().to_rfc3339(),
+            "updatedAt": Utc::now().to_rfc3339(),
+        });
+
+        let err = serde_json::from_value::<MemoryEntry>(row.row_payload.clone())
+            .map_err(|e| anyhow::Error::new(UnparseablePayload(e.to_string())))
+            .expect_err("an unknown entry type must not deserialize");
+
+        assert!(
+            err.downcast_ref::<UnparseablePayload>().is_some(),
+            "must be classified as unparseable so the row is released \
+             without spending an attempt, not dead-lettered: {err}"
+        );
+        assert!(
+            err.to_string().contains("payload deserialize"),
+            "the operator-facing message must still name the cause: {err}"
+        );
+    }
+
+    /// The other half of the contract: a genuine apply failure must NOT be
+    /// classified as unparseable, or a truly bad row would retry forever
+    /// instead of dead-lettering.
+    #[test]
+    fn a_remote_rejection_is_not_treated_as_unparseable() {
+        let err = anyhow!("apply_remote_entry: [23505] duplicate key value");
+        assert!(err.downcast_ref::<UnparseablePayload>().is_none());
     }
 
     #[test]
