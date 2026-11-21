@@ -352,10 +352,11 @@ pub fn scrub(text: &mut String) -> usize {
     total
 }
 
-/// Elide the input from a panic message. std's message for a failed str
-/// slice quotes up to 256 bytes of the string being cut, after ` of `` or
-/// ` when slicing ``; the message is cut there. Every message is capped at
-/// 300 chars. No regex, because this runs inside the panic hook.
+/// Elide the input from a panic message. On Rust 1.94 (not on 1.100),
+/// std's message for a failed str slice quotes up to 256 bytes of the
+/// string being cut, after ` of `` or ` when slicing ``; the message is cut
+/// there. Every message is capped at 300 chars. No regex, because this runs
+/// inside the panic hook.
 pub fn elide_panic_input(msg: &str) -> String {
     for subject in [" of `", " when slicing `"] {
         if let Some(head) = msg

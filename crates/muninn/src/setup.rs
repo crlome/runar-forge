@@ -36,6 +36,7 @@ pub fn runar_dir() -> PathBuf {
 // every local account. Unix only: Windows profiles are per-user by ACL.
 
 /// Files in the runar directory that hold memories, credentials or logs.
+#[cfg(unix)]
 const PRIVATE_FILES: &[&str] = &[
     ".env",
     "memory.db",

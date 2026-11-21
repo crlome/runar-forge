@@ -133,10 +133,13 @@ pub fn count_hook_panics() -> (usize, Option<String>) {
 }
 
 /// Replace std's panic hook for the whole process. std's message for a
-/// failed str slice quotes up to 256 bytes of the text being cut, and hook
+/// failed str slice quotes up to 256 bytes of the text being cut on Rust
+/// 1.94 (not on 1.100), and a binary built with such a toolchain keeps
+/// doing it. Hook
 /// stderr is appended to `hook.log` (the MCP server's stderr reaches the
 /// client's log), so a text-slicing bug wrote user text, private blocks
-/// included, into both. Call first thing in `main`.
+/// included, into both. Any other panic payload can carry input too.
+/// Call first thing in `main`.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let payload = info
@@ -221,18 +224,32 @@ mod tests {
         *payload.downcast::<String>().expect("a formatted message")
     }
 
+    /// std's messages for a bad str slice as Rust 1.94 prints them: they
+    /// quote up to 256 bytes of the string being cut. A binary built with
+    /// such a toolchain (a local `cargo install`) still prints them; Rust
+    /// 1.100 prints `(bytes 0..2 of string)` and quotes nothing.
+    const OLDER_STD_SLICE_MESSAGES: &[&str] = &[
+        "byte index 1 is not a char boundary; it is inside '\u{0130}' (bytes 0..2) of `\u{0130}<private>SENTINEL-P</private>`",
+        "begin <= end (4 <= 2) when slicing `\u{0130}<private>SENTINEL-P</private>`",
+        "byte index 99 is out of bounds of `\u{0130}<private>SENTINEL-P</private>`[...]",
+    ];
+
     #[test]
     fn render_panic_elides_the_sliced_text() {
-        let raw = std_slice_panic_message("\u{0130}<private>SENTINEL-P</private>", 1);
-        // Positive control: std quotes the text it was cutting.
-        assert!(raw.contains("SENTINEL-P"), "{raw}");
+        for raw in OLDER_STD_SLICE_MESSAGES {
+            let report = render_panic("main", "src/redact.rs:34:5", raw);
+            assert!(!report.contains("SENTINEL-P"), "{report}");
+            assert!(report.ends_with("<input elided>`"), "{report}");
+            // The line doctor and the release soak count.
+            assert!(report.starts_with("thread 'main' panicked at src/redact.rs:34:5:"));
+        }
 
-        let report = render_panic("main", "src/redact.rs:34:5", &raw);
+        // Whatever this toolchain's std prints for a real bad slice, the
+        // report carries none of the text and keeps the diagnosis.
+        let real = std_slice_panic_message("\u{0130}<private>SENTINEL-P</private>", 1);
+        let report = render_panic("main", "src/redact.rs:34:5", &real);
         assert!(!report.contains("SENTINEL-P"), "{report}");
         assert!(report.contains("is not a char boundary"), "{report}");
-        assert!(report.ends_with("<input elided>`"), "{report}");
-        // The line doctor and the release soak count.
-        assert!(report.starts_with("thread 'main' panicked at src/redact.rs:34:5:"));
     }
 
     #[test]
