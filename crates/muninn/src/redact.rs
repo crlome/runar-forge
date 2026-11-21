@@ -19,6 +19,12 @@ pub fn strip_private(input: &str) -> (String, usize) {
     strip_blocks(input, "[redacted]")
 }
 
+/// [`strip_private`] for text used as a search query. Each block becomes a
+/// space, so the query never searches for the word "redacted".
+pub fn strip_private_for_query(input: &str) -> String {
+    strip_blocks(input, " ").0
+}
+
 /// Replace each private block with `marker`.
 ///
 /// Tags are found in an ASCII-lowercased copy. ASCII folding never changes

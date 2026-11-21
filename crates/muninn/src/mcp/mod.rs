@@ -490,12 +490,23 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Derive the fallback key from the REDACTED title, or a secret pasted
-    // into the title survives inside topic_key after propose scrubs the
-    // title itself.
+    // Derive the fallback key from the CLEANED title: private blocks out
+    // first, as in propose, then secrets. Otherwise either survives inside
+    // topic_key after propose cleans the title itself. A title that held a
+    // private block also gets a short hash of the public title and content,
+    // so two notes whose titles differ only inside their private blocks do
+    // not share a key and replace each other.
     let effective_topic_key = topic_key.unwrap_or_else(|| {
-        let (clean_title, _) = crate::redact::redact_secrets(&title);
-        suggest_topic_key(entry_type.as_str(), &clean_title)
+        let (public_title, blocks) = crate::redact::strip_private(&title);
+        let (clean_title, _) = crate::redact::redact_secrets(&public_title);
+        let key = suggest_topic_key(entry_type.as_str(), &clean_title);
+        if blocks == 0 {
+            return key;
+        }
+        let (public_content, _) = crate::redact::strip_private(&content);
+        let (clean_content, _) = crate::redact::redact_secrets(&public_content);
+        let hash = crate::storage::content_hash(&clean_title, &clean_content);
+        format!("{key}-{}", hash.chars().take(8).collect::<String>())
     });
 
     let confidence = resolve_confidence(args.get("confidence"));
@@ -2549,6 +2560,40 @@ mod tests {
         assert!(!looks_like_storage_err("missing required field: title"));
         assert!(!looks_like_storage_err("unknown tool: muninn_foo"));
         assert!(!looks_like_storage_err("invalid UUID: not-a-uuid"));
+    }
+
+    /// The fallback key was derived from a title that kept its private
+    /// words (`note:privateacme-mergerprivate-roadmap`), and propose cannot
+    /// clean a key: the tags are gone by then.
+    #[tokio::test]
+    async fn save_never_derives_a_topic_key_from_private_text() {
+        let lib = icebox_test_lib().await;
+        let mut saved = Vec::new();
+        for (title, content) in [
+            ("<private>acme merger</private> roadmap", "plan A"),
+            ("<private>other co</private> roadmap", "plan B"),
+        ] {
+            let response = tool_save(
+                &serde_json::json!({ "title": title, "content": content }),
+                &lib,
+            )
+            .await
+            .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            let key = response["entry"]["topicKey"].as_str().unwrap().to_string();
+            let id: Uuid = response["entry"]["id"].as_str().unwrap().parse().unwrap();
+            assert!(key.starts_with("note:redacted-roadmap-"), "{key}");
+            assert!(!key.contains("acme") && !key.contains("other"), "{key}");
+            saved.push((id, key));
+        }
+        assert_ne!(
+            saved[0].1, saved[1].1,
+            "distinct public text, distinct keys"
+        );
+        for (id, key) in saved {
+            let stored = lib.get(id).await.expect("neither note replaced the other");
+            assert_eq!(stored.topic_key.as_deref(), Some(key.as_str()));
+        }
     }
 
     async fn icebox_test_lib() -> MemoryLibrarian {

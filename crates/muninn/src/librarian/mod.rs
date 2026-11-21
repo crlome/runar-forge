@@ -561,6 +561,13 @@ impl MemoryLibrarian {
         project_id: Option<&str>,
     ) -> StorageResult<Vec<MemoryEntry>> {
         let started = std::time::Instant::now();
+        // Private words must not steer recall, and the prompt reaches the FTS
+        // query, the embeddings API and the debug log from here. A prompt
+        // that was only a private block recalls nothing.
+        let prompt = crate::redact::strip_private_for_query(prompt);
+        if prompt.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         // Over-fetch, then drop the types that are captured *input* rather
         // than knowledge, plus the ones that describe work not yet done.
         // Without this the arm recalls the very prompt it was triggered by —
@@ -568,7 +575,7 @@ impl MemoryLibrarian {
         // the corpus, and a 0.5× rank multiplier is not enough to keep them
         // out of the top 8. See `EntryType::excluded_from_injection`.
         let entries: Vec<MemoryEntry> = self
-            .fused_search_inner(prompt, limit * 3, None, project_id, None, None, false)
+            .fused_search_inner(&prompt, limit * 3, None, project_id, None, None, false)
             .await?
             .into_iter()
             .filter(|e| !e.entry_type.excluded_from_injection())
@@ -739,16 +746,18 @@ impl MemoryLibrarian {
 
         if self.debug_enabled {
             let duration_ms = search_started.elapsed().as_secs_f64() * 1000.0;
+            // Cleaned: debug_log is not namespace-scoped, and agents paste
+            // user text into search queries. Clean while n=3 is not a
+            // guarantee.
+            let mut logged_query = query.to_string();
+            crate::redact::scrub_all(&mut logged_query);
             crate::debug::log(
                 &self.storage,
                 DebugLogInput {
                     event: DebugEvent::SearchScoring,
                     entry_id: None,
                     data: serde_json::json!({
-                        // Redacted: debug_log is not namespace-scoped, and
-                        // automatic recall now puts whole user prompts through
-                        // this path. Clean while n=3 is not a guarantee.
-                        "query": crate::redact::redact_secrets(query).0,
+                        "query": logged_query,
                         "namespace": ns,
                         "projectId": project_id,
                         "semanticCount": semantic_ranks.len(),
@@ -793,7 +802,14 @@ impl MemoryLibrarian {
         if !self.embedding.is_available() {
             return Ok(vec![]);
         }
-        match self.embedding.embed(query).await {
+        // The embed call is where a query leaves the machine, so private
+        // blocks are stripped here for every caller, including agent-written
+        // muninn_search and curator_ask queries. The FTS arm is local.
+        let query = crate::redact::strip_private_for_query(query);
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        match self.embedding.embed(&query).await {
             Some(embedding) => self.storage.semantic_search(&embedding, filters).await,
             None => Ok(vec![]),
         }
@@ -1644,6 +1660,102 @@ mod tests {
             "the tombstone must carry deleted_at, or the remote resolver \
              treats it as a live entry and the deletion never propagates"
         );
+    }
+
+    async fn recording_librarian() -> (
+        MemoryLibrarian,
+        Arc<crate::test_support::RecordingEmbeddings>,
+    ) {
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let recorder = Arc::new(crate::test_support::RecordingEmbeddings::default());
+        let lib = MemoryLibrarian::new(storage, recorder.clone(), "test", None);
+        (lib, recorder)
+    }
+
+    /// Recall searched with the raw prompt on every UserPromptSubmit, and
+    /// with embeddings on, that prompt went to the embeddings API.
+    #[tokio::test]
+    async fn recall_never_sends_private_text_to_the_embedder() {
+        let (lib, recorder) = recording_librarian().await;
+        lib.recall_for_prompt("why is <private>SENTINEL-R</private> slow", 8, Some("p"))
+            .await
+            .unwrap();
+        let sent = recorder.inputs();
+        assert!(!sent.is_empty(), "the public words are still embedded");
+        assert!(sent.iter().all(|s| !s.contains("SENTINEL")), "{sent:?}");
+
+        // A prompt that is only a private block recalls and embeds nothing.
+        let hits = lib
+            .recall_for_prompt("<private>SENTINEL-B</private>", 8, Some("p"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(recorder.inputs().len(), sent.len(), "no embed call");
+
+        // Private words do not steer recall's keyword arm either: an entry
+        // that matches only them is not recalled.
+        lib.propose(MemoryEntryInput {
+            title: "zebra crossing".into(),
+            content: "striped".into(),
+            project_id: Some("p".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let hits = lib
+            .recall_for_prompt("<private>zebra</private> lunch plans", 8, Some("p"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "recalled by a private word: {hits:?}");
+    }
+
+    /// Agent-written queries (muninn_search, curator_ask) reach the same
+    /// embed call.
+    #[tokio::test]
+    async fn search_never_sends_private_text_to_the_embedder() {
+        let (lib, recorder) = recording_librarian().await;
+        lib.search(
+            "<private>SENTINEL-Q</private> cache misses",
+            5,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sent = recorder.inputs();
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|s| !s.contains("SENTINEL")), "{sent:?}");
+    }
+
+    /// The RUNAR_DEBUG log stored queries with secrets redacted but
+    /// private blocks intact.
+    #[tokio::test]
+    async fn debug_log_query_has_no_private_text() {
+        let lib = test_librarian().await.with_debug(true);
+        lib.search(
+            "<private>SENTINEL-D</private> cache",
+            10,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let rows = lib
+            .query_debug_log(DebugLogQuery {
+                event: Some(DebugEvent::SearchScoring),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert!(!row.data.to_string().contains("SENTINEL"), "{}", row.data);
+        }
     }
 
     /// Session text bypasses `propose`, and every path into the sessions

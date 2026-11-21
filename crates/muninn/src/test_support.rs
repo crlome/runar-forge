@@ -146,6 +146,38 @@ impl crate::embedding::EmbeddingProvider for FixedEmbeddings {
     }
 }
 
+/// An available embedder that records every input and returns no vector,
+/// so callers fall back to keyword search: what an embeddings API would
+/// have been sent.
+#[derive(Default)]
+pub(crate) struct RecordingEmbeddings(pub std::sync::Mutex<Vec<String>>);
+
+impl RecordingEmbeddings {
+    pub(crate) fn inputs(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::embedding::EmbeddingProvider for RecordingEmbeddings {
+    fn name(&self) -> &str {
+        "recording"
+    }
+    fn dimensions(&self) -> usize {
+        4
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        self.0.lock().unwrap().push(text.to_string());
+        None
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
 /// The session-text scenario shared by the SQLite and live-Postgres tests:
 /// every session write path drops private blocks before storage. `project`
 /// must be unique to the test on a shared database.
