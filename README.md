@@ -89,8 +89,10 @@ questions by assembling context from memory.
   schema, migrations, FTS parity, sync state, hook log, code-graph coverage
   and freshness, and the auto-refresh record. A degraded subsystem is
   reported as skipped with the reason and the fix, never as a silent pass.
-- **Self-update.** `runar update --check|--rollback` fetches signed
-  release manifests; previous binary preserved at `runar.previous`.
+- **Self-update.** `runar update --check|--rollback` fetches the release
+  manifest and binary over HTTPS and checks the binary's SHA-256 against
+  the manifest (the manifest itself is not signed); previous binary
+  preserved at `runar.previous`.
 
 ---
 
