@@ -3040,6 +3040,86 @@ mod tests {
         }
     }
 
+    fn section_titles(doc: &Value) -> Vec<String> {
+        doc["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["title"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn plan(lib: &MemoryLibrarian, slug: &str) -> Value {
+        call(tool_plan_get(&serde_json::json!({ "slug": slug }), lib))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inserting_a_section_keeps_every_later_section() {
+        let lib = icebox_test_lib().await;
+        let md = "## Context\n\nc\n\n## Phase 1 — a\n\na\n\n## Phase 2 — b\n\nb\n";
+        create_md(&lib, "Ship", "ship", md).await;
+        let with_risks = md.replace("## Phase 1", "## Risks\n\nr\n\n## Phase 1");
+        create_md(&lib, "Ship", "ship", &with_risks).await;
+
+        let doc = plan(&lib, "ship").await;
+        assert_eq!(
+            section_titles(&doc),
+            ["Context", "Risks", "Phase 1 — a", "Phase 2 — b"]
+        );
+        assert_eq!(doc["phasesTotal"], 2);
+    }
+
+    #[tokio::test]
+    async fn removing_a_section_keeps_the_ones_after_it() {
+        let lib = icebox_test_lib().await;
+        let md = "## Context\n\nc\n\n## Risks\n\nr\n\n## Phase 1 — a\n\na\n\n## Phase 2 — b\n\nb\n";
+        create_md(&lib, "Ship", "ship", md).await;
+        create_md(&lib, "Ship", "ship", &md.replace("## Risks\n\nr\n\n", "")).await;
+
+        assert_eq!(
+            section_titles(&plan(&lib, "ship").await),
+            ["Context", "Phase 1 — a", "Phase 2 — b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_plans_can_share_an_identical_section() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "One", "one", "## Risks\n\nNone.\n").await;
+        create_md(&lib, "Two", "two", "## Risks\n\nNone.\n").await;
+        assert_eq!(section_titles(&plan(&lib, "two").await), ["Risks"]);
+        assert_eq!(section_titles(&plan(&lib, "one").await), ["Risks"]);
+    }
+
+    #[tokio::test]
+    async fn two_plans_can_share_a_title_and_overview() {
+        let lib = icebox_test_lib().await;
+        for slug in ["x", "x-v2"] {
+            call(tool_plan_create(
+                &serde_json::json!({ "title": "X", "slug": slug, "overview": "o" }),
+                &lib,
+            ))
+            .await
+            .unwrap();
+        }
+        let listed = call(tool_plan_list(&serde_json::json!({}), &lib))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 2, "{listed}");
+        plan(&lib, "x-v2").await;
+    }
+
+    #[tokio::test]
+    async fn a_plan_created_over_a_legacy_decision_keeps_the_decision() {
+        let lib = icebox_test_lib().await;
+        let decision = propose_decision(&lib, "Use JWT", "stateless tokens", "plan:auth").await;
+        create_md(&lib, "Auth", "auth", "## Phase 1 — a\n\nx\n").await;
+        lib.get(decision).await.expect("the decision stays live");
+        assert_eq!(plan(&lib, "auth").await["title"], "Auth");
+    }
+
     #[tokio::test]
     async fn muninn_save_refuses_the_plan_stores_types() {
         let lib = icebox_test_lib().await;

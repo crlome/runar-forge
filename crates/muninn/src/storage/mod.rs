@@ -5,11 +5,11 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::types::{
-    ApplyOutcome, DebugLogEntry, DebugLogInput, DebugLogQuery, DuplicateCluster, GlobalStats,
-    ListFilters, MemoryEdge, MemoryEdgeInput, MemoryEntry, MemoryEntryInput, MemoryStats,
-    MergeCounts, ObservationInput, OutboxHealth, OutboxInput, OutboxRow, PendingObservation,
-    SaveResult, SearchQuery, Session, SessionInput, SessionUpdate, SyncConflict, SyncState,
-    UnsendableRow,
+    ApplyOutcome, DebugLogEntry, DebugLogInput, DebugLogQuery, DuplicateCluster, EntryType,
+    GlobalStats, ListFilters, MemoryEdge, MemoryEdgeInput, MemoryEntry, MemoryEntryInput,
+    MemoryStats, MergeCounts, ObservationInput, OutboxHealth, OutboxInput, OutboxRow,
+    PendingObservation, SaveResult, SearchQuery, Session, SessionInput, SessionUpdate,
+    SyncConflict, SyncState, UnsendableRow,
 };
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -30,6 +30,37 @@ pub fn content_hash(title: &str, content: &str) -> String {
     hasher.update(b"\n");
     hasher.update(normalize(content).as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Entry types addressed by their topic key rather than their content.
+///
+/// For every other type the write-time duplicate guard matches any live
+/// row in the namespace with the same `content_hash`, whatever its key —
+/// right for notes, and wrong for documents the plan store keeps as one
+/// entry per key: an unchanged section that moved to a new index deduped
+/// onto its old row under its old key (which the plan's stale pass then
+/// retired), and the same section in a second plan was never written. For
+/// these types, when the entry carries a non-empty key, identity is
+/// `(namespace, topic_key, type)`:
+///
+/// - the duplicate guard matches only a live row with the same key and type;
+/// - the topic-key supersede replaces only a live row of the same type;
+/// - `find_duplicate_clusters` never returns them.
+///
+/// Both adapters implement this contract and both are tested against it.
+pub const KEY_ADDRESSED_TYPES: [EntryType; 2] = [EntryType::Plan, EntryType::Icebox];
+
+pub fn is_key_addressed(t: EntryType) -> bool {
+    KEY_ADDRESSED_TYPES.contains(&t)
+}
+
+/// `'plan', 'icebox'`, for an SQL `IN (...)` list.
+pub fn key_addressed_types_sql() -> String {
+    KEY_ADDRESSED_TYPES
+        .iter()
+        .map(|t| format!("'{}'", t.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Escape the LIKE wildcards in a literal prefix, for use with
@@ -251,6 +282,8 @@ pub trait MemoryStorage: Send + Sync {
 
     /// Live rows sharing a `(namespace, content_hash)` value, grouped into
     /// clusters of 2+ members. `namespace = None` scans all namespaces.
+    /// Keyed rows of `KEY_ADDRESSED_TYPES` are excluded: their identity is
+    /// their key, so equal content in two of them is not a duplicate.
     async fn find_duplicate_clusters(
         &self,
         namespace: Option<&str>,

@@ -1167,6 +1167,50 @@ pub(crate) mod parity {
             .set_plan_status("missing", Some(PlanStatus::Completed), None, None)
             .await
             .is_err());
+
+        // Re-create auth-flow with a section inserted first: every later
+        // section moves to a new index and must still be there.
+        store
+            .create_plan(
+                "auth flow",
+                Some(auth_flow),
+                "the longer slug",
+                &[
+                    SectionInput::prose("Context", "why auth-flow exists"),
+                    SectionInput::phase(1, "Phase 1 — tokens", "issue tokens"),
+                    SectionInput::prose("Notes", "auth-flow's own notes"),
+                ],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+        // A third plan holding a section identical to one of auth-flow's.
+        store
+            .create_plan(
+                "other",
+                Some("other"),
+                "a third plan",
+                &[SectionInput::prose("Notes", "auth-flow's own notes")],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+
+        let flow = store.get_plan(auth_flow).await.unwrap().unwrap();
+        assert_eq!(
+            flow.sections
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Context", "Phase 1 — tokens", "Notes"]
+        );
+        let other = store.get_plan("other").await.unwrap().unwrap();
+        assert_eq!(
+            other.sections.len(),
+            1,
+            "an identical section is still its own"
+        );
+        assert_eq!(store.list_plans(None).await.unwrap().len(), 3);
     }
 }
 
@@ -2097,6 +2141,19 @@ none
         ] {
             assert!(check_generic_save(t, key).is_ok(), "{t:?} {key:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn two_icebox_items_may_share_a_title_and_description() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        for slug in ["one", "two"] {
+            store
+                .add_icebox("Same idea", "same reason", Some(slug), &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list_icebox(None).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

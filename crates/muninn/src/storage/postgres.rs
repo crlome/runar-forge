@@ -440,16 +440,36 @@ impl MemoryStorage for PostgresAdapter {
         // Exact-duplicate guard: identical content in the same namespace
         // short-circuits before the topic_key branch, so an unchanged
         // recrawl never soft-deletes-and-reinserts its own predecessor.
+        //
+        // Plan and icebox rows with a key are matched within their key and
+        // type instead (contract on `storage::KEY_ADDRESSED_TYPES`); every
+        // other write keeps the namespace-wide guard and its exact SQL.
         let hash = crate::storage::content_hash(&input.title, &input.content);
-        let dup_row = client
-            .query_opt(
-                "SELECT id FROM muninn.memory_entries
-                 WHERE namespace = $1 AND content_hash = $2 AND deleted_at IS NULL
-                 LIMIT 1",
-                &[&ns, &hash],
-            )
-            .await
-            .map_err(db_err)?;
+        let addressed_key = input
+            .topic_key
+            .as_deref()
+            .filter(|k| !k.is_empty() && crate::storage::is_key_addressed(input.entry_type));
+        let dup_row = match addressed_key {
+            Some(tk) => client
+                .query_opt(
+                    "SELECT id FROM muninn.memory_entries
+                     WHERE namespace = $1 AND content_hash = $2 AND topic_key = $3
+                       AND type = $4 AND deleted_at IS NULL
+                     LIMIT 1",
+                    &[&ns, &hash, &tk, &input.entry_type.as_str()],
+                )
+                .await
+                .map_err(db_err)?,
+            None => client
+                .query_opt(
+                    "SELECT id FROM muninn.memory_entries
+                     WHERE namespace = $1 AND content_hash = $2 AND deleted_at IS NULL
+                     LIMIT 1",
+                    &[&ns, &hash],
+                )
+                .await
+                .map_err(db_err)?,
+        };
         if let Some(row) = dup_row {
             let dup_id: &str = row.get("id");
             client
@@ -471,16 +491,32 @@ impl MemoryStorage for PostgresAdapter {
         // supersession response.
         let superseded = match input.topic_key.as_deref() {
             Some(tk) if !tk.is_empty() => {
-                let row_opt = client
-                    .query_opt(
-                        "SELECT id, title, created_at FROM muninn.memory_entries
-                         WHERE namespace = $1 AND topic_key = $2 AND deleted_at IS NULL
-                         ORDER BY created_at DESC
-                         LIMIT 1",
-                        &[&ns, &tk],
-                    )
-                    .await
-                    .map_err(db_err)?;
+                // A plan or icebox write replaces only its own type: a
+                // legacy decision filed at the same key stays live.
+                let row_opt = if addressed_key.is_some() {
+                    client
+                        .query_opt(
+                            "SELECT id, title, created_at FROM muninn.memory_entries
+                             WHERE namespace = $1 AND topic_key = $2 AND type = $3
+                               AND deleted_at IS NULL
+                             ORDER BY created_at DESC
+                             LIMIT 1",
+                            &[&ns, &tk, &input.entry_type.as_str()],
+                        )
+                        .await
+                        .map_err(db_err)?
+                } else {
+                    client
+                        .query_opt(
+                            "SELECT id, title, created_at FROM muninn.memory_entries
+                             WHERE namespace = $1 AND topic_key = $2 AND deleted_at IS NULL
+                             ORDER BY created_at DESC
+                             LIMIT 1",
+                            &[&ns, &tk],
+                        )
+                        .await
+                        .map_err(db_err)?
+                };
 
                 if let Some(row) = row_opt {
                     let old_id_str: &str = row.get("id");
@@ -1784,14 +1820,19 @@ impl MemoryStorage for PostgresAdapter {
         } else {
             ""
         };
+        // Keyed plan and icebox rows are never duplicates of each other:
+        // the same rule as the write-time guard (`KEY_ADDRESSED_TYPES`).
+        let keyed = crate::storage::key_addressed_types_sql();
         let sql = format!(
             "SELECT e.content_hash, e.id, e.namespace, e.title, e.access_count, e.verified, e.created_at
              FROM muninn.memory_entries e
              JOIN (SELECT namespace, content_hash FROM muninn.memory_entries
                    WHERE deleted_at IS NULL AND content_hash IS NOT NULL{ns_clause}
+                     AND NOT (type IN ({keyed}) AND COALESCE(topic_key, '') <> '')
                    GROUP BY namespace, content_hash HAVING COUNT(*) > 1) d
                ON e.namespace = d.namespace AND e.content_hash = d.content_hash
              WHERE e.deleted_at IS NULL
+               AND NOT (e.type IN ({keyed}) AND COALESCE(e.topic_key, '') <> '')
              ORDER BY e.namespace, e.content_hash, e.access_count DESC, e.created_at DESC"
         );
         let rows = if let Some(ref ns) = ns_owned {
@@ -2866,6 +2907,126 @@ mod tests {
             let other = format!("{namespace}-other");
             crate::test_support::context_packet_names_no_other_namespace(&lib, &namespace, &other)
                 .await;
+        }
+    );
+
+    fn keyed(t: EntryType, title: &str, content: &str, key: &str) -> MemoryEntryInput {
+        MemoryEntryInput {
+            title: title.into(),
+            content: content.into(),
+            entry_type: t,
+            topic_key: Some(key.into()),
+            ..Default::default()
+        }
+    }
+
+    pg_test!(
+        pg_plan_entries_dedup_only_within_their_own_key,
+        "plan-dedup",
+        |adapter, namespace| {
+            let save =
+                |key: &str| adapter.save(keyed(EntryType::Plan, "Risks", "None.", key), &namespace);
+            let a = save("plan:a:01-risks").await.unwrap();
+            let b = save("plan:b:01-risks").await.unwrap();
+            let again = save("plan:a:01-risks").await.unwrap();
+            assert_eq!(b.action, SaveAction::Created);
+            assert_ne!(a.id, b.id);
+            adapter.get(a.id).await.unwrap();
+            adapter.get(b.id).await.unwrap();
+            assert_eq!(again.action, SaveAction::Duplicate);
+            assert_eq!(again.id, a.id);
+        }
+    );
+
+    pg_test!(
+        pg_a_plan_write_never_supersedes_another_type,
+        "plan-supersede",
+        |adapter, namespace| {
+            let decision = adapter
+                .save(
+                    keyed(EntryType::Decision, "Use JWT", "stateless", "plan:c"),
+                    &namespace,
+                )
+                .await
+                .unwrap();
+            let plan = adapter
+                .save(
+                    keyed(EntryType::Plan, "C", "the plan", "plan:c"),
+                    &namespace,
+                )
+                .await
+                .unwrap();
+            assert!(plan.superseded.is_none());
+            adapter
+                .get(decision.id)
+                .await
+                .expect("the decision stays live");
+            adapter.get(plan.id).await.unwrap();
+        }
+    );
+
+    pg_test!(
+        pg_other_types_keep_namespace_wide_dedup,
+        "plan-other-dedup",
+        |adapter, namespace| {
+            let first = adapter
+                .save(
+                    keyed(EntryType::Decision, "Same", "same body", "decision:x"),
+                    &namespace,
+                )
+                .await
+                .unwrap();
+            let second = adapter
+                .save(
+                    keyed(EntryType::Decision, "Same", "same body", "decision:y"),
+                    &namespace,
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.action, SaveAction::Duplicate);
+            assert_eq!(second.id, first.id);
+        }
+    );
+
+    pg_test!(
+        pg_dedup_clusters_skip_plan_and_icebox_rows,
+        "plan-clusters",
+        |adapter, namespace| {
+            let mut notes = Vec::new();
+            for (i, (t, key)) in [
+                (EntryType::Plan, "plan:a:00-x"),
+                (EntryType::Plan, "plan:b:00-x"),
+                (EntryType::Note, "note:a"),
+                (EntryType::Note, "note:b"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let saved = adapter
+                    .save(
+                        keyed(t, "X", &format!("distinct body {i}"), key),
+                        &namespace,
+                    )
+                    .await
+                    .unwrap();
+                // Equal content after the write, as a legacy corpus has it.
+                adapter
+                    .update(
+                        saved.id,
+                        serde_json::json!({"title": "X", "content": "same body"}),
+                    )
+                    .await
+                    .unwrap();
+                if t == EntryType::Note {
+                    notes.push(saved.id);
+                }
+            }
+            let clusters = adapter
+                .find_duplicate_clusters(Some(&namespace))
+                .await
+                .unwrap();
+            assert_eq!(clusters.len(), 1, "only the notes cluster: {clusters:?}");
+            assert!(clusters[0].entries.iter().all(|m| notes.contains(&m.id)));
         }
     );
 

@@ -128,6 +128,9 @@ pub struct DedupReport {
 /// Pass 2: cluster live rows on (namespace, content_hash); keep the most
 /// valuable member (highest access_count, then verified, then newest) and
 /// soft-delete the rest — recoverable until `runar gc --hard` purges them.
+///
+/// Keyed plan and icebox rows are never clustered (see
+/// `storage::KEY_ADDRESSED_TYPES`): two plans may hold the same section.
 pub async fn run_dedup(
     lib: &MemoryLibrarian,
     project: Option<&str>,
@@ -357,6 +360,44 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty(), "redacted secret must leave the index");
+    }
+
+    /// Two plans may hold an identical section (each is addressed by its
+    /// own key); `runar dedup` must never merge them.
+    #[tokio::test]
+    async fn runar_dedup_never_merges_plan_sections() {
+        let lib = lib().await;
+        let mut ids = Vec::new();
+        for (key, body) in [
+            ("plan:a:00-x", "first body"),
+            ("plan:b:00-x", "second body"),
+        ] {
+            let r = lib
+                .propose(MemoryEntryInput {
+                    title: "X".into(),
+                    content: body.into(),
+                    entry_type: EntryType::Plan,
+                    topic_key: Some(key.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            ids.push(r.id);
+        }
+        for id in &ids {
+            lib.update_entry(
+                *id,
+                serde_json::json!({"title": "X", "content": "same body"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let report = run_dedup(&lib, None, false, false).await.unwrap();
+        assert_eq!(report.soft_deleted, 0);
+        for id in ids {
+            lib.get(id).await.expect("both plans keep their section");
+        }
     }
 
     #[tokio::test]
