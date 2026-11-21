@@ -3484,6 +3484,75 @@ mod tests {
             .is_err());
     }
 
+    /// Every tool count, family count and catalogue the docs print must
+    /// match what the server declares. Four documents gave four different
+    /// totals (23, 25, 28) for a server with 37 tools, and none listed the
+    /// plan and icebox tools.
+    #[test]
+    fn docs_list_every_tool_with_the_true_counts() {
+        let names: Vec<String> = tool_definitions().into_iter().map(|t| t.name).collect();
+        let family = |f: &str| {
+            names
+                .iter()
+                .filter(|n| n.starts_with(&format!("{f}_")))
+                .count()
+        };
+        let counts = [
+            ("muninn", family("muninn")),
+            ("huginn", family("huginn")),
+            ("curator", family("curator")),
+        ];
+        assert_eq!(counts.iter().map(|(_, n)| n).sum::<usize>(), names.len());
+
+        let docs = [
+            ("README.md", include_str!("../../../../README.md")),
+            (
+                "docs/INSTALLATION-GUIDE.md",
+                include_str!("../../../../docs/INSTALLATION-GUIDE.md"),
+            ),
+            (
+                "docs/HOW_TO_USE_IT.md",
+                include_str!("../../../../docs/HOW_TO_USE_IT.md"),
+            ),
+        ];
+        let total = regex::Regex::new(r"\b(\d+) tools\b").unwrap();
+        // Counts are written lowercase ("22 muninn"); only the catalogue
+        // headings are capitalised. "9 Curator questions" is not a count.
+        let per_family = regex::Regex::new(
+            r"\b(\d+) (muninn|huginn|curator)\b|`(muninn|huginn|curator)_\*` \((\d+)\)|### (?i:(muninn|huginn|curator))\b[^\n]*— (\d+) tools",
+        )
+        .unwrap();
+        for (path, text) in docs {
+            for m in total.captures_iter(text) {
+                let line = text[..m.get(0).unwrap().start()].lines().count();
+                // A family heading's "N tools" is checked below.
+                let heading = text.lines().nth(line.saturating_sub(1)).unwrap_or("");
+                if heading.starts_with("### ") {
+                    continue;
+                }
+                assert_eq!(m[1].parse::<usize>().unwrap(), names.len(), "{path}:{line}");
+            }
+            for m in per_family.captures_iter(text) {
+                let (name, n) = [(2, 1), (3, 4), (5, 6)]
+                    .into_iter()
+                    .find_map(|(f, c)| {
+                        Some((m.get(f)?.as_str().to_lowercase(), m.get(c)?.as_str()))
+                    })
+                    .unwrap();
+                let want = counts.iter().find(|(f, _)| *f == name).unwrap().1;
+                assert_eq!(n.parse::<usize>().unwrap(), want, "{path}: {}", &m[0]);
+            }
+        }
+        for (path, text) in [docs[0], docs[2]] {
+            for name in &names {
+                assert!(
+                    text.contains(&format!("`{name}`")),
+                    "{path} does not list {name}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn icebox_tools_are_declared_and_dispatchable() {
         // A handler with no ToolInfo is invisible to clients; a ToolInfo
