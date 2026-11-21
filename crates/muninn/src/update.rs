@@ -346,6 +346,172 @@ mod tests {
         assert_eq!(current_version(), env!("CARGO_PKG_VERSION"));
     }
 
+    /// Targets whose binary the build runner can execute. aarch64-linux is
+    /// cross-built, and x86_64-apple-darwin is built on an arm64 runner.
+    const RUNNABLE_TARGETS: &[&str] = &[
+        "x86_64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ];
+
+    /// Each gate stops a release that would look green while shipping
+    /// something broken: a tag whose version the binary does not report
+    /// (`run` compares the manifest version with its own by strict
+    /// equality, so `runar update` would re-offer the same binary forever),
+    /// a binary that does not start, npm packages published before the
+    /// GitHub release exists, or a missing npm token that leaves npm users
+    /// with nothing.
+    #[test]
+    fn release_pipeline_keeps_its_gates() {
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+        let mut lost: Vec<&str> = Vec::new();
+        let mut gate = |kept: bool, what: &'static str| {
+            if !kept {
+                lost.push(what);
+            }
+        };
+
+        let preflight = job_lines(workflow, "preflight");
+        gate(
+            !preflight.is_empty() && !preflight.iter().any(|l| l.starts_with("    if:")),
+            "a preflight job with no job-level `if:` (a skipped need would skip \
+             `build` on workflow_dispatch, the only dry run)",
+        );
+        let compare = step_lines(&preflight, "Tag matches the Cargo.toml version");
+        gate(
+            has(&compare, "if: startsWith(github.ref, 'refs/tags/v')")
+                && has(&compare, "GITHUB_REF_NAME")
+                && has(&compare, "Cargo.toml")
+                && has(&compare, "exit 1"),
+            "preflight fails a tag whose version differs from Cargo.toml",
+        );
+
+        let build = job_lines(workflow, "build");
+        gate(has(&build, "needs: preflight"), "build needs preflight");
+
+        let matrix = matrix_entries(&build);
+        let mut shipped: Vec<&str> = matrix.iter().map(|(t, _)| t.as_str()).collect();
+        let mut expected = RELEASE_TARGETS.to_vec();
+        shipped.sort_unstable();
+        expected.sort_unstable();
+        gate(
+            shipped == expected,
+            "the build matrix ships exactly RELEASE_TARGETS",
+        );
+        gate(
+            RUNNABLE_TARGETS
+                .iter()
+                .all(|t| matrix.iter().any(|(m, smoke)| m == t && *smoke)),
+            "`smoke: true` on every target the runner can execute",
+        );
+
+        let smoke = step_lines(&build, "Smoke the built binary");
+        gate(
+            has(&smoke, "if: matrix.smoke")
+                && has(&smoke, "--version")
+                && has(&smoke, "GITHUB_REF_NAME")
+                && has(&smoke, "exit 1"),
+            "the smoke step runs the binary and, on tags, requires the tag's version",
+        );
+        let at = |name: &str| step_position(&build, name);
+        gate(
+            matches!(
+                (at("Codesign (macOS, ad-hoc)"), at("Smoke the built binary"), at("Package")),
+                (Some(sign), Some(run), Some(pack)) if sign < run && run < pack
+            ),
+            "the smoke step runs after codesign and before packaging",
+        );
+
+        let npm = job_lines(workflow, "npm-publish");
+        gate(
+            has(&npm, "needs: [build, publish]"),
+            "npm-publish waits for the GitHub release",
+        );
+        let token_check: Vec<&str> = npm
+            .iter()
+            .skip_while(|l| !l.contains("-z \"${NODE_AUTH_TOKEN"))
+            .take_while(|l| l.trim() != "fi")
+            .copied()
+            .collect();
+        gate(
+            has(&token_check, "exit 1") && !has(&token_check, "exit 0"),
+            "a missing NPM_TOKEN fails npm-publish instead of skipping it",
+        );
+
+        assert!(
+            lost.is_empty(),
+            "release.yml lost its gates:\n- {}",
+            lost.join("\n- ")
+        );
+    }
+
+    fn has(lines: &[&str], needle: &str) -> bool {
+        lines.iter().any(|l| l.contains(needle))
+    }
+
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// One job of a workflow: its `  <name>:` key and every line up to the
+    /// next key at job level or above. Empty when the job does not exist.
+    fn job_lines<'a>(workflow: &'a str, name: &str) -> Vec<&'a str> {
+        let key = format!("  {name}:");
+        let mut lines = workflow.lines().skip_while(|l| l.trim_end() != key);
+        let Some(first) = lines.next() else {
+            return Vec::new();
+        };
+        let ends_job = |l: &&str| {
+            let text = l.trim();
+            !text.is_empty() && !text.starts_with('#') && indent(l) <= 2
+        };
+        std::iter::once(first)
+            .chain(lines.take_while(|l| !ends_job(l)))
+            .collect()
+    }
+
+    /// The step named `name` in a job: its `- name:` line and every line up
+    /// to the next step. Empty when the step does not exist.
+    fn step_lines<'a>(job: &[&'a str], name: &str) -> Vec<&'a str> {
+        let header = format!("- name: {name}");
+        let mut lines = job.iter().copied().skip_while(|l| l.trim() != header);
+        let Some(first) = lines.next() else {
+            return Vec::new();
+        };
+        let step_indent = indent(first);
+        std::iter::once(first)
+            .chain(lines.take_while(|l| l.trim().is_empty() || indent(l) > step_indent))
+            .collect()
+    }
+
+    fn step_position(job: &[&str], name: &str) -> Option<usize> {
+        let header = format!("- name: {name}");
+        job.iter().position(|l| l.trim() == header)
+    }
+
+    /// `(target, smoke)` for each entry of the build matrix.
+    fn matrix_entries(build: &[&str]) -> Vec<(String, bool)> {
+        let mut entries: Vec<(String, bool)> = Vec::new();
+        for line in build.iter().map(|l| l.trim()) {
+            if line.starts_with("runs-on:") {
+                break;
+            }
+            if line.starts_with("- runner:") {
+                entries.push((String::new(), false));
+                continue;
+            }
+            let Some(entry) = entries.last_mut() else {
+                continue;
+            };
+            if let Some(target) = line.strip_prefix("target:") {
+                entry.0 = target.trim().to_string();
+            } else if line == "smoke: true" {
+                entry.1 = true;
+            }
+        }
+        entries
+    }
+
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
