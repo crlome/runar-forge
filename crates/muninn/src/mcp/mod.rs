@@ -2210,7 +2210,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
         // not a fact about the code.
         ToolInfo {
             name: "muninn_icebox_add".into(),
-            description: "Capture a deferred idea, backlog item or piece of future work. Use when the user says \"file this\", \"add to the icebox\", \"let's do this later\", or parks an idea mid-task.".into(),
+            description: "Capture a deferred idea, backlog item or piece of future work. Use when the user says \"file this\", \"add to the icebox\", \"let's do this later\", or parks an idea mid-task. Re-adding an existing slug replaces the item and sets it back to open.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

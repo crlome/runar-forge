@@ -2861,6 +2861,75 @@ none
             .any(|e| e.id != old.id && e.deleted_at.is_none() && e.content == "v2"));
     }
 
+    // ── The skill texts describe what the store does ─────────────
+    //
+    // These live here rather than in setup.rs, which installs the files:
+    // they pin behaviour of this module.
+
+    const PRD_SKILL: &str = include_str!("../templates/prd_skill.md");
+    const ICEBOX_SKILL: &str = include_str!("../templates/icebox_skill.md");
+
+    #[test]
+    fn the_prd_skill_says_a_re_create_keeps_progress() {
+        let section = PRD_SKILL
+            .split("## 4.")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the prd skill has a section 4");
+        let flat = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "keeps its phase status",
+            "restarts as pending",
+            "pass a `status`",
+        ] {
+            assert!(flat.contains(phrase), "section 4 must say {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn the_icebox_skill_explains_how_to_keep_a_drop_reason() {
+        let after = ICEBOX_SKILL
+            .split("decided against")
+            .nth(1)
+            .expect("the icebox skill covers dropping an item");
+        let flat = after.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("muninn_icebox_add"), "{flat}");
+        assert!(flat.contains("same slug"), "{flat}");
+        assert!(flat.contains("existing tags"), "{flat}");
+    }
+
+    /// Pins the sequence the icebox skill documents, so a later change to
+    /// add_icebox cannot silently break it.
+    #[tokio::test]
+    async fn a_drop_reason_filed_the_documented_way_survives() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        let tags = ["sync".to_string()];
+        store
+            .add_icebox("Idea", "why", Some("x"), &tags)
+            .await
+            .unwrap();
+        store
+            .add_icebox(
+                "Idea",
+                "why\n\nDropped because: superseded",
+                Some("x"),
+                &tags,
+            )
+            .await
+            .unwrap();
+        store
+            .set_icebox_status("x", IceboxStatus::Dropped, None)
+            .await
+            .unwrap();
+
+        let item = store.get_icebox("x").await.unwrap().unwrap();
+        assert_eq!(item.status, IceboxStatus::Dropped);
+        assert!(item.content.contains("Dropped because: superseded"));
+        assert!(item.tags.contains(&"sync".to_string()), "{:?}", item.tags);
+        assert_eq!(store.list_icebox(None).await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn plan_store_keeps_every_plans_data_on_sqlite() {
         let lib = test_lib().await;
