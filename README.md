@@ -58,8 +58,8 @@ questions by assembling context from memory.
   primary and a remote PG as the team store; `runar sync push|pull`
   drains the outbox and pulls deltas.
 - **MCP server.** `runar mcp-muninn` speaks the Model Context
-  Protocol over stdio. 28 tools exposed
-  under `muninn_*` (13), `huginn_*` (10), `curator_*` (5).
+  Protocol over stdio. 37 tools exposed
+  under `muninn_*` (22), `huginn_*` (10), `curator_*` (5).
 - **Symbol-level code graph.** `runar crawl` extracts definitions, call
   sites and per-function complexity into a dedicated `codegraph.db`
   (Rust, TypeScript/JS, Python, Go), then resolves calls into edges
@@ -323,7 +323,7 @@ again with `--no-graph-autorefresh`.
 | `runar sync enable\|disable` | Toggle background auto-sync.                                                   |
 | `runar sync gc`              | Outbox retention sweep (default 7 days). `--dry-run`.                          |
 | `runar session ping\|list`   | Session heartbeat / recent-session listing.                                    |
-| `runar context`              | Print recent context (PreToolUse hook target).                                 |
+| `runar context`              | Print the context packet (SessionStart hook target).                           |
 | `runar nudge`                | UserPromptSubmit hook (idle-save reminder).                                    |
 | `runar save-ack`             | PostToolUse acknowledgement hook.                                              |
 | `runar extract`              | Passive PostToolUse extraction (gated by `RUNAR_PASSIVE_LEARNING=true`).       |
@@ -343,7 +343,7 @@ with the package they belong to.
 
 | Tool                       | Description                                                                 |
 |----------------------------|-----------------------------------------------------------------------------|
-| `muninn_save`              | Save a memory entry after significant work (bug fix, decision, pattern).   |
+| `muninn_save`              | Save a memory entry after significant work (bug fix, decision, pattern). Plans, icebox items and the `plan:` / `icebox:` key scopes are refused: use the plan tools below. |
 | `muninn_search`            | Fused search (semantic + keyword + decay + recency); compact rows by default. |
 | `muninn_get`               | Fetch full content of an entry by ID.                                       |
 | `muninn_context`           | Recent context from previous sessions; call after compaction.               |
@@ -356,6 +356,15 @@ with the package they belong to.
 | `muninn_capture_passive`   | Parse a `## Key Learnings` block and fan out to multiple entries.           |
 | `muninn_merge_projects`    | Merge entries + sessions across project namespaces. `dryRun` first.         |
 | `muninn_debug`             | Internal operation traces (requires `RUNAR_DEBUG=true`).                    |
+| `muninn_plan_create`       | Store a plan (PRD) from markdown or sections; `## Phase N` headings become tracked phases. A re-create keeps the plan's status and each unchanged phase's progress. |
+| `muninn_plan_list`         | Plans with status and phase progress. A completed or abandoned plan is not executed again. |
+| `muninn_plan_get`          | One plan in full, sections in order, or rendered as markdown.               |
+| `muninn_plan_save_section` | Add or replace one section of an existing plan.                             |
+| `muninn_plan_set_status`   | Advance a plan, or one of its phases (`phase` + `phaseStatus`).             |
+| `muninn_icebox_add`        | File a deferred idea; re-adding a slug replaces the item.                   |
+| `muninn_icebox_list`       | Backlog items, optionally filtered by status.                               |
+| `muninn_icebox_get`        | One icebox item in full.                                                    |
+| `muninn_icebox_set_status` | Promote an item (into a plan) or drop it.                                   |
 
 ### Huginn (scout)
 
@@ -368,7 +377,7 @@ with the package they belong to.
 | `huginn_recrawl_file` | Re-analyze a single file after editing (memory entry only — the symbol graph is whole-project; use `runar graph refresh`). |
 | `huginn_search_graph` | Full-text search over symbol names, ranked, with an optional label filter. |
 | `huginn_symbol`       | One symbol: definition site, signature, metrics, one-hop callers and callees. |
-| `huginn_trace`        | Walk callers or callees from a symbol, or find a path between two.  |
+| `huginn_trace`        | Walk callers (blast radius) or callees (dependencies) out from a symbol. |
 | `huginn_benchmark`    | Memory-quality benchmark (deterministic scoring).                   |
 | `huginn_skills`       | Static skills/best-practices reference.                             |
 

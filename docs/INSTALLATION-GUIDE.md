@@ -290,7 +290,7 @@ the current directory name.
 **4a. MCP server → `~/.claude.json`**
 
 Registers **one unified MCP server** globally (the Rust binary exposes all
-23 tools — muninn, huginn, curator — from a single process):
+37 tools — muninn, huginn, curator — from a single process):
 
 ```json
 {
@@ -794,7 +794,7 @@ per-user.
 
 ```bash
 runar mcp-muninn   # Single unified MCP stdio server.
-                   # Exposes 25 tools: 13 muninn + 5 curator + 7 huginn.
+                   # Exposes 37 tools: 22 muninn + 5 curator + 10 huginn.
                    # Called by AI tools via ~/.claude.json — not manually.
 ```
 

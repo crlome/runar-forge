@@ -393,16 +393,36 @@ impl MemoryStorage for SqliteAdapter {
         // Exact-duplicate guard: identical content in the same namespace
         // short-circuits before the topic_key branch, so an unchanged
         // recrawl never soft-deletes-and-reinserts its own predecessor.
+        //
+        // Plan and icebox rows with a key are matched within their key and
+        // type instead (contract on `storage::KEY_ADDRESSED_TYPES`); every
+        // other write keeps the namespace-wide guard and its exact SQL.
         let hash = crate::storage::content_hash(&input.title, &input.content);
-        let existing_dup: Option<String> = db
-            .query_row(
-                "SELECT id FROM memory_entries
-                 WHERE namespace = ?1 AND content_hash = ?2 AND deleted_at IS NULL
-                 LIMIT 1",
-                params![ns, hash],
-                |row| row.get(0),
-            )
-            .ok();
+        let addressed_key = input
+            .topic_key
+            .as_deref()
+            .filter(|k| !k.is_empty() && crate::storage::is_key_addressed(input.entry_type));
+        let existing_dup: Option<String> = match addressed_key {
+            Some(tk) => db
+                .query_row(
+                    "SELECT id FROM memory_entries
+                     WHERE namespace = ?1 AND content_hash = ?2 AND topic_key = ?3
+                       AND type = ?4 AND deleted_at IS NULL
+                     LIMIT 1",
+                    params![ns, hash, tk, input.entry_type.as_str()],
+                    |row| row.get(0),
+                )
+                .ok(),
+            None => db
+                .query_row(
+                    "SELECT id FROM memory_entries
+                     WHERE namespace = ?1 AND content_hash = ?2 AND deleted_at IS NULL
+                     LIMIT 1",
+                    params![ns, hash],
+                    |row| row.get(0),
+                )
+                .ok(),
+        };
         if let Some(dup_id) = existing_dup {
             db.execute(
                 "UPDATE memory_entries SET updated_at = ?1 WHERE id = ?2",
@@ -421,22 +441,37 @@ impl MemoryStorage for SqliteAdapter {
         // metadata so the caller can report supersession.
         let superseded = match input.topic_key.as_deref() {
             Some(tk) if !tk.is_empty() => {
-                let existing: Option<(String, String, String)> = db
-                    .query_row(
+                let row = |row: &rusqlite::Row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                };
+                // A plan or icebox write replaces only its own type: a
+                // legacy decision filed at the same key stays live.
+                let existing: Option<(String, String, String)> = if addressed_key.is_some() {
+                    db.query_row(
+                        "SELECT id, title, created_at FROM memory_entries
+                         WHERE namespace = ?1 AND topic_key = ?2 AND type = ?3
+                           AND deleted_at IS NULL
+                         ORDER BY created_at DESC
+                         LIMIT 1",
+                        params![ns, tk, input.entry_type.as_str()],
+                        row,
+                    )
+                    .ok()
+                } else {
+                    db.query_row(
                         "SELECT id, title, created_at FROM memory_entries
                          WHERE namespace = ?1 AND topic_key = ?2 AND deleted_at IS NULL
                          ORDER BY created_at DESC
                          LIMIT 1",
                         params![ns, tk],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        },
+                        row,
                     )
-                    .ok();
+                    .ok()
+                };
 
                 if let Some((old_id_str, old_title, old_created)) = existing {
                     db.execute(
@@ -555,6 +590,9 @@ impl MemoryStorage for SqliteAdapter {
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         let pattern = super::escape_like_prefix(prefix);
+        // SQLite's LIKE folds ASCII case (no case_sensitive_like pragma is
+        // set), Postgres's does not: callers filter exact keys in Rust, so
+        // the extra case variants returned here never reach a decision.
         let mut stmt = db
             .prepare(
                 "SELECT * FROM memory_entries
@@ -1931,14 +1969,19 @@ impl MemoryStorage for SqliteAdapter {
         } else {
             ""
         };
+        // Keyed plan and icebox rows are never duplicates of each other:
+        // the same rule as the write-time guard (`KEY_ADDRESSED_TYPES`).
+        let keyed = crate::storage::key_addressed_types_sql();
         let sql = format!(
             "SELECT e.content_hash, e.id, e.namespace, e.title, e.access_count, e.verified, e.created_at
              FROM memory_entries e
              JOIN (SELECT namespace, content_hash FROM memory_entries
                    WHERE deleted_at IS NULL AND content_hash IS NOT NULL{ns_clause}
+                     AND NOT (type IN ({keyed}) AND COALESCE(topic_key, '') <> '')
                    GROUP BY namespace, content_hash HAVING COUNT(*) > 1) d
                ON e.namespace = d.namespace AND e.content_hash = d.content_hash
              WHERE e.deleted_at IS NULL
+               AND NOT (e.type IN ({keyed}) AND COALESCE(e.topic_key, '') <> '')
              ORDER BY e.namespace, e.content_hash, e.access_count DESC, e.created_at DESC"
         );
         let mut stmt = db.prepare(&sql).map_err(db_err)?;
@@ -3849,6 +3892,148 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn keyed(t: EntryType, title: &str, content: &str, key: &str) -> MemoryEntryInput {
+        MemoryEntryInput {
+            title: title.into(),
+            content: content.into(),
+            entry_type: t,
+            topic_key: Some(key.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Plan sections are addressed by key: an unchanged section that moved
+    /// to a new index, or the same section in a second plan, deduped onto
+    /// the old row under its old key, and the plan's stale pass then
+    /// retired it.
+    #[tokio::test]
+    async fn plan_entries_dedup_only_within_their_own_key() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        let a = adapter
+            .save(
+                keyed(EntryType::Plan, "Risks", "None.", "plan:a:01-risks"),
+                "test",
+            )
+            .await
+            .unwrap();
+        let b = adapter
+            .save(
+                keyed(EntryType::Plan, "Risks", "None.", "plan:b:01-risks"),
+                "test",
+            )
+            .await
+            .unwrap();
+        let again = adapter
+            .save(
+                keyed(EntryType::Plan, "Risks", "None.", "plan:a:01-risks"),
+                "test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(a.action, SaveAction::Created);
+        assert_eq!(
+            b.action,
+            SaveAction::Created,
+            "a second plan's identical section is its own row"
+        );
+        assert_ne!(a.id, b.id);
+        adapter.get(a.id).await.unwrap();
+        adapter.get(b.id).await.unwrap();
+        assert_eq!(again.action, SaveAction::Duplicate);
+        assert_eq!(again.id, a.id);
+    }
+
+    #[tokio::test]
+    async fn a_plan_write_never_supersedes_another_type() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        let decision = adapter
+            .save(
+                keyed(EntryType::Decision, "Use JWT", "stateless", "plan:c"),
+                "test",
+            )
+            .await
+            .unwrap();
+        let plan = adapter
+            .save(keyed(EntryType::Plan, "C", "the plan", "plan:c"), "test")
+            .await
+            .unwrap();
+        assert!(plan.superseded.is_none());
+        adapter
+            .get(decision.id)
+            .await
+            .expect("the decision stays live");
+        adapter.get(plan.id).await.unwrap();
+    }
+
+    /// Pins the constraint the change keeps: every other type still dedups
+    /// across the namespace, whatever its key.
+    #[tokio::test]
+    async fn other_types_keep_namespace_wide_dedup() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        let first = adapter
+            .save(
+                keyed(EntryType::Decision, "Same", "same body", "decision:x"),
+                "test",
+            )
+            .await
+            .unwrap();
+        let second = adapter
+            .save(
+                keyed(EntryType::Decision, "Same", "same body", "decision:y"),
+                "test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.action, SaveAction::Duplicate);
+        assert_eq!(second.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn dedup_clusters_skip_plan_and_icebox_rows() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        {
+            let db = adapter.db.lock().unwrap();
+            for (id, t, key) in [
+                (
+                    "bbbbbbbb-0000-0000-0000-000000000001",
+                    "plan",
+                    "plan:a:00-x",
+                ),
+                (
+                    "bbbbbbbb-0000-0000-0000-000000000002",
+                    "plan",
+                    "plan:b:00-x",
+                ),
+                ("bbbbbbbb-0000-0000-0000-000000000003", "note", "note:a"),
+                ("bbbbbbbb-0000-0000-0000-000000000004", "note", "note:b"),
+            ] {
+                db.execute(
+                    "INSERT INTO memory_entries (id, namespace, title, content, type, tags, topic_key, created_at, updated_at)
+                     VALUES (?1, 'test', ?2, 'shared body', ?2, '[]', ?3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    params![id, t, key],
+                )
+                .unwrap();
+            }
+        }
+        loop {
+            let batch = adapter.list_missing_content_hash(10).await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (id, title, content) in batch {
+                let h = crate::storage::content_hash(&title, &content);
+                adapter.set_content_hash(id, &h).await.unwrap();
+            }
+        }
+        let clusters = adapter.find_duplicate_clusters(Some("test")).await.unwrap();
+        assert_eq!(clusters.len(), 1, "only the notes cluster: {clusters:?}");
+        assert!(clusters[0].entries.iter().all(|m| m.title == "note"));
     }
 
     #[tokio::test]

@@ -74,9 +74,11 @@ Structure the plan as:
 
 Rules that matter:
 
-- **Only headings that name a phase become tracked work.** `## Phase 2 —
-  storage` is executable and tracked; `## Design` is not. This is
-  deliberate — nothing is silently promoted into work.
+- **Only headings that start with a phase number become tracked work.**
+  `## Phase 2 — storage` is executable and tracked; `## Design` and
+  `## Risks in phase 2` are not. This is deliberate — nothing is silently
+  promoted into work. Headings inside code fences are text, so quoting a
+  template or an example is safe.
 - **Split anything longer than one session into phases.** Each phase must be
   independently shippable and independently verifiable. This is what makes
   progress survive a restart.
@@ -92,12 +94,19 @@ Ask explicitly — this is the user's call, and multiple answers are normal:
    a restart, and syncs to the team remote.
 3. **Both** — the file is where it gets edited, runar is where execution is
    tracked. If the file later changes, re-run `muninn_plan_create` with the
-   same slug: it replaces the sections and retires the ones that are gone.
+   same slug and the whole document: it replaces the sections and retires
+   the ones that are gone. Progress survives the re-run: omit `status` and
+   the plan keeps its status, and every phase whose heading is unchanged —
+   or only annotated, such as an appended `— SHIPPED` — keeps its phase
+   status. A renamed heading restarts as pending, and the response's
+   `warning` names it. A completed or abandoned plan changes only when you
+   pass a `status`.
 4. **Execute it now** — still store it first, or a restart loses everything.
 
 Pass the whole document as `markdown` to `muninn_plan_create`; it splits the
-sections and detects phases. If a section is longer than the entry cap it is
-split across parts, never truncated.
+sections, detects phases, and keeps the prose before the first `##` as the
+overview. If a section is longer than the entry cap it is split across
+parts, never truncated.
 
 If this plan came from an icebox item, close the loop:
 `muninn_icebox_set_status(slug, status: "promoted", promotedTo: <plan slug>)`.

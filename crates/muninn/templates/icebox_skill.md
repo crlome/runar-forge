@@ -31,7 +31,10 @@ Then ask where it goes — multiple answers are normal:
 
 Before filing, run `muninn_icebox_list` and check for a near-duplicate. If
 one exists, add to it rather than filing a second — a backlog with two
-entries for one problem is a backlog nobody trusts.
+entries for one problem is a backlog nobody trusts. To add to it, re-file
+with `muninn_icebox_add` using the same slug, its title, its existing tags
+and its content plus what you learned: re-filing a slug replaces the item
+and sets it back to open.
 
 ## Listing
 
@@ -53,7 +56,10 @@ When the user decides to work on an item:
 2. Then close the loop:
    `muninn_icebox_set_status(slug, status: "promoted", promotedTo: <plan slug>)`.
 
-When an item is decided against, record that too:
-`muninn_icebox_set_status(slug, status: "dropped")`. A dropped item with a
-reason stops the same idea being re-filed every few months. Deleting it does
-not.
+When an item is decided against, record that too, with the reason. First
+re-file it with `muninn_icebox_add` using the same slug, the same title, its
+existing tags and its content followed by a line `Dropped because:
+<reason>`; then call `muninn_icebox_set_status(slug, status: "dropped")`.
+From the CLI: `runar icebox add "<title>" --slug <slug> -m "<content>"`,
+then `runar icebox drop <slug>`. A dropped item with a reason stops the
+same idea being re-filed every few months. Deleting it does not.

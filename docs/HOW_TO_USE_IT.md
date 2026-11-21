@@ -318,8 +318,8 @@ never noisy).
 
 ```bash
 runar mcp-muninn
-  # One unified stdio server. Exposes all 23 tools:
-  # 11 muninn + 5 curator + 7 huginn.
+  # One unified stdio server. Exposes all 37 tools:
+  # 22 muninn + 5 curator + 10 huginn.
   # Called by ~/.claude.json, not manually.
 ```
 
@@ -346,11 +346,11 @@ structured fields) are MCP-only — call them from inside Claude Code.
 
 Called by your AI tool automatically via the `muninn` MCP server.
 
-### Muninn (Memory) — 13 tools
+### Muninn (Memory) — 22 tools
 
 | Tool | What it does |
 |---|---|
-| `muninn_save` | Save an entry. Supports `topicKey` for upserts. `<private>…</private>` content is redacted automatically. Stamps `author` from `git config user.name` (Phase 5.7) — pass `author` arg to override. |
+| `muninn_save` | Save an entry. Supports `topicKey` for upserts; the `plan:` and `icebox:` scopes and the plan/icebox types are refused (use the plan tools). `<private>…</private>` content is redacted automatically. Stamps `author` from `git config user.name` (Phase 5.7) — pass `author` arg to override. |
 | `muninn_capture_passive` | Parse markdown `## Key Learnings:` / `## Takeaways` sections and fan out each bullet as its own entry. One call → many entries. Stable dedup key so re-saves upsert. (Phase 5.3 A2) |
 | `muninn_verify` | Owner-endorse an entry — sets `verified=true` + grants a 1.25× rank bonus and makes the row never-evicted. Phase 5.7 also records `verified_by` from `git config user.name`. |
 | `muninn_search` | Fused retrieval (semantic + keyword + decay + recency + verified + tier). Every result carries `tokensEstimate` (snippet cost) + `fullTokensEstimate` (cost if fetched via `muninn_get`), plus `author` + `verifiedBy`. Optional `author` arg = case-insensitive substring filter. Compact by default. |
@@ -362,8 +362,17 @@ Called by your AI tool automatically via the `muninn` MCP server.
 | `muninn_related` | Linked entries via edges |
 | `muninn_merge_projects` | Merge entries from one project id into another (Phase 5.2) |
 | `muninn_debug` | Query the debug log (requires `RUNAR_DEBUG=true`) |
+| `muninn_plan_create` | Store a plan (PRD) as markdown or sections; `## Phase N` headings become tracked phases. Re-creating keeps the plan's status (unless `status` is given) and each unchanged phase's progress; a completed or abandoned plan changes only with an explicit `status`. |
+| `muninn_plan_list` | Plans with status and phase progress |
+| `muninn_plan_get` | One plan in full, or rendered as markdown |
+| `muninn_plan_save_section` | Add or replace one section of an existing plan |
+| `muninn_plan_set_status` | Advance a plan or one phase |
+| `muninn_icebox_add` | File a deferred idea; re-adding a slug replaces the item |
+| `muninn_icebox_list` | Backlog items by status |
+| `muninn_icebox_get` | One icebox item |
+| `muninn_icebox_set_status` | Promote or drop an item |
 
-### Huginn (Scout) — 7 tools
+### Huginn (Scout) — 10 tools
 
 | Tool | What it does |
 |---|---|
@@ -374,6 +383,9 @@ Called by your AI tool automatically via the `muninn` MCP server.
 | `huginn_recrawl_file` | Re-analyze a single file |
 | `huginn_benchmark` | Run memory-quality benchmark |
 | `huginn_skills` | List Huginn capabilities |
+| `huginn_search_graph` | Find definitions by name in the code graph |
+| `huginn_symbol` | One definition: signature, metrics, callers and callees |
+| `huginn_trace` | Walk callers (blast radius) or callees (dependencies) out from a definition |
 
 ### Curator (Knowledge) — 5 tools
 

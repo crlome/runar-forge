@@ -425,6 +425,10 @@ async fn tool_capture_passive(args: &Value, lib: &MemoryLibrarian) -> Result<Str
         .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    // Its keys are `learning:<hash>`, so only the type can trespass.
+    if let Some(t) = entry_type {
+        crate::plans::check_generic_save(t, None)?;
+    }
 
     let results = lib
         .capture_passive(text, project_id.as_deref(), entry_type, &extra_tags)
@@ -508,6 +512,7 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         let hash = crate::storage::content_hash(&clean_title, &clean_content);
         format!("{key}-{}", hash.chars().take(8).collect::<String>())
     });
+    crate::plans::check_generic_save(entry_type, Some(&effective_topic_key))?;
 
     let confidence = resolve_confidence(args.get("confidence"));
 
@@ -690,12 +695,14 @@ fn plan_doc_json(doc: &crate::plans::PlanDocument) -> Value {
 
 async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
     let title = required_str(args, "title")?;
-    let overview = arg_str(args, "overview").unwrap_or("");
-    let status = plan_status_arg(args, "status")?.unwrap_or_default();
+    let mut overview = arg_str(args, "overview").unwrap_or("").to_string();
+    // Omitted means "keep the stored status" on a re-create; a new plan
+    // starts as draft.
+    let status = plan_status_arg(args, "status")?;
 
     // Sections arrive either pre-split or as one markdown document. The
     // markdown form is what a /prd conversation naturally produces.
-    let mut untracked: Vec<String> = Vec::new();
+    let mut parse_warnings: Vec<String> = Vec::new();
     let sections: Vec<crate::plans::SectionInput> = match args.get("sections") {
         Some(Value::Array(items)) => items
             .iter()
@@ -719,7 +726,12 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
         _ => match arg_str(args, "markdown") {
             Some(md) => {
                 let parsed = crate::plans::parse_markdown(md);
-                untracked = parsed.untracked_phase_headings;
+                parse_warnings = parsed.warnings();
+                // The prose before the first section is the overview, as
+                // on the CLI, unless the caller gave one explicitly.
+                if overview.is_empty() {
+                    overview = parsed.overview;
+                }
                 parsed.sections
             }
             None => Vec::new(),
@@ -727,27 +739,24 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
     };
 
     let store = icebox_store(args, lib);
-    let (slug, entries) = store
-        .create_plan(title, arg_str(args, "slug"), overview, &sections, status)
+    let created = store
+        .create_plan(title, arg_str(args, "slug"), &overview, &sections, status)
         .await
         .map_err(|e| e.to_string())?;
 
     let tracked = sections.iter().filter(|s| s.phase.is_some()).count();
     let mut response = serde_json::json!({
         "status": "saved",
-        "slug": slug,
-        "entriesWritten": entries,
+        "slug": created.slug,
+        "entriesWritten": created.entries,
         "sections": sections.len(),
         "trackedPhases": tracked,
         "hint": "track execution with muninn_plan_set_status(slug, phase, phaseStatus)",
     });
-    if !untracked.is_empty() {
-        response["warning"] = serde_json::json!(format!(
-            "{} heading(s) name a phase but sit below `##`, so they are body text and are \
-             NOT tracked: {}. Promote them to `## Phase N — name`.",
-            untracked.len(),
-            untracked.join("; ")
-        ));
+    let mut warnings = parse_warnings;
+    warnings.extend(created.notices());
+    if !warnings.is_empty() {
+        response["warning"] = serde_json::json!(warnings.join(" "));
     }
     Ok(response.to_string())
 }
@@ -2030,12 +2039,12 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "content": { "type": "string", "description": "Full content of the memory (10-10,000 chars)" },
                     "type": {
                         "type": "string",
-                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt", "plan", "icebox"],
-                        "description": "Category of this memory. Prefer the muninn_plan_* / muninn_icebox_* tools over saving \"plan\"/\"icebox\" directly — they own the topic-key and status conventions."
+                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt"],
+                        "description": "Category of this memory. Plans and icebox items are not saved here: use muninn_plan_create / muninn_icebox_add, which own their keys and statuses."
                     },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags for filtering (max 10)" },
                     "projectId": { "type": "string", "description": "Optional project this memory belongs to" },
-                    "topicKey": { "type": "string", "description": "Optional stable key for upsert. Format: \"scope:key\" e.g. \"auth:approach\"" },
+                    "topicKey": { "type": "string", "description": "Optional stable key for upsert. Format: \"scope:key\" e.g. \"auth:approach\". The `plan:` and `icebox:` scopes belong to the plan tools and are refused, as are keys containing '<' or '>'." },
                     "confidence": {
                         "description": "Source confidence multiplier applied to search ranking. Preset string (verified=1.0, observed=0.9, inferred=0.7, speculative=0.4) or a numeric 0..1 value. Default: observed.",
                         "oneOf": [
@@ -2201,7 +2210,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
         // not a fact about the code.
         ToolInfo {
             name: "muninn_icebox_add".into(),
-            description: "Capture a deferred idea, backlog item or piece of future work. Use when the user says \"file this\", \"add to the icebox\", \"let's do this later\", or parks an idea mid-task.".into(),
+            description: "Capture a deferred idea, backlog item or piece of future work. Use when the user says \"file this\", \"add to the icebox\", \"let's do this later\", or parks an idea mid-task. Re-adding an existing slug replaces the item and sets it back to open.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2270,7 +2279,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "title": { "type": "string", "description": "Plan title" },
                     "slug": { "type": "string", "description": "Optional stable id; derived from the title otherwise" },
                     "overview": { "type": "string", "description": "Problem statement and goals — the plan's summary" },
-                    "markdown": { "type": "string", "description": "Whole plan as markdown; each '## Heading' becomes a section, and a heading naming a phase ('## Phase 2 — storage') becomes a tracked phase" },
+                    "markdown": { "type": "string", "description": "Whole plan as markdown; each '## Heading' becomes a section, a heading starting with a phase number ('## Phase 2 — storage') becomes a tracked phase, and the prose before the first '##' becomes the overview unless 'overview' is given. Headings inside code fences are ignored" },
                     "sections": {
                         "type": "array",
                         "description": "Sections given explicitly, instead of markdown",
@@ -2284,7 +2293,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                             "required": ["title", "content"],
                         },
                     },
-                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"], "description": "Initial status (default: draft)" },
+                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"], "description": "Plan status. Omit to keep the stored status when re-creating (a new plan starts as draft); a completed or abandoned plan is only changed when a status is given" },
                     "projectId": { "type": "string" },
                 },
                 "required": ["title"],
@@ -2319,7 +2328,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: "muninn_plan_save_section".into(),
-            description: "Add or replace one section of an existing plan, leaving the rest untouched. Content longer than the entry cap is split across parts rather than truncated.".into(),
+            description: "Add or replace one section of an existing plan, leaving the rest untouched. The plan must already exist (create it with muninn_plan_create). Content longer than the entry cap is split across parts rather than truncated.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2327,7 +2336,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "index": { "type": "number", "description": "Section ordinal; determines reading order" },
                     "title": { "type": "string" },
                     "content": { "type": "string" },
-                    "phase": { "type": "number", "description": "Set when this section is executable work to track" },
+                    "phase": { "type": "number", "description": "Set when this section is executable work to track. Omit to keep the section's current phase; a re-saved phase keeps its status" },
                     "projectId": { "type": "string" },
                 },
                 "required": ["slug", "index", "title", "content"],
@@ -2807,6 +2816,741 @@ mod tests {
             .is_err(),
             "a section with no title or content must be refused"
         );
+    }
+
+    async fn propose_decision(
+        lib: &MemoryLibrarian,
+        title: &str,
+        content: &str,
+        key: &str,
+    ) -> Uuid {
+        lib.propose(MemoryEntryInput {
+            title: title.into(),
+            content: content.into(),
+            entry_type: EntryType::Decision,
+            topic_key: Some(key.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn call(
+        tool: impl std::future::Future<Output = Result<String, String>>,
+    ) -> Result<Value, String> {
+        tool.await.map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    /// `plan:auth` is a prefix of `plan:auth-flow`, and the stale pass read
+    /// every key under the raw prefix: creating `auth` retired the other
+    /// plan and a decision that only shared the scope.
+    #[tokio::test]
+    async fn creating_a_plan_never_retires_a_plan_it_prefixes() {
+        let lib = icebox_test_lib().await;
+        call(tool_plan_create(
+            &serde_json::json!({
+                "title": "auth flow",
+                "slug": "auth-flow",
+                "markdown": "## Phase 1 — a\n\nx\n\n## Notes\n\ny\n",
+            }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        let decision = propose_decision(
+            &lib,
+            "Auth notes",
+            "keep the check in one layer",
+            "plan:auth-notes",
+        )
+        .await;
+        // Inside auth's own key space, shaped like a section key: only the
+        // entry type says it is not auth's.
+        let inside = propose_decision(
+            &lib,
+            "Legacy auth decision",
+            "filed under the plan by a generic save",
+            "plan:auth:00-legacy",
+        )
+        .await;
+        for _ in 0..2 {
+            call(tool_plan_create(
+                &serde_json::json!({
+                    "title": "auth",
+                    "slug": "auth",
+                    "markdown": "## Only mine\n\nz\n",
+                }),
+                &lib,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let other = call(tool_plan_get(
+            &serde_json::json!({ "slug": "auth-flow" }),
+            &lib,
+        ))
+        .await
+        .expect("the longer slug's plan survives");
+        assert_eq!(other["sections"].as_array().unwrap().len(), 2);
+        assert_eq!(other["phasesTotal"], 1);
+        lib.get(decision)
+            .await
+            .expect("a decision under the plan scope is not the plan's to retire");
+        lib.get(inside)
+            .await
+            .expect("a decision inside the plan's key space is not a section");
+        let own = call(tool_plan_get(&serde_json::json!({ "slug": "auth" }), &lib))
+            .await
+            .unwrap();
+        assert_eq!(own["sections"].as_array().unwrap().len(), 1, "{own}");
+    }
+
+    async fn create_md(lib: &MemoryLibrarian, title: &str, slug: &str, markdown: &str) -> Value {
+        call(tool_plan_create(
+            &serde_json::json!({ "title": title, "slug": slug, "markdown": markdown }),
+            lib,
+        ))
+        .await
+        .unwrap()
+    }
+
+    async fn phase_status_of(lib: &MemoryLibrarian, slug: &str, index: usize) -> String {
+        let doc = call(tool_plan_get(&serde_json::json!({ "slug": slug }), lib))
+            .await
+            .unwrap();
+        doc["sections"][index]["phaseStatus"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_phase_update_never_touches_a_prefix_sibling() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth", "auth", "## Phase 1 — a\n\nauth's phase\n").await;
+        create_md(
+            &lib,
+            "auth flow",
+            "auth-flow",
+            "## Phase 1 — a\n\nflow's phase\n",
+        )
+        .await;
+
+        call(tool_plan_set_status(
+            &serde_json::json!({ "slug": "auth", "phase": 1, "phaseStatus": "done" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(phase_status_of(&lib, "auth", 0).await, "done");
+        assert_eq!(phase_status_of(&lib, "auth-flow", 0).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_phase_update_on_an_unknown_slug_is_an_error_not_a_panic() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth flow", "auth-flow", "## Phase 1 — a\n\nx\n").await;
+
+        let err = tool_plan_set_status(
+            &serde_json::json!({ "slug": "auth", "phase": 1, "phaseStatus": "done" }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no plan with slug 'auth'"), "{err}");
+        assert_eq!(phase_status_of(&lib, "auth-flow", 0).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_update_writes_nothing() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth flow", "auth-flow", "## Phase 1 — a\n\nx\n").await;
+
+        assert!(tool_plan_set_status(
+            &serde_json::json!({
+                "slug": "auth",
+                "status": "completed",
+                "phase": 1,
+                "phaseStatus": "done",
+            }),
+            &lib,
+        )
+        .await
+        .is_err());
+        // A real plan, a phase it does not have: the status half must not
+        // land either.
+        assert!(tool_plan_set_status(
+            &serde_json::json!({
+                "slug": "auth-flow",
+                "status": "completed",
+                "phase": 9,
+                "phaseStatus": "done",
+            }),
+            &lib,
+        )
+        .await
+        .is_err());
+        let flow = call(tool_plan_get(
+            &serde_json::json!({ "slug": "auth-flow" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(flow["sections"][0]["phaseStatus"], "pending");
+        assert_eq!(flow["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn a_mixed_case_slug_resolves_to_the_same_plan() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth", "auth", "## Phase 1 — a\n\nx\n").await;
+
+        let set = call(tool_plan_set_status(
+            &serde_json::json!({ "slug": "Auth", "phase": 1, "phaseStatus": "done" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(set["slug"], "auth");
+        assert_eq!(set["phasesDone"], 1);
+        call(tool_plan_get(&serde_json::json!({ "slug": "AUTH" }), &lib))
+            .await
+            .expect("a case variant reads the same plan");
+    }
+
+    #[tokio::test]
+    async fn plan_errors_are_not_storage_failures() {
+        let lib = icebox_test_lib().await;
+        let plan = tool_plan_set_status(
+            &serde_json::json!({ "slug": "nope", "status": "completed" }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        let item = tool_icebox_set_status(
+            &serde_json::json!({ "slug": "nope", "status": "dropped" }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        for err in [plan, item] {
+            assert!(
+                !looks_like_storage_err(&err),
+                "a wrong slug must not count toward the MCP breaker: {err}"
+            );
+        }
+    }
+
+    fn section_titles(doc: &Value) -> Vec<String> {
+        doc["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["title"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn plan(lib: &MemoryLibrarian, slug: &str) -> Value {
+        call(tool_plan_get(&serde_json::json!({ "slug": slug }), lib))
+            .await
+            .unwrap()
+    }
+
+    async fn set_phase(lib: &MemoryLibrarian, slug: &str, phase: u64, status: &str) {
+        call(tool_plan_set_status(
+            &serde_json::json!({ "slug": slug, "phase": phase, "phaseStatus": status }),
+            lib,
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn set_plan(lib: &MemoryLibrarian, slug: &str, status: &str) {
+        call(tool_plan_set_status(
+            &serde_json::json!({ "slug": slug, "status": status }),
+            lib,
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn phase_statuses(doc: &Value) -> Vec<String> {
+        doc["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["phase"].is_null())
+            .map(|s| s["phaseStatus"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// /prd tells agents to re-run create whenever the file changes. Every
+    /// re-run reset the plan to draft and every edited phase to pending.
+    #[tokio::test]
+    async fn re_creating_a_plan_keeps_its_progress() {
+        let lib = icebox_test_lib().await;
+        let md = "## Phase 1 — build\n\nbuild it\n\n## Phase 2 — ship\n\nship it\n";
+        let create = |overview: &str, md: &str| serde_json::json!({ "title": "Ship", "overview": overview, "markdown": md });
+        call(tool_plan_create(&create("v1", md), &lib))
+            .await
+            .unwrap();
+        set_phase(&lib, "ship", 1, "done").await;
+        set_plan(&lib, "ship", "in-progress").await;
+
+        let edited = md.replace("build it", "build it, with tests");
+        call(tool_plan_create(&create("v2", &edited), &lib))
+            .await
+            .unwrap();
+
+        let doc = plan(&lib, "ship").await;
+        assert_eq!(doc["status"], "in-progress");
+        assert_eq!(doc["closed"], false);
+        assert_eq!(doc["overview"], "v2");
+        assert_eq!(phase_statuses(&doc), ["done", "pending"]);
+    }
+
+    #[tokio::test]
+    async fn re_creating_a_completed_plan_keeps_it_closed() {
+        let lib = icebox_test_lib().await;
+        let create = |overview: &str| serde_json::json!({ "title": "Done", "overview": overview });
+        call(tool_plan_create(&create("v1"), &lib)).await.unwrap();
+        set_plan(&lib, "done", "completed").await;
+
+        let err = tool_plan_create(&create("v2"), &lib).await.unwrap_err();
+        assert!(err.contains("completed") && err.contains("status"), "{err}");
+        assert!(!looks_like_storage_err(&err), "{err}");
+        let doc = plan(&lib, "done").await;
+        assert_eq!(doc["overview"], "v1", "a refused re-create writes nothing");
+        assert_eq!(doc["closed"], true);
+        let drafts = call(tool_plan_list(
+            &serde_json::json!({ "status": "draft" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(drafts["count"], 0);
+
+        // Unchanged content is not a change: no status needed.
+        call(tool_plan_create(&create("v1"), &lib)).await.unwrap();
+        // Reopening is explicit.
+        let mut reopen = create("v2");
+        reopen["status"] = "in-progress".into();
+        call(tool_plan_create(&reopen, &lib)).await.unwrap();
+        let doc = plan(&lib, "done").await;
+        assert_eq!(doc["status"], "in-progress");
+        assert_eq!(doc["overview"], "v2");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_status_on_an_unchanged_re_create_is_applied() {
+        let lib = icebox_test_lib().await;
+        let mut args =
+            serde_json::json!({ "title": "Same", "overview": "o", "status": "approved" });
+        call(tool_plan_create(&args, &lib)).await.unwrap();
+        args["status"] = "completed".into();
+        call(tool_plan_create(&args, &lib)).await.unwrap();
+        assert_eq!(plan(&lib, "same").await["status"], "completed");
+    }
+
+    /// Plans annotate a finished phase in its heading (`— SHIPPED`); the
+    /// phase keeps its progress.
+    #[tokio::test]
+    async fn an_annotated_heading_keeps_its_phase_done() {
+        let lib = icebox_test_lib().await;
+        create_md(
+            &lib,
+            "P",
+            "p",
+            "## Phase 1 — storage\n\nx\n\n## Phase 2 — api\n\ny\n",
+        )
+        .await;
+        set_phase(&lib, "p", 1, "done").await;
+        let created = create_md(
+            &lib,
+            "P",
+            "p",
+            "## Phase 1 — storage — SHIPPED\n\nx\n\n## Phase 2 — api\n\ny\n",
+        )
+        .await;
+        assert!(created.get("warning").is_none(), "{created}");
+        assert_eq!(phase_statuses(&plan(&lib, "p").await), ["done", "pending"]);
+    }
+
+    #[tokio::test]
+    async fn a_renamed_heading_restarts_and_is_reported() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "P", "p", "## Phase 1 — storage\n\nx\n").await;
+        set_phase(&lib, "p", 1, "done").await;
+        let created = create_md(&lib, "P", "p", "## Phase 1 — persistence\n\nx\n").await;
+        let warning = created["warning"].as_str().unwrap_or_default();
+        assert!(warning.contains("Phase 1 — persistence"), "{created}");
+        assert_eq!(phase_statuses(&plan(&lib, "p").await), ["pending"]);
+    }
+
+    #[tokio::test]
+    async fn a_done_phase_whose_body_changed_is_reported() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "P", "p", "## Phase 1 — storage\n\nx\n").await;
+        set_phase(&lib, "p", 1, "done").await;
+        let created = create_md(&lib, "P", "p", "## Phase 1 — storage\n\nx, and y\n").await;
+        let warning = created["warning"].as_str().unwrap_or_default();
+        assert!(warning.contains("still done"), "{created}");
+        assert_eq!(phase_statuses(&plan(&lib, "p").await), ["done"]);
+    }
+
+    #[tokio::test]
+    async fn a_renumbered_phase_in_the_sections_array_keeps_its_status() {
+        let lib = icebox_test_lib().await;
+        let create = |n: u64| {
+            serde_json::json!({
+                "title": "P",
+                "sections": [{ "title": "Storage", "content": "x", "phase": n }],
+            })
+        };
+        call(tool_plan_create(&create(1), &lib)).await.unwrap();
+        set_phase(&lib, "p", 1, "done").await;
+        call(tool_plan_create(&create(2), &lib)).await.unwrap();
+        let doc = plan(&lib, "p").await;
+        assert_eq!(doc["sections"][0]["phase"], 2);
+        assert_eq!(phase_statuses(&doc), ["done"]);
+    }
+
+    async fn save_section(lib: &MemoryLibrarian, args: Value) -> Result<Value, String> {
+        call(tool_plan_save_section(&args, lib)).await
+    }
+
+    #[tokio::test]
+    async fn save_section_refuses_a_plan_that_does_not_exist() {
+        let lib = icebox_test_lib().await;
+        let err = save_section(
+            &lib,
+            serde_json::json!({ "slug": "ghost", "index": 0, "title": "T", "content": "c" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("muninn_plan_create"), "{err}");
+        assert!(lib
+            .list_by_topic_prefix(None, "plan:ghost")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_section_resolves_a_mixed_case_slug() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth", "auth", "## Phase 1 — a\n\nx\n").await;
+        let saved = save_section(
+            &lib,
+            serde_json::json!({ "slug": "Auth", "index": 1, "title": "Notes", "content": "n" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved["topicKey"], "plan:auth:01-notes");
+        assert!(section_titles(&plan(&lib, "auth").await).contains(&"Notes".to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_section_keeps_a_neighbour_at_the_same_index() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "p", "p", "").await;
+        for (title, content) in [("Body extra", "x"), ("Body", "y")] {
+            save_section(
+                &lib,
+                serde_json::json!({ "slug": "p", "index": 0, "title": title, "content": content }),
+            )
+            .await
+            .unwrap();
+        }
+        let titles = section_titles(&plan(&lib, "p").await);
+        assert!(titles.contains(&"Body".to_string()), "{titles:?}");
+        assert!(titles.contains(&"Body extra".to_string()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn re_saving_a_phase_section_keeps_its_phase_and_status() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "p", "p", "## Phase 1 — go\n\nx\n").await;
+        set_phase(&lib, "p", 1, "done").await;
+        for args in [
+            serde_json::json!({ "slug": "p", "index": 0, "title": "Phase 1 — go", "content": "x, edited", "phase": 1 }),
+            serde_json::json!({ "slug": "p", "index": 0, "title": "Phase 1 — go", "content": "x, edited again" }),
+        ] {
+            save_section(&lib, args).await.unwrap();
+            let doc = plan(&lib, "p").await;
+            assert_eq!(doc["sections"][0]["phase"], 1, "{doc}");
+            assert_eq!(doc["sections"][0]["phaseStatus"], "done", "{doc}");
+            assert_eq!(doc["phasesTotal"], 1);
+        }
+    }
+
+    /// /prd passes the whole document as markdown; its problem statement
+    /// was dropped, while the CLI kept it.
+    #[tokio::test]
+    async fn plan_create_keeps_the_markdown_overview() {
+        let lib = icebox_test_lib().await;
+        let md = "# T\n\nThe problem statement.\n\n## Phase 1 — x\n\nbody\n";
+        call(tool_plan_create(
+            &serde_json::json!({ "title": "T", "markdown": md }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        call(tool_plan_create(
+            &serde_json::json!({ "title": "U", "overview": "explicit", "markdown": md }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(plan(&lib, "t").await["overview"], "The problem statement.");
+        assert_eq!(plan(&lib, "u").await["overview"], "explicit");
+    }
+
+    #[tokio::test]
+    async fn inserting_a_section_keeps_every_later_section() {
+        let lib = icebox_test_lib().await;
+        let md = "## Context\n\nc\n\n## Phase 1 — a\n\na\n\n## Phase 2 — b\n\nb\n";
+        create_md(&lib, "Ship", "ship", md).await;
+        set_phase(&lib, "ship", 1, "done").await;
+        let with_risks = md.replace("## Phase 1", "## Risks\n\nr\n\n## Phase 1");
+        create_md(&lib, "Ship", "ship", &with_risks).await;
+
+        let doc = plan(&lib, "ship").await;
+        assert_eq!(
+            section_titles(&doc),
+            ["Context", "Risks", "Phase 1 — a", "Phase 2 — b"]
+        );
+        assert_eq!(doc["phasesTotal"], 2);
+        assert_eq!(doc["phasesDone"], 1, "the moved phase keeps its progress");
+    }
+
+    #[tokio::test]
+    async fn removing_a_section_keeps_the_ones_after_it() {
+        let lib = icebox_test_lib().await;
+        let md = "## Context\n\nc\n\n## Risks\n\nr\n\n## Phase 1 — a\n\na\n\n## Phase 2 — b\n\nb\n";
+        create_md(&lib, "Ship", "ship", md).await;
+        create_md(&lib, "Ship", "ship", &md.replace("## Risks\n\nr\n\n", "")).await;
+
+        assert_eq!(
+            section_titles(&plan(&lib, "ship").await),
+            ["Context", "Phase 1 — a", "Phase 2 — b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_plans_can_share_an_identical_section() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "One", "one", "## Risks\n\nNone.\n").await;
+        create_md(&lib, "Two", "two", "## Risks\n\nNone.\n").await;
+        assert_eq!(section_titles(&plan(&lib, "two").await), ["Risks"]);
+        assert_eq!(section_titles(&plan(&lib, "one").await), ["Risks"]);
+    }
+
+    #[tokio::test]
+    async fn two_plans_can_share_a_title_and_overview() {
+        let lib = icebox_test_lib().await;
+        for slug in ["x", "x-v2"] {
+            call(tool_plan_create(
+                &serde_json::json!({ "title": "X", "slug": slug, "overview": "o" }),
+                &lib,
+            ))
+            .await
+            .unwrap();
+        }
+        let listed = call(tool_plan_list(&serde_json::json!({}), &lib))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 2, "{listed}");
+        plan(&lib, "x-v2").await;
+    }
+
+    #[tokio::test]
+    async fn a_plan_created_over_a_legacy_decision_keeps_the_decision() {
+        let lib = icebox_test_lib().await;
+        let decision = propose_decision(&lib, "Use JWT", "stateless tokens", "plan:auth").await;
+        create_md(&lib, "Auth", "auth", "## Phase 1 — a\n\nx\n").await;
+        lib.get(decision).await.expect("the decision stays live");
+        assert_eq!(plan(&lib, "auth").await["title"], "Auth");
+    }
+
+    #[tokio::test]
+    async fn muninn_save_refuses_the_plan_stores_types() {
+        let lib = icebox_test_lib().await;
+        for (t, tool) in [
+            ("plan", "muninn_plan_create"),
+            ("icebox", "muninn_icebox_add"),
+        ] {
+            let err = tool_save(
+                &serde_json::json!({
+                    "title": "Auth rewrite",
+                    "content": "replace the session check",
+                    "type": t,
+                }),
+                &lib,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains(tool), "{err}");
+            assert!(!looks_like_storage_err(&err), "{err}");
+        }
+        let listed = call(tool_plan_list(&serde_json::json!({}), &lib))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn muninn_save_refuses_reserved_scopes_and_leaves_the_plan_alone() {
+        let lib = icebox_test_lib().await;
+        create_md(
+            &lib,
+            "Auth rewrite",
+            "auth-rewrite",
+            "## Phase 1 — a\n\nx\n",
+        )
+        .await;
+
+        for key in ["plan:auth-rewrite", "ICEBOX:later", " plan:x", "auth:<b>"] {
+            let err = tool_save(
+                &serde_json::json!({
+                    "title": "Use JWT",
+                    "content": "stateless tokens",
+                    "type": "decision",
+                    "topicKey": key,
+                }),
+                &lib,
+            )
+            .await
+            .unwrap_err();
+            assert!(!looks_like_storage_err(&err), "{key}: {err}");
+        }
+        for key in ["planning:x", "auth:approach"] {
+            tool_save(
+                &serde_json::json!({
+                    "title": format!("Use JWT for {key}"),
+                    "content": format!("stateless tokens, filed at {key}"),
+                    "type": "decision",
+                    "topicKey": key,
+                }),
+                &lib,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{key} is an ordinary scope: {e}"));
+        }
+        let plan = call(tool_plan_get(
+            &serde_json::json!({ "slug": "auth-rewrite" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(plan["title"], "Auth rewrite");
+        assert_eq!(plan["phasesTotal"], 1);
+    }
+
+    #[tokio::test]
+    async fn capture_passive_refuses_the_plan_type() {
+        let lib = icebox_test_lib().await;
+        let err = tool_capture_passive(
+            &serde_json::json!({
+                "text": "## Key Learnings:\n- the outbox must coalesce by entry id",
+                "type": "plan",
+            }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("muninn_plan_create"), "{err}");
+        assert!(lib
+            .list(crate::types::ListFilters::default())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_decision_under_a_plan_key_is_not_a_plan() {
+        let lib = icebox_test_lib().await;
+        propose_decision(&lib, "Use JWT", "stateless tokens", "plan:ghost").await;
+
+        let listed = call(tool_plan_list(&serde_json::json!({}), &lib))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 0, "{listed}");
+        assert!(tool_plan_get(&serde_json::json!({ "slug": "ghost" }), &lib)
+            .await
+            .is_err());
+    }
+
+    /// Every tool count, family count and catalogue the docs print must
+    /// match what the server declares. Four documents gave four different
+    /// totals (23, 25, 28) for a server with 37 tools, and none listed the
+    /// plan and icebox tools.
+    #[test]
+    fn docs_list_every_tool_with_the_true_counts() {
+        let names: Vec<String> = tool_definitions().into_iter().map(|t| t.name).collect();
+        let family = |f: &str| {
+            names
+                .iter()
+                .filter(|n| n.starts_with(&format!("{f}_")))
+                .count()
+        };
+        let counts = [
+            ("muninn", family("muninn")),
+            ("huginn", family("huginn")),
+            ("curator", family("curator")),
+        ];
+        assert_eq!(counts.iter().map(|(_, n)| n).sum::<usize>(), names.len());
+
+        let docs = [
+            ("README.md", include_str!("../../../../README.md")),
+            (
+                "docs/INSTALLATION-GUIDE.md",
+                include_str!("../../../../docs/INSTALLATION-GUIDE.md"),
+            ),
+            (
+                "docs/HOW_TO_USE_IT.md",
+                include_str!("../../../../docs/HOW_TO_USE_IT.md"),
+            ),
+        ];
+        let total = regex::Regex::new(r"\b(\d+) tools\b").unwrap();
+        // Counts are written lowercase ("22 muninn"); only the catalogue
+        // headings are capitalised. "9 Curator questions" is not a count.
+        let per_family = regex::Regex::new(
+            r"\b(\d+) (muninn|huginn|curator)\b|`(muninn|huginn|curator)_\*` \((\d+)\)|### (?i:(muninn|huginn|curator))\b[^\n]*— (\d+) tools",
+        )
+        .unwrap();
+        for (path, text) in docs {
+            for m in total.captures_iter(text) {
+                let line = text[..m.get(0).unwrap().start()].lines().count();
+                // A family heading's "N tools" is checked below.
+                let heading = text.lines().nth(line.saturating_sub(1)).unwrap_or("");
+                if heading.starts_with("### ") {
+                    continue;
+                }
+                assert_eq!(m[1].parse::<usize>().unwrap(), names.len(), "{path}:{line}");
+            }
+            for m in per_family.captures_iter(text) {
+                let (name, n) = [(2, 1), (3, 4), (5, 6)]
+                    .into_iter()
+                    .find_map(|(f, c)| {
+                        Some((m.get(f)?.as_str().to_lowercase(), m.get(c)?.as_str()))
+                    })
+                    .unwrap();
+                let want = counts.iter().find(|(f, _)| *f == name).unwrap().1;
+                assert_eq!(n.parse::<usize>().unwrap(), want, "{path}: {}", &m[0]);
+            }
+        }
+        for (path, text) in [docs[0], docs[2]] {
+            for name in &names {
+                assert!(
+                    text.contains(&format!("`{name}`")),
+                    "{path} does not list {name}"
+                );
+            }
+        }
     }
 
     #[test]
