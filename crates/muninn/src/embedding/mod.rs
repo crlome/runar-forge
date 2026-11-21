@@ -33,10 +33,39 @@ impl EmbeddingProvider for DisabledEmbeddingProvider {
     }
 }
 
+// ── HTTP time bounds ───────────────────────────────────────────────
+
+/// Time to set up a connection (DNS, TCP, TLS). Without it an unreachable
+/// host waits for the OS connect timeout, about 75 s on macOS.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// An HTTP client with connect and whole-request bounds. reqwest's default
+/// client has neither, so an endpoint that accepted a connection and never
+/// answered held the caller, and the serial MCP loop behind it, for the
+/// rest of the session.
+pub(crate) fn bounded_http_client(
+    request_timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(request_timeout);
+    // Tests talk to a listener on 127.0.0.1; a proxy configured on the
+    // developer's machine must not sit in between.
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder.build()
+}
+
 // ── OpenAI Embeddings API ──────────────────────────────────────────
+
+const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
+
+/// Whole-request bound for one embedding call.
+const EMBED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct OpenAIEmbeddingProvider {
     client: reqwest::Client,
+    endpoint: String,
     api_key: String,
     model: String,
     dims: usize,
@@ -60,7 +89,18 @@ struct EmbeddingData {
 }
 
 impl OpenAIEmbeddingProvider {
-    pub fn new(api_key: String, model: Option<String>) -> Self {
+    /// Fails only when the HTTP client cannot be built; the factory then
+    /// runs without embeddings.
+    pub fn new(api_key: String, model: Option<String>) -> reqwest::Result<Self> {
+        Self::with_endpoint(api_key, model, OPENAI_EMBEDDINGS_URL, EMBED_REQUEST_TIMEOUT)
+    }
+
+    fn with_endpoint(
+        api_key: String,
+        model: Option<String>,
+        endpoint: &str,
+        request_timeout: std::time::Duration,
+    ) -> reqwest::Result<Self> {
         let model = model.unwrap_or_else(|| "text-embedding-3-small".into());
         let dims = if model == "text-embedding-3-large" {
             3072
@@ -68,12 +108,13 @@ impl OpenAIEmbeddingProvider {
             1536
         };
 
-        Self {
-            client: reqwest::Client::new(),
+        Ok(Self {
+            client: bounded_http_client(request_timeout)?,
+            endpoint: endpoint.to_string(),
             api_key,
             model,
             dims,
-        }
+        })
     }
 }
 
@@ -96,14 +137,24 @@ impl EmbeddingProvider for OpenAIEmbeddingProvider {
             dimensions: self.dims,
         };
 
-        let response = self
+        let response = match self
             .client
-            .post("https://api.openai.com/v1/embeddings")
+            .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&req)
             .send()
             .await
-            .ok()?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    timed_out = e.is_timeout(),
+                    "embedding request failed; continuing without a vector"
+                );
+                return None;
+            }
+        };
 
         if !response.status().is_success() {
             tracing::warn!(
@@ -153,7 +204,7 @@ pub fn create_embedding_provider() -> Box<dyn EmbeddingProvider> {
                         model = model.as_deref().unwrap_or("text-embedding-3-small"),
                         "RUNAR_EMBEDDINGS=openai — using OpenAI embeddings"
                     );
-                    return Box::new(OpenAIEmbeddingProvider::new(api_key, model));
+                    return openai_provider(api_key, model);
                 }
             }
             tracing::warn!(
@@ -181,12 +232,22 @@ pub fn create_embedding_provider() -> Box<dyn EmbeddingProvider> {
                 model = model.as_deref().unwrap_or("text-embedding-3-small"),
                 "using OpenAI embeddings"
             );
-            return Box::new(OpenAIEmbeddingProvider::new(api_key, model));
+            return openai_provider(api_key, model);
         }
     }
 
     tracing::info!("no OPENAI_API_KEY set — embeddings disabled, using FTS only");
     Box::new(DisabledEmbeddingProvider)
+}
+
+fn openai_provider(api_key: String, model: Option<String>) -> Box<dyn EmbeddingProvider> {
+    match OpenAIEmbeddingProvider::new(api_key, model) {
+        Ok(provider) => Box::new(provider),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the embeddings HTTP client; embeddings disabled");
+            Box::new(DisabledEmbeddingProvider)
+        }
+    }
 }
 
 #[cfg(feature = "local-embeddings")]
@@ -214,4 +275,26 @@ fn create_local_provider() -> Box<dyn EmbeddingProvider> {
          `local-embeddings` Cargo feature — falling back to disabled"
     );
     Box::new(DisabledEmbeddingProvider)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// reqwest's default client has no timeout, so against an endpoint that
+    /// accepts and never answers, `embed` never returned.
+    #[tokio::test]
+    async fn openai_embed_gives_up_on_a_server_that_never_answers() {
+        let base = crate::test_support::silent_http_listener().await;
+        let provider = OpenAIEmbeddingProvider::with_endpoint(
+            "test-key".into(),
+            None,
+            &format!("{base}/v1/embeddings"),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), provider.embed("x")).await;
+        assert_eq!(outcome, Ok(None), "embed must give up, not hang");
+    }
 }

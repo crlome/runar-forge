@@ -178,6 +178,44 @@ impl crate::embedding::EmbeddingProvider for RecordingEmbeddings {
     }
 }
 
+/// An available embedder whose `embed` never completes: a provider stuck
+/// behind a dead connection.
+pub(crate) struct StalledEmbeddings;
+
+#[async_trait::async_trait]
+impl crate::embedding::EmbeddingProvider for StalledEmbeddings {
+    fn name(&self) -> &str {
+        "stalled"
+    }
+    fn dimensions(&self) -> usize {
+        4
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+        std::future::pending().await
+    }
+    async fn health_check(&self) -> bool {
+        false
+    }
+}
+
+/// A local HTTP endpoint that accepts connections and never answers: a
+/// stalled API. Returns its base URL. Binds 127.0.0.1 only, so no test
+/// needs the network.
+pub(crate) async fn silent_http_listener() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket); // keep it open, never reply
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// The session-text scenario shared by the SQLite and live-Postgres tests:
 /// every session write path drops private blocks before storage. `project`
 /// must be unique to the test on a shared database.

@@ -66,7 +66,13 @@ pub trait Summarizer: Send + Sync {
 /// Pick Claude when the API key is set; otherwise fall back to heuristic.
 pub fn create_summarizer() -> Box<dyn Summarizer> {
     match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => Box::new(ClaudeSummarizer::new(key, None)),
+        Ok(key) if !key.trim().is_empty() => match ClaudeSummarizer::new(key, None) {
+            Ok(claude) => Box::new(claude),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not build the summarizer HTTP client; using the heuristic");
+                Box::new(HeuristicSummarizer)
+            }
+        },
         _ => Box::new(HeuristicSummarizer),
     }
 }
@@ -129,23 +135,47 @@ impl Summarizer for HeuristicSummarizer {
 
 // ── Claude API ───────────────────────────────────────────────────
 
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Whole-request bound for one summary call. Its only caller already runs
+/// under the SessionEnd hook budget; this bounds any other caller.
+const SUMMARIZE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct ClaudeSummarizer {
     api_key: String,
     model: String,
+    endpoint: String,
     client: reqwest::Client,
 }
 
 impl ClaudeSummarizer {
-    pub fn new(api_key: String, model: Option<String>) -> Self {
+    /// Fails only when the HTTP client cannot be built; the factory then
+    /// falls back to the heuristic summarizer.
+    pub fn new(api_key: String, model: Option<String>) -> reqwest::Result<Self> {
+        Self::with_endpoint(
+            api_key,
+            model,
+            ANTHROPIC_MESSAGES_URL,
+            SUMMARIZE_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn with_endpoint(
+        api_key: String,
+        model: Option<String>,
+        endpoint: &str,
+        request_timeout: std::time::Duration,
+    ) -> reqwest::Result<Self> {
         // Haiku is the right tradeoff for session summaries: short context,
         // fast response, cheap. Allow override via arg for callers that want
         // a beefier model for dense sessions.
         let model = model.unwrap_or_else(|| "claude-haiku-4-5".to_string());
-        Self {
+        Ok(Self {
             api_key,
             model,
-            client: reqwest::Client::new(),
-        }
+            endpoint: endpoint.to_string(),
+            client: crate::embedding::bounded_http_client(request_timeout)?,
+        })
     }
 
     fn system_prompt() -> &'static str {
@@ -213,7 +243,7 @@ Return ONLY the JSON object, with no prose before or after.",
 
         let response = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&self.endpoint)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -314,6 +344,30 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// The call and its retry both used a client with no timeout, so a
+    /// stalled endpoint held the caller forever.
+    #[tokio::test]
+    async fn claude_summarizer_gives_up_on_a_server_that_never_answers() {
+        let base = crate::test_support::silent_http_listener().await;
+        let summarizer = ClaudeSummarizer::with_endpoint(
+            "test-key".into(),
+            None,
+            &format!("{base}/v1/messages"),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        let observations = [sample("Edit", "src/a.rs")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            summarizer.synthesize(&observations),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "both attempts must time out and report an error"
+        );
+    }
 
     fn sample(tool: &str, file: &str) -> PendingObservation {
         PendingObservation {

@@ -60,6 +60,35 @@ pub struct MemoryLibrarian {
     /// Captured at construction (RUNAR_DEBUG) rather than read per call, so
     /// tests can flip it per instance without process-global env mutation.
     debug_enabled: bool,
+    /// Upper bound on one embed call from a save or search: [`EMBED_WAIT`],
+    /// lowered per instance by tests.
+    embed_wait: std::time::Duration,
+}
+
+/// How long a save or search waits for an embedding before it goes on
+/// without one. The OpenAI client gives up at the same point; this also
+/// bounds a local model and any provider without an HTTP timeout.
+pub(crate) const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `embed`, bounded by `wait`. A stalled provider used to hold the caller,
+/// and with it the serial MCP loop, until the OS gave up on the connection.
+/// The entry is still saved, only without a vector, and a warning says so.
+async fn bounded_embed(
+    provider: &dyn EmbeddingProvider,
+    text: &str,
+    wait: std::time::Duration,
+) -> Option<Vec<f32>> {
+    match tokio::time::timeout(wait, provider.embed(text)).await {
+        Ok(embedding) => embedding,
+        Err(_) => {
+            tracing::warn!(
+                provider = provider.name(),
+                wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                "embedding call timed out; continuing without it"
+            );
+            None
+        }
+    }
 }
 
 impl MemoryLibrarian {
@@ -75,12 +104,21 @@ impl MemoryLibrarian {
             default_namespace: default_namespace.to_string(),
             decay_config: decay_config.unwrap_or_default(),
             debug_enabled: crate::debug::enabled(),
+            embed_wait: EMBED_WAIT,
         }
     }
 
     /// Override the RUNAR_DEBUG gate for this instance (tests, tooling).
     pub fn with_debug(mut self, on: bool) -> Self {
         self.debug_enabled = on;
+        self
+    }
+
+    /// Lower the embed bound for this instance, so a test of a stalled
+    /// provider finishes quickly.
+    #[cfg(test)]
+    pub(crate) fn with_embed_wait(mut self, wait: std::time::Duration) -> Self {
+        self.embed_wait = wait;
         self
     }
 
@@ -213,7 +251,9 @@ impl MemoryLibrarian {
 
             // Generate and save embedding synchronously (before returning)
             if self.embedding.is_available() {
-                if let Some(emb) = self.embedding.embed(&embed_text).await {
+                if let Some(emb) =
+                    bounded_embed(&*self.embedding, &embed_text, self.embed_wait).await
+                {
                     let _ = self.storage.save_embedding(entry_id, &emb).await;
                 }
             }
@@ -809,7 +849,7 @@ impl MemoryLibrarian {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        match self.embedding.embed(&query).await {
+        match bounded_embed(&*self.embedding, &query, self.embed_wait).await {
             Some(embedding) => self.storage.semantic_search(&embedding, filters).await,
             None => Ok(vec![]),
         }
@@ -1543,7 +1583,7 @@ async fn auto_link_entry(
     // and the entry never got its related links.
     let search_text = crate::text::byte_prefix(&search_text, 500);
 
-    let query_emb = match embedding.embed(search_text).await {
+    let query_emb = match bounded_embed(embedding, search_text, EMBED_WAIT).await {
         Some(e) => e,
         None => return Ok(()),
     };
@@ -1756,6 +1796,44 @@ mod tests {
         for row in rows {
             assert!(!row.data.to_string().contains("SENTINEL"), "{}", row.data);
         }
+    }
+
+    /// `propose` awaited the embed unbounded, and fused search joined the
+    /// stalled semantic arm, so one stuck provider froze both.
+    #[tokio::test]
+    async fn save_and_search_return_when_the_embedder_stalls() {
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let lib = MemoryLibrarian::new(
+            storage,
+            Arc::new(crate::test_support::StalledEmbeddings),
+            "test",
+            None,
+        )
+        .with_embed_wait(std::time::Duration::from_millis(100));
+        let guard = std::time::Duration::from_secs(5);
+
+        let saved = tokio::time::timeout(
+            guard,
+            lib.propose(MemoryEntryInput {
+                title: "zebra migration".into(),
+                content: "move the zebra table".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("propose must not wait on the stalled embedder")
+        .unwrap();
+        assert!(lib.get(saved.id).await.is_ok(), "saved without a vector");
+
+        let hits = tokio::time::timeout(guard, lib.search("zebra", 5, None, None, None, None))
+            .await
+            .expect("search must not wait on the stalled embedder")
+            .unwrap();
+        assert!(
+            hits.iter().any(|e| e.id == saved.id),
+            "the keyword arm still finds it"
+        );
     }
 
     /// Session text bypasses `propose`, and every path into the sessions
