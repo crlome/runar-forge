@@ -8,6 +8,9 @@
 //! colon) and stop at the next same-or-higher-level heading so adjacent
 //! sections stay separate.
 
+// Offsets come from searches; cuts go through `str::get`, never `&s[a..b]`.
+#![deny(clippy::string_slice)]
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -80,42 +83,37 @@ pub fn parse_key_learnings(text: &str) -> Vec<ExtractedLearning> {
 // ── Internals ────────────────────────────────────────────────────
 
 fn locate_section(text: &str) -> Option<&str> {
-    let lower = text.to_lowercase();
-    let mut header_start = None;
-    let mut header_line_len = 0usize;
-    for header in SECTION_HEADERS {
-        if let Some(idx) = lower.find(header) {
-            // Must be at line start (char before is '\n' or BOF).
-            if idx == 0 || lower.as_bytes().get(idx - 1) == Some(&b'\n') {
-                header_start = Some(idx);
-                header_line_len = lower[idx..]
-                    .find('\n')
-                    .map(|n| n + 1)
-                    .unwrap_or_else(|| lower.len() - idx);
-                break;
-            }
-        }
-    }
-    let start = header_start? + header_line_len;
-    if start >= text.len() {
-        return Some("");
-    }
-    let tail = &text[start..];
+    // The headers are ASCII, and ASCII folding changes no byte length, so an
+    // offset found in `lower` is a char boundary of `text`. Full Unicode
+    // lowercasing does change lengths (U+0130, U+212A, ...), which shifted
+    // the section start: learnings were lost, or the cut panicked.
+    let lower = text.to_ascii_lowercase();
+    // The first header variant that occurs at a line start wins. Every
+    // occurrence is tried, so an inline mention earlier in a sentence
+    // ("see ## Learnings below") does not hide the real header.
+    let header_at = SECTION_HEADERS.iter().find_map(|header| {
+        lower
+            .match_indices(header)
+            .map(|(at, _)| at)
+            .find(|&at| at == 0 || lower.as_bytes().get(at - 1) == Some(&b'\n'))
+    })?;
+    let start = match text.get(header_at..)?.find('\n') {
+        Some(newline) => header_at + newline + 1,
+        None => text.len(),
+    };
+    let tail = text.get(start..)?;
     // Stop at the next same-or-higher-level heading so adjacent sections
     // don't bleed into each other.
     let end = tail
         .match_indices('\n')
-        .filter_map(|(i, _)| {
-            let after = &tail[i + 1..];
-            if after.starts_with("# ") || after.starts_with("## ") || after.starts_with("### ") {
-                Some(i)
-            } else {
-                None
-            }
+        .map(|(i, _)| i)
+        .find(|&i| {
+            tail.get(i + 1..).is_some_and(|after| {
+                after.starts_with("# ") || after.starts_with("## ") || after.starts_with("### ")
+            })
         })
-        .next()
         .unwrap_or(tail.len());
-    Some(&tail[..end])
+    tail.get(..end)
 }
 
 fn strip_bullet(line: &str) -> Option<&str> {
@@ -143,9 +141,11 @@ fn strip_bullet(line: &str) -> Option<&str> {
             return None;
         }
         if c == '.' || c == ')' {
-            let after_marker = &trimmed[digits + c.len_utf8()..];
-            if let Some(rest) = after_marker.strip_prefix(' ') {
-                return Some(rest);
+            let rest = trimmed
+                .get(digits + c.len_utf8()..)
+                .and_then(|after_marker| after_marker.strip_prefix(' '));
+            if rest.is_some() {
+                return rest;
             }
         }
         break;
@@ -254,6 +254,61 @@ preamble\n\
         let text = "## KEY LEARNINGS:\n- only one\n";
         let out = parse_key_learnings(text);
         assert_eq!(out.len(), 1);
+    }
+
+    fn titles(text: &str) -> Vec<String> {
+        parse_key_learnings(text)
+            .into_iter()
+            .map(|l| l.title)
+            .collect()
+    }
+
+    /// U+0130 lowercases one byte longer, so the section started one byte
+    /// late and the first item lost its bullet.
+    #[test]
+    fn dotted_capital_i_before_the_header_keeps_the_first_learning() {
+        assert_eq!(
+            titles("\u{0130}zmir notes\n## Key Learnings\n- First\n- Second\n"),
+            ["First", "Second"]
+        );
+    }
+
+    /// Three U+0130 moved the cut inside the first CJK character: a panic
+    /// that killed the MCP server.
+    #[test]
+    fn growing_chars_before_the_header_do_not_panic() {
+        let text = format!("{}\n## Learnings\n- 配置 first\n", "\u{0130}".repeat(3));
+        assert_eq!(titles(&text), ["配置 first"]);
+    }
+
+    /// Ten Kelvin signs (3 bytes each, 1 when lowercased) moved the cut 20
+    /// bytes early, and the section came back empty.
+    #[test]
+    fn shrinking_chars_before_the_header_keep_the_section() {
+        let text = format!("{}\n## Learnings\n- a\n", "\u{212A}".repeat(10));
+        assert_eq!(titles(&text), ["a"]);
+    }
+
+    /// Only the first occurrence of each header was tried; an inline
+    /// mention is not at a line start, so the real header was never found.
+    #[test]
+    fn inline_mention_before_the_real_header_is_skipped() {
+        assert_eq!(
+            titles("See ## Learnings below.\n## Learnings\n- real\n"),
+            ["real"]
+        );
+    }
+
+    #[test]
+    fn learnings_survive_hostile_text_before_the_header() {
+        for s in crate::test_support::hostile_corpus() {
+            assert_eq!(
+                titles(&format!("{s}\n## Key Learnings\n- first\n- second\n")),
+                ["first", "second"],
+                "after {:?}",
+                crate::text::char_prefix(&s, 40)
+            );
+        }
     }
 
     #[test]

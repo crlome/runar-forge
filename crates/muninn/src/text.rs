@@ -5,8 +5,17 @@
 //! whose cut point fell mid-character permanently killed the PreToolUse
 //! context hook for three projects, because the context packet is a fixed
 //! recency window that kept re-including the same row on every fire.
+//!
+//! The two prefix helpers below hold the only raw slices in this module,
+//! each at an index that is a char boundary by construction.
+
+#![deny(clippy::string_slice)]
 
 /// Char-boundary-safe prefix. Never panics, whatever `s` contains.
+#[allow(
+    clippy::string_slice,
+    reason = "the index comes from char_indices, so it is a char boundary"
+)]
 pub fn char_prefix(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => &s[..idx],
@@ -23,6 +32,10 @@ pub fn char_prefix(s: &str, max_chars: usize) -> &str {
 /// `String::truncate(n)` and `&s[..n]` both panic when `n` lands inside a
 /// multibyte character. This floors to the nearest boundary at or below the
 /// budget, so it always returns at most `max_bytes` and never panics.
+#[allow(
+    clippy::string_slice,
+    reason = "the index is lowered until is_char_boundary holds"
+)]
 pub fn byte_prefix(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -132,5 +145,37 @@ mod tests {
     fn zero_budget_yields_only_the_ellipsis() {
         assert_eq!(truncate_ellipsis("anything", 0), "...");
         assert_eq!(truncate_ellipsis("", 0), "");
+    }
+
+    /// The prefix helpers are how text code is meant to cut, so they must be
+    /// total on the shared hostile corpus. Every cut is tried on strings up
+    /// to 2 KB; longer ones are sampled, since a full sweep is quadratic.
+    #[test]
+    fn prefix_helpers_are_total_on_hostile_text() {
+        for s in crate::test_support::hostile_corpus() {
+            let label = char_prefix(&s, 40).to_string();
+            let end = s.len() + 3;
+            let cuts: Vec<usize> = if s.len() <= 2048 {
+                (0..=end).collect()
+            } else {
+                (0..=end).step_by(97).chain([s.len(), end]).collect()
+            };
+            for n in cuts {
+                let bytes = byte_prefix(&s, n);
+                assert!(
+                    bytes.len() <= n && s.starts_with(bytes),
+                    "byte_prefix({n}) on {label:?}"
+                );
+                let chars = char_prefix(&s, n);
+                assert!(
+                    chars.chars().count() <= n && s.starts_with(chars),
+                    "char_prefix({n}) on {label:?}"
+                );
+                assert!(
+                    truncate_ellipsis(&s, n).starts_with(chars),
+                    "truncate_ellipsis({n}) on {label:?}"
+                );
+            }
+        }
     }
 }

@@ -122,7 +122,9 @@ when you want.
 **Redact sensitive content:** wrap secrets in `<private>…</private>`
 tags when pasting into chat; they are stripped to `[redacted]` before
 any memory entry is saved, and the entry is tagged `redacted` for
-audit. Best-effort hygiene, not a security boundary.
+audit. Session goals and summaries are stripped the same way, and the
+prompt used for automatic recall is searched and embedded without the
+private text. Best-effort hygiene, not a security boundary.
 
 **Per-dev attribution (Phase 5.7):** every save stamps `author` from
 `git config user.name` (name only — never email; email is PII and

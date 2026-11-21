@@ -11,6 +11,9 @@
 //! questions returned zero rows, while the same questions rewritten as
 //! keyword/OR queries returned hits for all 16. This module is that rewrite.
 
+// Text is walked by `char`, never cut at a byte index.
+#![deny(clippy::string_slice)]
+
 /// Function words and interrogatives that carry no retrieval signal. Kept
 /// deliberately tight — anything that could plausibly be a domain term
 /// ("state", "type", "index", "key") stays in.
@@ -108,6 +111,22 @@ fn sanitize_phrase(phrase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever the input, the expression handed to FTS5 holds no syntax:
+    /// its ASCII is only letters, digits, `_`, spaces and phrase quotes.
+    #[test]
+    fn build_emits_no_fts5_syntax_on_hostile_text() {
+        for s in crate::test_support::hostile_corpus() {
+            let Some(q) = build(&s) else { continue };
+            assert!(
+                q.chars()
+                    .filter(|c| c.is_ascii())
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '"')),
+                "FTS5 syntax leaked from {:?}: {q:?}",
+                crate::text::char_prefix(&s, 40)
+            );
+        }
+    }
 
     #[test]
     fn strips_stopwords_and_or_joins_the_rest() {

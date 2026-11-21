@@ -1168,6 +1168,10 @@ async fn create_librarian_for_hook(project_id: &str) -> anyhow::Result<Arc<Memor
 }
 
 async fn create_librarian() -> anyhow::Result<Arc<MemoryLibrarian>> {
+    // Every hook, CLI command and MCP start that opens the store tightens
+    // an install whose files were created before they were owner-only.
+    // `runar doctor` never comes here, so it stays read-only.
+    setup::restrict_runar_permissions();
     let storage_type = std::env::var("RUNAR_STORAGE").unwrap_or_else(|_| "postgresql".into());
     let namespace = std::env::var("RUNAR_MEMORY_NAMESPACE").unwrap_or_else(|_| "default".into());
 
@@ -2983,8 +2987,10 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
             .as_deref()
             .is_none_or(|g| g == "Auto-started session");
         if placeholder {
-            // Redact before storing: the goal column bypasses propose().
-            let (clean_prompt, _) = redact::redact_secrets(prompt);
+            // Clean before the 120-char cut, so the budget is spent on public
+            // text; update_session cleans again, which changes nothing.
+            let mut clean_prompt = prompt.to_string();
+            redact::scrub_all(&mut clean_prompt);
             let goal: String = char_prefix(&clean_prompt, 120).to_string();
             let _ = librarian
                 .update_session(
@@ -3002,6 +3008,10 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything that could panic on user text: std's default hook
+    // quotes the text a bad slice was cutting into hook.log.
+    hooks_runtime::install_panic_hook();
+
     // Load `~/.runar-forge/.env` into the process env BEFORE anything reads
     // `std::env::var`. `dotenvy::from_path` does not overwrite vars already
     // set by the parent shell / Claude Code MCP env block. Missing file is

@@ -763,12 +763,32 @@ substring match on the name). `muninn_save` accepts an optional
 
 ### `<private>` redaction
 
-Any `<private>…</private>` block in `title` or `content` is stripped to
-`[redacted]` before storage, and the entry is tagged `redacted` for
-audit. Case-insensitive, multiple blocks supported, unterminated tags
-redact through end-of-input. **Best-effort hygiene, not a security
-boundary** — a motivated attacker with MCP access can still cause
-unredacted saves.
+Any `<private>…</private>` block is stripped to `[redacted]` before
+storage, and the entry is tagged `redacted` for audit. That covers an
+entry's `title` and `content`; session goals (including the one taken from
+a session's first prompt), summaries, instructions, accomplished items and
+discoveries; the text `muninn_capture_passive` splits into learnings; and a
+`topicKey` derived from the title, which then gets a short hash suffix so
+two such entries never replace each other. The prompt used for automatic
+recall, and any search query, loses its blocks before it is searched,
+embedded or written to the debug log.
+
+Tag names match case-insensitively in ASCII, multiple blocks are
+supported, the first closing tag ends a block, and an unterminated tag
+redacts through end-of-input. Text stored before v0.19.1 is not rewritten.
+**Best-effort hygiene, not a security boundary** — a motivated attacker
+with MCP access can still cause unredacted saves.
+
+### Files and permissions
+
+On macOS and Linux, `~/.runar-forge` is private to your account (0700), and
+`memory.db` (with its `-wal` and `-shm` files), `.env` and `hook.log` are
+0600. New files are created that way, and an older install is tightened the
+first time runar opens its store (any hook, CLI command or MCP start;
+`runar doctor` never changes modes). A database at a custom
+`RUNAR_SQLITE_PATH` outside `~/.runar-forge` keeps the mode it has, though a
+new one is created 0600. Windows is unchanged: user profiles are already
+per-user.
 
 ### MCP server
 
@@ -848,6 +868,15 @@ When done diagnosing, re-enable hooks:
 ```bash
 rm ~/.runar-forge/.disable-hooks
 ```
+
+### A save or search pauses for about 10 seconds
+
+With embeddings on, each save and search waits at most 10 s for the
+embeddings endpoint (3 s to connect), then continues without it: the entry
+is saved and found by keyword search, but gets no vector, and nothing adds
+one later. `embedding call timed out` or `embedding request failed`
+warnings in the MCP log or `hook.log` mean the endpoint is slow or
+unreachable. Set `RUNAR_EMBEDDINGS=disabled` until it recovers.
 
 ### `runar: command not found`
 

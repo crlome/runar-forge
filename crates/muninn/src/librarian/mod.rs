@@ -1,3 +1,6 @@
+// Text is cut with the `crate::text` helpers or `str::get`, never `&s[a..b]`.
+#![deny(clippy::string_slice)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -57,6 +60,35 @@ pub struct MemoryLibrarian {
     /// Captured at construction (RUNAR_DEBUG) rather than read per call, so
     /// tests can flip it per instance without process-global env mutation.
     debug_enabled: bool,
+    /// Upper bound on one embed call from a save or search: [`EMBED_WAIT`],
+    /// lowered per instance by tests.
+    embed_wait: std::time::Duration,
+}
+
+/// How long a save or search waits for an embedding before it goes on
+/// without one. The OpenAI client gives up at the same point; this also
+/// bounds a local model and any provider without an HTTP timeout.
+pub(crate) const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `embed`, bounded by `wait`. A stalled provider used to hold the caller,
+/// and with it the serial MCP loop, until the OS gave up on the connection.
+/// The entry is still saved, only without a vector, and a warning says so.
+async fn bounded_embed(
+    provider: &dyn EmbeddingProvider,
+    text: &str,
+    wait: std::time::Duration,
+) -> Option<Vec<f32>> {
+    match tokio::time::timeout(wait, provider.embed(text)).await {
+        Ok(embedding) => embedding,
+        Err(_) => {
+            tracing::warn!(
+                provider = provider.name(),
+                wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                "embedding call timed out; continuing without it"
+            );
+            None
+        }
+    }
 }
 
 impl MemoryLibrarian {
@@ -72,12 +104,21 @@ impl MemoryLibrarian {
             default_namespace: default_namespace.to_string(),
             decay_config: decay_config.unwrap_or_default(),
             debug_enabled: crate::debug::enabled(),
+            embed_wait: EMBED_WAIT,
         }
     }
 
     /// Override the RUNAR_DEBUG gate for this instance (tests, tooling).
     pub fn with_debug(mut self, on: bool) -> Self {
         self.debug_enabled = on;
+        self
+    }
+
+    /// Lower the embed bound for this instance, so a test of a stalled
+    /// provider finishes quickly.
+    #[cfg(test)]
+    pub(crate) fn with_embed_wait(mut self, wait: std::time::Duration) -> Self {
+        self.embed_wait = wait;
         self
     }
 
@@ -210,7 +251,9 @@ impl MemoryLibrarian {
 
             // Generate and save embedding synchronously (before returning)
             if self.embedding.is_available() {
-                if let Some(emb) = self.embedding.embed(&embed_text).await {
+                if let Some(emb) =
+                    bounded_embed(&*self.embedding, &embed_text, self.embed_wait).await
+                {
                     let _ = self.storage.save_embedding(entry_id, &emb).await;
                 }
             }
@@ -353,13 +396,14 @@ impl MemoryLibrarian {
     // ── Sessions ───────────────────────────────────────────────
 
     pub async fn propose_session(&self, input: SessionInput) -> StorageResult<Session> {
-        // Straight to storage, so it scrubs here. The goal is model- or
+        // Straight to storage, so it cleans here. The goal is model- or
         // caller-supplied free text — "set up deploys with sk-ant-…" is an
-        // ordinary thing to write — and it is persisted on the session row and
-        // replayed into the next session's context packet.
+        // ordinary thing to write, and so is a <private> block — and it is
+        // persisted on the session row and replayed into the next session's
+        // context packet.
         let mut input = input;
         if let Some(ref mut goal) = input.goal {
-            crate::redact::scrub(goal);
+            crate::redact::scrub_all(goal);
         }
         let ns = self.ns(input.project_id.as_deref()).to_string();
         self.storage.create_session(input, &ns).await
@@ -393,19 +437,13 @@ impl MemoryLibrarian {
         checkpoint: bool,
     ) -> StorageResult<Session> {
         // This path persists via storage.save directly (no propose), so it
-        // must redact here: summaries/goals/discoveries are model-supplied
+        // must clean here: summaries/goals/discoveries are model-supplied
         // text and end up both in the sessions table and in an FTS-indexed
-        // session entry.
+        // session entry. Private blocks go first, as in propose.
         let mut summary = summary;
-        let redact_string = |s: &mut String| {
-            let (clean, hits) = crate::redact::redact_secrets(s);
-            if !hits.is_empty() {
-                *s = clean;
-            }
-        };
-        redact_string(&mut summary.summary);
+        crate::redact::scrub_all(&mut summary.summary);
         if let Some(ref mut g) = summary.goal {
-            redact_string(g);
+            crate::redact::scrub_all(g);
         }
         for item in summary
             .instructions
@@ -413,7 +451,7 @@ impl MemoryLibrarian {
             .chain(summary.accomplished.iter_mut())
             .chain(summary.discoveries.iter_mut())
         {
-            redact_string(item);
+            crate::redact::scrub_all(item);
         }
 
         // Goal and discoveries used to be dropped here (SessionUpdate had no
@@ -486,11 +524,23 @@ impl MemoryLibrarian {
             .find(|s| s.status == SessionStatus::Active))
     }
 
+    /// The chokepoint for session text written outside `end_session`: the
+    /// first-prompt goal, the ping and summarize hooks. Like `propose`, it
+    /// strips private blocks and redacts secrets before storage.
     pub async fn update_session(
         &self,
         id: uuid::Uuid,
         update: crate::types::SessionUpdate,
     ) -> StorageResult<Session> {
+        let mut update = update;
+        for text in update
+            .goal
+            .iter_mut()
+            .chain(update.summary.iter_mut())
+            .chain(update.discoveries.iter_mut().flatten())
+        {
+            crate::redact::scrub_all(text);
+        }
         self.storage.update_session(id, update).await
     }
 
@@ -551,6 +601,13 @@ impl MemoryLibrarian {
         project_id: Option<&str>,
     ) -> StorageResult<Vec<MemoryEntry>> {
         let started = std::time::Instant::now();
+        // Private words must not steer recall, and the prompt reaches the FTS
+        // query, the embeddings API and the debug log from here. A prompt
+        // that was only a private block recalls nothing.
+        let prompt = crate::redact::strip_private_for_query(prompt);
+        if prompt.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         // Over-fetch, then drop the types that are captured *input* rather
         // than knowledge, plus the ones that describe work not yet done.
         // Without this the arm recalls the very prompt it was triggered by —
@@ -558,7 +615,7 @@ impl MemoryLibrarian {
         // the corpus, and a 0.5× rank multiplier is not enough to keep them
         // out of the top 8. See `EntryType::excluded_from_injection`.
         let entries: Vec<MemoryEntry> = self
-            .fused_search_inner(prompt, limit * 3, None, project_id, None, None, false)
+            .fused_search_inner(&prompt, limit * 3, None, project_id, None, None, false)
             .await?
             .into_iter()
             .filter(|e| !e.entry_type.excluded_from_injection())
@@ -729,16 +786,18 @@ impl MemoryLibrarian {
 
         if self.debug_enabled {
             let duration_ms = search_started.elapsed().as_secs_f64() * 1000.0;
+            // Cleaned: debug_log is not namespace-scoped, and agents paste
+            // user text into search queries. Clean while n=3 is not a
+            // guarantee.
+            let mut logged_query = query.to_string();
+            crate::redact::scrub_all(&mut logged_query);
             crate::debug::log(
                 &self.storage,
                 DebugLogInput {
                     event: DebugEvent::SearchScoring,
                     entry_id: None,
                     data: serde_json::json!({
-                        // Redacted: debug_log is not namespace-scoped, and
-                        // automatic recall now puts whole user prompts through
-                        // this path. Clean while n=3 is not a guarantee.
-                        "query": crate::redact::redact_secrets(query).0,
+                        "query": logged_query,
                         "namespace": ns,
                         "projectId": project_id,
                         "semanticCount": semantic_ranks.len(),
@@ -783,7 +842,14 @@ impl MemoryLibrarian {
         if !self.embedding.is_available() {
             return Ok(vec![]);
         }
-        match self.embedding.embed(query).await {
+        // The embed call is where a query leaves the machine, so private
+        // blocks are stripped here for every caller, including agent-written
+        // muninn_search and curator_ask queries. The FTS arm is local.
+        let query = crate::redact::strip_private_for_query(query);
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        match bounded_embed(&*self.embedding, &query, self.embed_wait).await {
             Some(embedding) => self.storage.semantic_search(&embedding, filters).await,
             None => Ok(vec![]),
         }
@@ -1282,7 +1348,11 @@ impl MemoryLibrarian {
         entry_type: Option<EntryType>,
         extra_tags: &[String],
     ) -> StorageResult<Vec<SaveResult>> {
-        let items = crate::capture::parse_key_learnings(text);
+        // Strip before splitting. `propose` strips each item on its own, so a
+        // block opened in one bullet and closed in the next reached it as two
+        // halves, and the second half (no opening tag) was stored.
+        let (text, redactions) = crate::redact::strip_private(text);
+        let items = crate::capture::parse_key_learnings(&text);
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -1292,6 +1362,11 @@ impl MemoryLibrarian {
 
         for item in items {
             let mut tags: Vec<String> = vec!["auto-capture".into(), "key-learning".into()];
+            // `propose` adds this tag only when it strips something itself,
+            // and nothing is left for it to strip.
+            if redactions > 0 && item.content.contains("[redacted]") {
+                tags.push("redacted".into());
+            }
             if let Some(pid) = project_id {
                 tags.push(pid.to_string());
             }
@@ -1383,14 +1458,17 @@ fn format_context_packet(
         lines.push("### Recent Sessions".into());
         for s in sessions {
             let date = s.started_at.format("%Y-%m-%d").to_string();
+            // Stripped again at render time: rows written before session
+            // text was cleaned still hold private blocks, and every packet
+            // would replay them.
             let goal = s
                 .goal
                 .as_deref()
-                .map(|g| format!(": {g}"))
+                .map(|g| format!(": {}", crate::redact::strip_private(g).0))
                 .unwrap_or_default();
             lines.push(format!("- Session {date}{goal}"));
             if let Some(ref summary) = s.summary {
-                lines.push(format!("  {summary}"));
+                lines.push(format!("  {}", crate::redact::strip_private(summary).0));
             }
         }
         lines.push(String::new());
@@ -1422,9 +1500,9 @@ fn format_context_packet(
         "- {} memory entries | {} sessions",
         stats.total_entries, stats.total_sessions
     ));
-    if !stats.namespaces.is_empty() {
-        lines.push(format!("- Namespaces: {}", stats.namespaces.join(", ")));
-    }
+    // No namespace list: `stats.namespaces` spans the whole store, so it
+    // named every other project, and on a shared Postgres every other
+    // user's, in every session's context.
 
     lines.join("\n")
 }
@@ -1500,9 +1578,12 @@ async fn auto_link_entry(
 
     let entry = storage.get(entry_id).await?;
     let search_text = format!("{} {}", entry.title, entry.content);
-    let search_text = &search_text[..search_text.len().min(500)];
+    // A 500-byte budget, floored to a char boundary: a raw `[..500]` panicked
+    // whenever byte 500 fell inside a multibyte character (most CJK text),
+    // and the entry never got its related links.
+    let search_text = crate::text::byte_prefix(&search_text, 500);
 
-    let query_emb = match embedding.embed(search_text).await {
+    let query_emb = match bounded_embed(embedding, search_text, EMBED_WAIT).await {
         Some(e) => e,
         None => return Ok(()),
     };
@@ -1619,6 +1700,280 @@ mod tests {
             "the tombstone must carry deleted_at, or the remote resolver \
              treats it as a live entry and the deletion never propagates"
         );
+    }
+
+    async fn recording_librarian() -> (
+        MemoryLibrarian,
+        Arc<crate::test_support::RecordingEmbeddings>,
+    ) {
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let recorder = Arc::new(crate::test_support::RecordingEmbeddings::default());
+        let lib = MemoryLibrarian::new(storage, recorder.clone(), "test", None);
+        (lib, recorder)
+    }
+
+    /// Recall searched with the raw prompt on every UserPromptSubmit, and
+    /// with embeddings on, that prompt went to the embeddings API.
+    #[tokio::test]
+    async fn recall_never_sends_private_text_to_the_embedder() {
+        let (lib, recorder) = recording_librarian().await;
+        lib.recall_for_prompt("why is <private>SENTINEL-R</private> slow", 8, Some("p"))
+            .await
+            .unwrap();
+        let sent = recorder.inputs();
+        assert!(!sent.is_empty(), "the public words are still embedded");
+        assert!(sent.iter().all(|s| !s.contains("SENTINEL")), "{sent:?}");
+
+        // A prompt that is only a private block recalls and embeds nothing.
+        let hits = lib
+            .recall_for_prompt("<private>SENTINEL-B</private>", 8, Some("p"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(recorder.inputs().len(), sent.len(), "no embed call");
+
+        // Private words do not steer recall's keyword arm either: an entry
+        // that matches only them is not recalled.
+        lib.propose(MemoryEntryInput {
+            title: "zebra crossing".into(),
+            content: "striped".into(),
+            project_id: Some("p".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let hits = lib
+            .recall_for_prompt("<private>zebra</private> lunch plans", 8, Some("p"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "recalled by a private word: {hits:?}");
+    }
+
+    /// Agent-written queries (muninn_search, curator_ask) reach the same
+    /// embed call.
+    #[tokio::test]
+    async fn search_never_sends_private_text_to_the_embedder() {
+        let (lib, recorder) = recording_librarian().await;
+        lib.search(
+            "<private>SENTINEL-Q</private> cache misses",
+            5,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sent = recorder.inputs();
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|s| !s.contains("SENTINEL")), "{sent:?}");
+    }
+
+    /// The RUNAR_DEBUG log stored queries with secrets redacted but
+    /// private blocks intact.
+    #[tokio::test]
+    async fn debug_log_query_has_no_private_text() {
+        let lib = test_librarian().await.with_debug(true);
+        lib.search(
+            "<private>SENTINEL-D</private> cache",
+            10,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let rows = lib
+            .query_debug_log(DebugLogQuery {
+                event: Some(DebugEvent::SearchScoring),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert!(!row.data.to_string().contains("SENTINEL"), "{}", row.data);
+        }
+    }
+
+    /// `propose` awaited the embed unbounded, and fused search joined the
+    /// stalled semantic arm, so one stuck provider froze both.
+    #[tokio::test]
+    async fn save_and_search_return_when_the_embedder_stalls() {
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let lib = MemoryLibrarian::new(
+            storage,
+            Arc::new(crate::test_support::StalledEmbeddings),
+            "test",
+            None,
+        )
+        .with_embed_wait(std::time::Duration::from_millis(100));
+        let guard = std::time::Duration::from_secs(5);
+
+        let saved = tokio::time::timeout(
+            guard,
+            lib.propose(MemoryEntryInput {
+                title: "zebra migration".into(),
+                content: "move the zebra table".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("propose must not wait on the stalled embedder")
+        .unwrap();
+        assert!(lib.get(saved.id).await.is_ok(), "saved without a vector");
+
+        let hits = tokio::time::timeout(guard, lib.search("zebra", 5, None, None, None, None))
+            .await
+            .expect("search must not wait on the stalled embedder")
+            .unwrap();
+        assert!(
+            hits.iter().any(|e| e.id == saved.id),
+            "the keyword arm still finds it"
+        );
+    }
+
+    /// Every SessionStart packet ended with "- Namespaces: …", listing
+    /// every namespace in the store.
+    #[tokio::test]
+    async fn context_packet_names_no_other_project() {
+        let lib = test_librarian().await;
+        crate::test_support::context_packet_names_no_other_namespace(&lib, "proj_a", "proj_b")
+            .await;
+    }
+
+    /// Session text bypasses `propose`, and every path into the sessions
+    /// table or the session-summary entry used to redact secrets only.
+    #[tokio::test]
+    async fn session_paths_drop_private_blocks() {
+        let lib = test_librarian().await;
+        crate::test_support::session_paths_drop_private_blocks(&lib, "p").await;
+    }
+
+    /// Rows written before session text was cleaned still hold private
+    /// blocks, and every SessionStart packet replayed them.
+    #[tokio::test]
+    async fn context_packet_strips_private_blocks_from_stored_sessions() {
+        let (lib, storage) = test_librarian_with_storage().await;
+        let legacy = storage
+            .create_session(
+                SessionInput {
+                    goal: Some("legacy <private>PRIV-L1</private> goal".into()),
+                    project_id: Some("p".into()),
+                    tool: None,
+                },
+                "p",
+            )
+            .await
+            .unwrap();
+        storage
+            .update_session(
+                legacy.id,
+                SessionUpdate {
+                    status: Some(SessionStatus::Completed),
+                    summary: Some("old <private>PRIV-L2</private> summary".into()),
+                    ended_at: Some(Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let packet = lib.get_context(None, Some("p"), 3).await.unwrap();
+        assert!(
+            packet.formatted.contains("legacy [redacted] goal")
+                && packet.formatted.contains("old [redacted] summary"),
+            "{}",
+            packet.formatted
+        );
+        assert!(!packet.formatted.contains("PRIV-L"), "{}", packet.formatted);
+    }
+
+    /// The auto-link query was cut with `[..500]`, which panicked whenever
+    /// byte 500 fell inside a multibyte character (most CJK text): the
+    /// spawned task died and the entry never got its related links.
+    #[tokio::test]
+    async fn auto_link_survives_a_multibyte_char_at_byte_500() {
+        let storage = SqliteAdapter::in_memory("test").unwrap();
+        storage.initialize().await.unwrap();
+        let unit = [1.0, 0.0, 0.0, 0.0];
+        let fixed = crate::test_support::FixedEmbeddings(unit.to_vec());
+        let anchor = storage
+            .save(
+                MemoryEntryInput {
+                    title: "anchor".into(),
+                    content: "plain ascii".into(),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        storage.save_embedding(anchor.id, &unit).await.unwrap();
+
+        for atom in crate::test_support::HOSTILE_ATOMS
+            .iter()
+            .filter(|atom| !atom.is_ascii())
+        {
+            // The query is "t " + content, so the atom starts at byte 499
+            // and byte 500 falls inside it.
+            let content = crate::test_support::straddling(498, atom);
+            let entry = storage
+                .save(
+                    MemoryEntryInput {
+                        title: "t".into(),
+                        content,
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+            auto_link_entry(&storage, &fixed, entry.id, "test")
+                .await
+                .unwrap();
+            let edges = storage.get_edges(entry.id, None).await.unwrap();
+            assert!(
+                edges
+                    .iter()
+                    .any(|e| e.edge_type == EdgeType::Related && e.to_id == anchor.id),
+                "no related link for an entry straddling byte 500 with {atom:?}"
+            );
+        }
+    }
+
+    /// The outbox payload is a snapshot of the stored row, so private text
+    /// that survived `strip_private` would be pushed to the shared remote.
+    /// Seventeen U+0130 before the block used to shift the cut far enough
+    /// to keep it.
+    #[tokio::test]
+    async fn private_text_never_reaches_the_outbox() {
+        let _env = crate::test_support::with_env("RUNAR_STORAGE_LOCAL", "sqlite");
+        let (lib, storage) = test_librarian_with_storage().await;
+        let shifted = "\u{0130}".repeat(17);
+        lib.propose(MemoryEntryInput {
+            title: format!("{shifted} <private>SENTINEL-T</private> outbox"),
+            content: format!("{shifted} <private>SENTINEL-C</private> tail"),
+            entry_type: EntryType::Note,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let queued = crate::test_support::drain_outbox(&*storage).await;
+        assert_eq!(queued.len(), 1, "one insert queued");
+        let entry = &queued[0];
+        assert!(
+            !entry.title.contains("SENTINEL") && !entry.content.contains("SENTINEL"),
+            "private text queued for the remote: {:?} / {:?}",
+            entry.title,
+            entry.content
+        );
+        assert_eq!(entry.content, format!("{shifted} [redacted] tail"));
+        assert!(entry.tags.iter().any(|t| t == "redacted"));
     }
 
     /// Outbox writes stay off unless hybrid mode is configured; a
@@ -2140,6 +2495,36 @@ mod tests {
 
         assert!(!results.is_empty());
         assert_eq!(results[0].title, "Database migration strategy");
+    }
+
+    #[tokio::test]
+    async fn capture_passive_strips_blocks_that_span_bullets() {
+        let lib = test_librarian().await;
+
+        // The text used to be split into items before anything was
+        // stripped, so the second half of this block (no opening tag) was
+        // stored.
+        let spanning =
+            "## Key Learnings\n- a <private>SENTINEL-1\n- SENTINEL-2</private> z\n- plain\n";
+        let saved = lib
+            .capture_passive(spanning, Some("proj-span"), None, &[])
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 2, "'a [redacted] z' and 'plain'");
+        let mut redacted_items = 0;
+        for res in &saved {
+            let entry = lib.get(res.id).await.unwrap();
+            assert!(
+                !entry.title.contains("SENTINEL") && !entry.content.contains("SENTINEL"),
+                "private text stored: {:?}",
+                entry.content
+            );
+            if entry.content.contains("[redacted]") {
+                assert!(entry.tags.iter().any(|t| t == "redacted"));
+                redacted_items += 1;
+            }
+        }
+        assert_eq!(redacted_items, 1);
     }
 
     #[tokio::test]

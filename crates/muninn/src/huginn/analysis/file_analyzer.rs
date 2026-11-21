@@ -211,17 +211,18 @@ fn is_test_file(path: &str) -> bool {
 }
 
 fn infer_purpose(file_path: &str, content: &str, exports: &[String]) -> String {
-    // File-level doc comment (@description)
-    if let Some(head) = content.get(..500.min(content.len())) {
-        if let Some(idx) = head.find("@description") {
-            let line = head[idx + "@description".len()..]
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim();
-            if !line.is_empty() {
-                return line.to_string();
-            }
+    // File-level doc comment (@description) in the first 500 bytes. The
+    // budget floors to a char boundary: `content.get(..500)` returned None
+    // whenever byte 500 fell inside a multibyte character, which silently
+    // skipped this rule.
+    let head = crate::text::byte_prefix(content, 500);
+    if let Some(after) = head
+        .find("@description")
+        .and_then(|idx| head.get(idx + "@description".len()..))
+    {
+        let line = after.lines().next().unwrap_or("").trim();
+        if !line.is_empty() {
+            return line.to_string();
         }
     }
 
@@ -527,6 +528,22 @@ fn build_relationships(file_path: &str, graph: &DependencyGraph) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `content.get(..500)` returned None when byte 500 fell inside a
+    /// multibyte character, which silently skipped the @description rule.
+    #[test]
+    fn purpose_survives_a_multibyte_char_at_byte_500() {
+        let header = "/** @description Handles auth tokens\n"; // 37 bytes
+        let content = format!("{header}{}配配", "x".repeat(462));
+        assert!(
+            !content.is_char_boundary(500),
+            "fixture must straddle byte 500"
+        );
+        assert_eq!(
+            infer_purpose("src/auth.ts", &content, &[]),
+            "Handles auth tokens"
+        );
+    }
 
     #[test]
     fn responsibilities_from_rust() {

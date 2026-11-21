@@ -7,59 +7,70 @@
 //! A motivated attacker with MCP access can still cause unredacted saves.
 //! Docs should be explicit about this.
 
-/// Redact content between `<private>...</private>` tags. Case-insensitive on
-/// the tag names, supports multiple blocks, and tolerates unclosed tags by
-/// redacting through end-of-input. Returns the stripped string and how many
-/// blocks were redacted.
+// Offsets come from searches; cuts go through `str::get`, never `&s[a..b]`.
+#![deny(clippy::string_slice)]
+
+/// Redact content between `<private>...</private>` tags. Tag names match
+/// case-insensitively in ASCII, multiple blocks are supported, the first
+/// closing tag ends a block, and an unclosed tag redacts through
+/// end-of-input. Returns the stripped string and how many blocks were
+/// redacted.
 pub fn strip_private(input: &str) -> (String, usize) {
+    strip_blocks(input, "[redacted]")
+}
+
+/// [`strip_private`] for text used as a search query. Each block becomes a
+/// space, so the query never searches for the word "redacted".
+pub fn strip_private_for_query(input: &str) -> String {
+    strip_blocks(input, " ").0
+}
+
+/// Replace each private block with `marker`.
+///
+/// Tags are found in an ASCII-lowercased copy. ASCII folding never changes
+/// a byte length and the tags are ASCII, so every offset found in the copy
+/// is a char boundary of `input`. Full Unicode lowercasing does change
+/// lengths (U+0130 grows from 2 bytes to 3, U+212A shrinks from 3 to 1),
+/// and cutting `input` at offsets taken from such a copy kept private text,
+/// dropped public text, or panicked mid-character. Cuts still go through
+/// `str::get`: if one were ever invalid, the rest is redacted (fail closed)
+/// rather than kept or panicked on.
+fn strip_blocks(input: &str, marker: &str) -> (String, usize) {
     const OPEN: &str = "<private>";
     const CLOSE: &str = "</private>";
-    const MARKER: &str = "[redacted]";
 
-    // Short-circuit when no opening marker exists (case-insensitive scan).
-    if !has_ci(input, OPEN) {
+    let folded = input.to_ascii_lowercase();
+    if !folded.contains(OPEN) {
         return (input.to_string(), 0);
     }
 
-    let lower = input.to_lowercase();
     let mut out = String::with_capacity(input.len());
-    let mut cursor = 0usize;
     let mut count = 0usize;
-
-    while cursor < input.len() {
-        match lower[cursor..].find(OPEN) {
-            Some(rel_open) => {
-                let open_at = cursor + rel_open;
-                // Emit everything before the opening tag.
-                out.push_str(&input[cursor..open_at]);
-                // Find a matching closer; if none, redact through EOF.
-                let after_open = open_at + OPEN.len();
-                match lower[after_open..].find(CLOSE) {
-                    Some(rel_close) => {
-                        out.push_str(MARKER);
-                        count += 1;
-                        cursor = after_open + rel_close + CLOSE.len();
-                    }
-                    None => {
-                        // Unterminated — treat the rest of the input as private.
-                        out.push_str(MARKER);
-                        count += 1;
-                        cursor = input.len();
-                    }
-                }
-            }
-            None => {
-                out.push_str(&input[cursor..]);
-                break;
-            }
+    let mut cursor = 0usize;
+    while let Some(rel_open) = folded.get(cursor..).and_then(|rest| rest.find(OPEN)) {
+        let open_at = cursor + rel_open;
+        let Some(before) = input.get(cursor..open_at) else {
+            out.push_str(marker);
+            return (out, count + 1);
+        };
+        out.push_str(before);
+        out.push_str(marker);
+        count += 1;
+        let after_open = open_at + OPEN.len();
+        match folded.get(after_open..).and_then(|rest| rest.find(CLOSE)) {
+            Some(rel_close) => cursor = after_open + rel_close + CLOSE.len(),
+            // Unterminated: the rest of the input is private.
+            None => return (out, count),
         }
     }
-
+    match input.get(cursor..) {
+        Some(rest) => out.push_str(rest),
+        None => {
+            out.push_str(marker);
+            count += 1;
+        }
+    }
     (out, count)
-}
-
-fn has_ci(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(needle)
 }
 
 use regex::Regex;
@@ -341,6 +352,35 @@ pub fn scrub(text: &mut String) -> usize {
     total
 }
 
+/// Elide the input from a panic message. On Rust 1.94 (not on 1.100),
+/// std's message for a failed str slice quotes up to 256 bytes of the
+/// string being cut, after ` of `` or ` when slicing ``; the message is cut
+/// there. Every message is capped at 300 chars. No regex, because this runs
+/// inside the panic hook.
+pub fn elide_panic_input(msg: &str) -> String {
+    for subject in [" of `", " when slicing `"] {
+        if let Some(head) = msg
+            .find(subject)
+            .and_then(|at| msg.get(..at + subject.len()))
+        {
+            return crate::text::truncate_ellipsis(&format!("{head}<input elided>`"), 300);
+        }
+    }
+    crate::text::truncate_ellipsis(msg, 300)
+}
+
+/// [`strip_private`] in place, then [`scrub`]: the order `propose` uses, so
+/// a secret inside a private block goes with the block. For write paths that
+/// bypass `propose` (session goals, summaries, discoveries). Returns private
+/// blocks plus secret hits. A second pass changes nothing.
+pub fn scrub_all(text: &mut String) -> usize {
+    let (stripped, blocks) = strip_private(text);
+    if blocks > 0 {
+        *text = stripped;
+    }
+    blocks + scrub(text)
+}
+
 /// Recursively redact every string leaf of a JSON value (hook payloads carry
 /// tool input/output as nested JSON). Returns the total number of hits.
 pub fn redact_secrets_value(value: &mut serde_json::Value) -> usize {
@@ -414,8 +454,119 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    const DOTTED_I: &str = "\u{0130}"; // 2 bytes; lowercases to 3
+    const KELVIN: &str = "\u{212A}"; // 3 bytes; lowercases to 1
+
+    /// Offsets taken from a Unicode-lowercased copy were 17 bytes late
+    /// here: the cut kept `<private>pin 4821` and dropped ` tail`.
+    #[test]
+    fn strip_private_keeps_offsets_after_length_growing_chars() {
+        let prefix = DOTTED_I.repeat(17);
+        let (out, n) = strip_private(&format!("{prefix} <private>pin 4821</private> tail"));
+        assert_eq!(out, format!("{prefix} [redacted] tail"));
+        assert_eq!(n, 1);
+        assert!(!out.contains("4821"));
+    }
+
+    /// The open offset (4) came from a copy in which the Kelvin sign was one
+    /// byte, so the cut landed inside it and panicked.
+    #[test]
+    fn strip_private_does_not_panic_on_a_shrinking_char_before_the_tag() {
+        let (out, n) = strip_private(&format!("300{KELVIN}<private>hunter2</private> ok"));
+        assert_eq!(out, format!("300{KELVIN}[redacted] ok"));
+        assert_eq!(n, 1);
+    }
+
+    /// Six Kelvin signs inside the block made the close offset 12 bytes
+    /// short, leaving `21</private>` in the output.
+    #[test]
+    fn strip_private_close_cut_ignores_case_changes_inside_the_span() {
+        let kelvins = KELVIN.repeat(6);
+        let (out, n) = strip_private(&format!(
+            "<private>temp 300{kelvins} pin=4821</private> done"
+        ));
+        assert_eq!(out, "[redacted] done");
+        assert_eq!(n, 1);
+    }
+
+    /// Both private payloads were kept and the public text between and
+    /// after them dropped.
+    #[test]
+    fn strip_private_handles_every_block_after_shifting_chars() {
+        let prefix = DOTTED_I.repeat(12);
+        let (out, n) = strip_private(&format!(
+            "{prefix}<private>aaa</private> mid <private>bbb</private> end"
+        ));
+        assert_eq!(out, format!("{prefix}[redacted] mid [redacted] end"));
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn strip_private_holds_on_the_hostile_corpus() {
+        for s in crate::test_support::hostile_corpus() {
+            if s.contains('<') {
+                continue; // tag fragments: wrapping a block around them changes the meaning
+            }
+            let label = crate::text::char_prefix(&s, 40);
+            for (open, close) in [("<private>", "</private>"), ("<PRIVATE>", "</Private>")] {
+                let (out, n) = strip_private(&format!("{s}{open}SENTINEL{s}{close}{s}"));
+                assert_eq!(out, format!("{s}[redacted]{s}"), "around {label:?}");
+                assert_eq!(n, 1, "around {label:?}");
+            }
+            let (out, n) = strip_private(&format!("{s}<private>SENTINEL{s}"));
+            assert_eq!(
+                out,
+                format!("{s}[redacted]"),
+                "unterminated after {label:?}"
+            );
+            assert_eq!(n, 1);
+        }
+    }
+
+    #[test]
+    fn strip_private_on_seeded_mixes_never_emits_a_tag() {
+        let mixes = crate::test_support::hostile_mixes(2000, 0x5EED_1234);
+
+        // The mixer must keep producing the shapes that broke the old code,
+        // or a seed or mixer change would quietly remove this test's teeth.
+        let atoms_before_tag = |s: &str, atom: char| {
+            s.to_ascii_lowercase()
+                .find("<private>")
+                .and_then(|at| s.get(..at))
+                .map_or(0, |before| before.chars().filter(|c| *c == atom).count())
+        };
+        assert!(mixes.iter().any(|s| atoms_before_tag(s, '\u{0130}') >= 10));
+        assert!(mixes.iter().any(|s| atoms_before_tag(s, '\u{212A}') >= 1));
+
+        for s in &mixes {
+            let (out, n) = strip_private(s);
+            assert!(
+                !out.to_ascii_lowercase().contains("<private>"),
+                "tag emitted for {s:?}"
+            );
+            if !s.to_ascii_lowercase().contains("<private>") {
+                assert_eq!((out.as_str(), n), (s.as_str(), 0));
+            }
+        }
+    }
+
     fn total_hits(hits: &[SecretHit]) -> usize {
         hits.iter().map(|h| h.count).sum()
+    }
+
+    #[test]
+    fn redact_secrets_leaves_hostile_text_alone_and_still_catches_secrets() {
+        // Assembled at runtime so no secret-shaped literal sits in the source.
+        let fake = ["Zq8x", "7Lm2", "Pw9R", "t4Kd"].concat();
+        for s in crate::test_support::hostile_corpus() {
+            let label = crate::text::char_prefix(&s, 40);
+            let (out, hits) = redact_secrets(&s);
+            assert_eq!(out, s, "clean text changed: {label:?}");
+            assert_eq!(total_hits(&hits), 0, "false hit on {label:?}");
+
+            let (out, _) = redact_secrets(&format!("{s} DB_PASSWORD={fake} {s}"));
+            assert!(!out.contains(&fake), "secret survived next to {label:?}");
+        }
     }
 
     #[test]

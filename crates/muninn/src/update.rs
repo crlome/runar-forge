@@ -4,7 +4,7 @@
 //! Operating model
 //! ---------------
 //! The update flow reads a JSON manifest at `RUNAR_UPDATE_MANIFEST_URL`
-//! (defaults to a hard-coded URL once the release pipeline is wired up).
+//! (defaults to the latest GitHub release's `manifest.json`).
 //! The manifest looks like:
 //!
 //! ```json
@@ -31,11 +31,11 @@
 //! `runar setup claude-code`), so a swap mid-session never corrupts a
 //! running CC.
 //!
-//! Distribution infra is owned outside this file: the manifest URL,
-//! signing, and CI release pipeline live in `.gitlab-ci.yml` (or a future
-//! GitHub release workflow). Until that endpoint exists, `runar update`
-//! still works in `--check` mode against any URL the user passes through
-//! `RUNAR_UPDATE_MANIFEST_URL`, and surfaces a clear error otherwise.
+//! Distribution lives in `.github/workflows/release.yml`, which publishes
+//! `manifest.json` as a release asset. The only integrity check is the
+//! SHA-256 per artifact, read from that same manifest; the manifest is not
+//! signed, so the check catches a corrupt or truncated download, not a
+//! tampered release. `RUNAR_UPDATE_MANIFEST_URL` overrides the manifest URL.
 
 use std::fs;
 use std::path::PathBuf;
@@ -344,6 +344,27 @@ mod tests {
     #[test]
     fn current_version_matches_cargo() {
         assert_eq!(current_version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    /// The README claimed "signed release manifests"; `run` checks a SHA-256
+    /// taken from the same unsigned manifest. A security claim the code does
+    /// not make must not come back.
+    #[test]
+    fn readme_describes_what_update_actually_verifies() {
+        let readme = include_str!("../../../README.md");
+        // The bullet: its first line and the indented lines that continue it.
+        let mut lines = readme
+            .lines()
+            .skip_while(|l| !l.contains("**Self-update.**"));
+        let first = lines.next().expect("README has a Self-update bullet");
+        let claim = std::iter::once(first)
+            .chain(lines.take_while(|l| l.starts_with("  ")))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(claim.contains("SHA-256"), "{claim}");
+        assert!(claim.contains("not signed"), "{claim}");
+        assert!(!claim.contains("signed release"), "{claim}");
     }
 
     /// Targets whose binary the build runner can execute. aarch64-linux is

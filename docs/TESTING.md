@@ -210,6 +210,16 @@ When fixing a defect of this family, grep the **shape**, then grep again for
 the shape under every plausible local name. The 0.9.1 miss searched by
 variable name; the same six-line helper was copy-pasted under four names.
 
+An offset is valid only in the string it was found in. `to_lowercase()`
+changes the byte length of some characters (U+0130 grows from 2 bytes to 3,
+U+212A shrinks from 3 to 1), so never cut the original at an offset found in
+a Unicode-lowercased copy: when the needle is ASCII, fold with
+`to_ascii_lowercase()`, which keeps every offset. Cut through `str::get`,
+not `&s[a..b]`. `redact.rs`, `capture.rs`, `text.rs`, `fts_query.rs` and
+`librarian/mod.rs` deny `clippy::string_slice`; the only allowed raw slices
+are inside `text::char_prefix` and `text::byte_prefix`. Drive any new text
+transformer through `test_support::hostile_corpus()`.
+
 ## Credential fixtures
 
 Assemble fake credentials at runtime from parts. Do not write them as
