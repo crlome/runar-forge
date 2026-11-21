@@ -121,3 +121,67 @@ pub(crate) fn hostile_corpus() -> Vec<String> {
     }
     corpus
 }
+
+/// Claim every queued outbox row and decode its payload the way
+/// `sync::push` does before sending it: exactly what the remote would
+/// receive.
+pub(crate) async fn drain_outbox(
+    storage: &dyn crate::storage::MemoryStorage,
+) -> Vec<crate::types::MemoryEntry> {
+    storage
+        .claim_outbox(10_000, i32::MAX)
+        .await
+        .expect("claim the outbox")
+        .into_iter()
+        .map(|row| {
+            serde_json::from_value(row.row_payload)
+                .expect("an outbox payload decodes as a MemoryEntry, as push does")
+        })
+        .collect()
+}
+
+/// `count` texts mixing runs of hostile atoms, ASCII words, `<private>` tag
+/// fragments and markdown lines, drawn from a xorshift generator seeded
+/// with `seed`: random coverage that is identical on every OS, with no
+/// dependency.
+pub(crate) fn hostile_mixes(count: usize, seed: u64) -> Vec<String> {
+    const WORDS: &[&str] = &[
+        "alpha",
+        "pin 4821",
+        " ",
+        "\n",
+        "## Key Learnings\n",
+        "- item\n",
+    ];
+    const TAGS: &[&str] = &[
+        "<private>",
+        "</private>",
+        "<PRIVATE>",
+        "</Private>",
+        "<priv",
+        "ate>",
+    ];
+    let mut state = seed | 1;
+    let mut next = move |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    (0..count)
+        .map(|_| {
+            let mut text = String::new();
+            for _ in 0..1 + next(40) {
+                match next(3) {
+                    0 => {
+                        let atom = HOSTILE_ATOMS[next(HOSTILE_ATOMS.len())];
+                        text.push_str(&atom.repeat(1 + next(12)));
+                    }
+                    1 => text.push_str(WORDS[next(WORDS.len())]),
+                    _ => text.push_str(TAGS[next(TAGS.len())]),
+                }
+            }
+            text
+        })
+        .collect()
+}

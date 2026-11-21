@@ -1621,6 +1621,37 @@ mod tests {
         );
     }
 
+    /// The outbox payload is a snapshot of the stored row, so private text
+    /// that survived `strip_private` would be pushed to the shared remote.
+    /// Seventeen U+0130 before the block used to shift the cut far enough
+    /// to keep it.
+    #[tokio::test]
+    async fn private_text_never_reaches_the_outbox() {
+        let _env = crate::test_support::with_env("RUNAR_STORAGE_LOCAL", "sqlite");
+        let (lib, storage) = test_librarian_with_storage().await;
+        let shifted = "\u{0130}".repeat(17);
+        lib.propose(MemoryEntryInput {
+            title: format!("{shifted} <private>SENTINEL-T</private> outbox"),
+            content: format!("{shifted} <private>SENTINEL-C</private> tail"),
+            entry_type: EntryType::Note,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let queued = crate::test_support::drain_outbox(&*storage).await;
+        assert_eq!(queued.len(), 1, "one insert queued");
+        let entry = &queued[0];
+        assert!(
+            !entry.title.contains("SENTINEL") && !entry.content.contains("SENTINEL"),
+            "private text queued for the remote: {:?} / {:?}",
+            entry.title,
+            entry.content
+        );
+        assert_eq!(entry.content, format!("{shifted} [redacted] tail"));
+        assert!(entry.tags.iter().any(|t| t == "redacted"));
+    }
+
     /// Outbox writes stay off unless hybrid mode is configured; a
     /// single-backend user should never accumulate a queue.
     #[tokio::test]
