@@ -936,30 +936,6 @@ impl<'a> PlanStore<'a> {
         Ok(None)
     }
 
-    /// `propose` with the store's key and project, nothing more. Only
-    /// `save_section` still writes this way.
-    async fn save(
-        &self,
-        title: &str,
-        content: &str,
-        entry_type: EntryType,
-        topic_key: &str,
-        tags: Vec<String>,
-    ) -> StorageResult<()> {
-        self.lib
-            .propose(MemoryEntryInput {
-                title: title.to_string(),
-                content: content.to_string(),
-                entry_type,
-                tags,
-                project_id: self.project_id.clone(),
-                topic_key: Some(topic_key.to_string()),
-                ..Default::default()
-            })
-            .await?;
-        Ok(())
-    }
-
     /// Write one entry so that afterwards the store holds exactly it.
     ///
     /// Two things `propose` alone does not do. An unchanged entry comes
@@ -1144,6 +1120,12 @@ impl<'a> PlanStore<'a> {
     }
 
     /// Upsert one section of an existing plan, leaving the rest alone.
+    ///
+    /// The plan must exist (its slug resolves like `get_plan`'s). Omitting
+    /// `phase` keeps the section's stored phase, and its status follows the
+    /// same carry rule as `create_plan`, so re-saving a done phase keeps it
+    /// done. Only this section's own parts are replaced: `plan:p:00-body`
+    /// never retires its neighbour `plan:p:00-body-extra`.
     pub async fn save_section(
         &self,
         slug: &str,
@@ -1152,38 +1134,62 @@ impl<'a> PlanStore<'a> {
         content: &str,
         phase: Option<usize>,
     ) -> StorageResult<String> {
+        let Some((slug, existing)) = self.resolve_plan(slug).await? else {
+            return Err(crate::storage::StorageError::Invalid(format!(
+                "no plan with slug '{slug}'; create it with muninn_plan_create first"
+            )));
+        };
         let (title, title_blocks) = crate::redact::strip_private(title);
         let (content, content_blocks) = crate::redact::strip_private(content);
-        let (title, content) = (title.as_str(), content.as_str());
-        let section_key = plan_section_key(slug, index, title);
-        let parts = split_section(content, content_limit());
+        let section_key = plan_section_key(&slug, index, &title);
+        let part_prefix = format!("{section_key}{PART_SEP}");
+        let own_part = |key: &str| key == section_key || key.starts_with(&part_prefix);
+
+        let phase = phase.or_else(|| {
+            existing
+                .iter()
+                .filter(|e| e.topic_key.as_deref().is_some_and(own_part))
+                .find_map(|e| tag_value(&e.tags, PHASE_TAG)?.parse().ok())
+        });
+        let phase_status = phase.map(|n| {
+            let (body, _) = crate::redact::redact_secrets(&content);
+            match carry_phase(&stored_phases(&existing), &slugify(&title), n, &body) {
+                Carry::Kept { status, .. } => status,
+                Carry::Restarted | Carry::New => PhaseStatus::Pending,
+            }
+        });
+
+        let parts = split_section(&content, content_limit());
         let mut written = Vec::new();
         for (part_idx, body) in parts.iter().enumerate() {
-            let key = part_key(&section_key, part_idx + 1, parts.len());
             let mut tags = vec!["plan".to_string(), format!("{PLAN_REF_TAG}{slug}")];
             if title_blocks + content_blocks > 0 {
                 tags.push("redacted".to_string());
             }
-            if let Some(phase) = phase {
+            if let (Some(phase), Some(phase_status)) = (phase, phase_status) {
                 set_tag(&mut tags, PHASE_TAG, &phase.to_string());
-                set_tag(&mut tags, PHASE_STATUS_TAG, PhaseStatus::Pending.as_str());
+                set_tag(&mut tags, PHASE_STATUS_TAG, phase_status.as_str());
             }
-            let part_title = if parts.len() > 1 {
-                format!("{title} (part {}/{})", part_idx + 1, parts.len())
-            } else {
-                title.to_string()
+            let entry = PlannedEntry {
+                key: part_key(&section_key, part_idx + 1, parts.len()),
+                title: if parts.len() > 1 {
+                    format!("{title} (part {}/{})", part_idx + 1, parts.len())
+                } else {
+                    title.clone()
+                },
+                content: body.clone(),
+                tags,
             };
-            self.save(&part_title, body, EntryType::Plan, &key, tags)
-                .await?;
-            written.push(key);
+            self.put(&entry, EntryType::Plan).await?;
+            written.push(entry.key);
         }
         // Same bounded reconciliation as `create_plan`, scoped to this one
-        // section: drop parts left over from a longer previous version.
-        for entry in self.entries_under(&section_key).await? {
+        // section's own parts: drop parts left over from a longer version.
+        for entry in self.plan_entries(&slug).await? {
             if entry
                 .topic_key
                 .as_deref()
-                .is_some_and(|k| !written.iter().any(|w| w == k))
+                .is_some_and(|k| own_part(k) && !written.iter().any(|w| w == k))
             {
                 self.lib.deprecate(entry.id).await?;
             }

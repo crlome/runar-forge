@@ -2331,7 +2331,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: "muninn_plan_save_section".into(),
-            description: "Add or replace one section of an existing plan, leaving the rest untouched. Content longer than the entry cap is split across parts rather than truncated.".into(),
+            description: "Add or replace one section of an existing plan, leaving the rest untouched. The plan must already exist (create it with muninn_plan_create). Content longer than the entry cap is split across parts rather than truncated.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2339,7 +2339,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "index": { "type": "number", "description": "Section ordinal; determines reading order" },
                     "title": { "type": "string" },
                     "content": { "type": "string" },
-                    "phase": { "type": "number", "description": "Set when this section is executable work to track" },
+                    "phase": { "type": "number", "description": "Set when this section is executable work to track. Omit to keep the section's current phase; a re-saved phase keeps its status" },
                     "projectId": { "type": "string" },
                 },
                 "required": ["slug", "index", "title", "content"],
@@ -3219,6 +3219,75 @@ mod tests {
         let doc = plan(&lib, "p").await;
         assert_eq!(doc["sections"][0]["phase"], 2);
         assert_eq!(phase_statuses(&doc), ["done"]);
+    }
+
+    async fn save_section(lib: &MemoryLibrarian, args: Value) -> Result<Value, String> {
+        call(tool_plan_save_section(&args, lib)).await
+    }
+
+    #[tokio::test]
+    async fn save_section_refuses_a_plan_that_does_not_exist() {
+        let lib = icebox_test_lib().await;
+        let err = save_section(
+            &lib,
+            serde_json::json!({ "slug": "ghost", "index": 0, "title": "T", "content": "c" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("muninn_plan_create"), "{err}");
+        assert!(lib
+            .list_by_topic_prefix(None, "plan:ghost")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_section_resolves_a_mixed_case_slug() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth", "auth", "## Phase 1 — a\n\nx\n").await;
+        let saved = save_section(
+            &lib,
+            serde_json::json!({ "slug": "Auth", "index": 1, "title": "Notes", "content": "n" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved["topicKey"], "plan:auth:01-notes");
+        assert!(section_titles(&plan(&lib, "auth").await).contains(&"Notes".to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_section_keeps_a_neighbour_at_the_same_index() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "p", "p", "").await;
+        for (title, content) in [("Body extra", "x"), ("Body", "y")] {
+            save_section(
+                &lib,
+                serde_json::json!({ "slug": "p", "index": 0, "title": title, "content": content }),
+            )
+            .await
+            .unwrap();
+        }
+        let titles = section_titles(&plan(&lib, "p").await);
+        assert!(titles.contains(&"Body".to_string()), "{titles:?}");
+        assert!(titles.contains(&"Body extra".to_string()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn re_saving_a_phase_section_keeps_its_phase_and_status() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "p", "p", "## Phase 1 — go\n\nx\n").await;
+        set_phase(&lib, "p", 1, "done").await;
+        for args in [
+            serde_json::json!({ "slug": "p", "index": 0, "title": "Phase 1 — go", "content": "x, edited", "phase": 1 }),
+            serde_json::json!({ "slug": "p", "index": 0, "title": "Phase 1 — go", "content": "x, edited again" }),
+        ] {
+            save_section(&lib, args).await.unwrap();
+            let doc = plan(&lib, "p").await;
+            assert_eq!(doc["sections"][0]["phase"], 1, "{doc}");
+            assert_eq!(doc["sections"][0]["phaseStatus"], "done", "{doc}");
+            assert_eq!(doc["phasesTotal"], 1);
+        }
     }
 
     #[tokio::test]
