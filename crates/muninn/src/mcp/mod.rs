@@ -702,7 +702,7 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
 
     // Sections arrive either pre-split or as one markdown document. The
     // markdown form is what a /prd conversation naturally produces.
-    let mut untracked: Vec<String> = Vec::new();
+    let mut parse_warnings: Vec<String> = Vec::new();
     let sections: Vec<crate::plans::SectionInput> = match args.get("sections") {
         Some(Value::Array(items)) => items
             .iter()
@@ -726,7 +726,7 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
         _ => match arg_str(args, "markdown") {
             Some(md) => {
                 let parsed = crate::plans::parse_markdown(md);
-                untracked = parsed.untracked_phase_headings;
+                parse_warnings = parsed.warnings();
                 parsed.sections
             }
             None => Vec::new(),
@@ -748,15 +748,7 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
         "trackedPhases": tracked,
         "hint": "track execution with muninn_plan_set_status(slug, phase, phaseStatus)",
     });
-    let mut warnings = Vec::new();
-    if !untracked.is_empty() {
-        warnings.push(format!(
-            "{} heading(s) name a phase but sit below `##`, so they are body text and are \
-             NOT tracked: {}. Promote them to `## Phase N — name`.",
-            untracked.len(),
-            untracked.join("; ")
-        ));
-    }
+    let mut warnings = parse_warnings;
     warnings.extend(created.notices());
     if !warnings.is_empty() {
         response["warning"] = serde_json::json!(warnings.join(" "));

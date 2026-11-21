@@ -845,7 +845,7 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                 None => None,
             };
 
-            let (title, overview, sections, untracked) = match &file {
+            let (title, overview, sections, untracked, unclosed) = match &file {
                 Some(path) => {
                     let text = std::fs::read_to_string(path)
                         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
@@ -861,6 +861,7 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                         parsed.overview,
                         parsed.sections,
                         parsed.untracked_phase_headings,
+                        parsed.unclosed_fence_phase_headings,
                     )
                 }
                 None => (
@@ -868,6 +869,7 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                         anyhow::anyhow!("give a title, or --file to read one from markdown")
                     })?,
                     String::new(),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 ),
@@ -906,6 +908,15 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                 }
                 println!(
                     "  Promote them to `## Phase N — name` to track progress across sessions."
+                );
+            }
+            if !unclosed.is_empty() {
+                println!(
+                    "\n  WARNING — the file ends inside an open code fence, so {} phase \
+                     heading(s) after it are body text and will NOT be tracked: {}. \
+                     Close the fence.",
+                    unclosed.len(),
+                    unclosed.join("; ")
                 );
             }
             for notice in created.notices() {

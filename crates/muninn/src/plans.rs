@@ -455,16 +455,48 @@ pub struct ParsedMarkdown {
     /// promoting them automatically would make an `### Phase 2` inside a
     /// worked example into executable work.
     pub untracked_phase_headings: Vec<String>,
+    /// Phase headings inside a code fence that is still open at the end of
+    /// the document. An unclosed fence runs to the end (as in CommonMark),
+    /// so they are body text; usually the closing fence is just missing.
+    pub unclosed_fence_phase_headings: Vec<String>,
+}
+
+impl ParsedMarkdown {
+    /// One sentence per parse problem the author should fix, for the MCP
+    /// `warning` and the CLI.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.untracked_phase_headings.is_empty() {
+            out.push(format!(
+                "{} heading(s) name a phase but sit below `##`, so they are body text and are \
+                 NOT tracked: {}. Promote them to `## Phase N — name`.",
+                self.untracked_phase_headings.len(),
+                self.untracked_phase_headings.join("; ")
+            ));
+        }
+        if !self.unclosed_fence_phase_headings.is_empty() {
+            out.push(format!(
+                "the document ends inside an open code fence, so {} phase heading(s) after it \
+                 are body text and are NOT tracked: {}. Close the fence.",
+                self.unclosed_fence_phase_headings.len(),
+                self.unclosed_fence_phase_headings.join("; ")
+            ));
+        }
+        out
+    }
 }
 
 /// Parse a plan written as markdown: a leading `# Title`, prose before the
 /// first `## Heading` as the overview, and one section per `##`.
 ///
-/// A heading naming a phase (`## Phase 2 — storage`, `## Phase 2: storage`)
-/// becomes an executable phase; every other section is prose. That rule is
-/// deliberately syntactic rather than clever: a plan author can see from the
-/// heading alone whether a section will be tracked, and no section is
-/// silently promoted into work.
+/// A heading starting with a phase number (`## Phase 2 — storage`,
+/// `## Phase 2: storage`) becomes an executable phase; every other section
+/// is prose. That rule is deliberately syntactic rather than clever: a plan
+/// author can see from the heading alone whether a section will be
+/// tracked, and no section is silently promoted into work. Lines inside a
+/// ``` or ~~~ code fence are body text, so a plan that quotes markdown
+/// keeps its real sections. The title is the first `# ` line before the
+/// first section; any later `# ` line there stays in the overview.
 pub fn parse_markdown(text: &str) -> ParsedMarkdown {
     // Strip the whole document before splitting it: a block that spans a
     // heading would otherwise be cut in two, the heading inside it would
@@ -476,8 +508,30 @@ pub fn parse_markdown(text: &str) -> ParsedMarkdown {
     let mut sections: Vec<SectionInput> = Vec::new();
     let mut current: Option<(String, String)> = None;
     let mut untracked_phase_headings = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut fenced_phase_headings = Vec::new();
 
     for line in text.lines() {
+        if let Some(open) = fence {
+            if closes_fence(line, open) {
+                fence = None;
+                fenced_phase_headings.clear();
+            } else if let Some(rest) = line
+                .strip_prefix("## ")
+                .or_else(|| line.strip_prefix("### "))
+            {
+                if parse_phase_number(rest).is_some() {
+                    fenced_phase_headings.push(rest.trim().to_string());
+                }
+            }
+            push_text(&mut current, &mut overview, line);
+            continue;
+        }
+        if let Some(open) = opens_fence(line) {
+            fence = Some(open);
+            push_text(&mut current, &mut overview, line);
+            continue;
+        }
         // Any deeper heading naming a phase is body text by the rule below,
         // but silently so — record it for the caller to warn about.
         if let Some(rest) = line.strip_prefix("### ") {
@@ -495,17 +549,11 @@ pub fn parse_markdown(text: &str) -> ParsedMarkdown {
                 title = Some(rest.trim().to_string());
                 continue;
             }
-            // A `#` after the first section is body text, not a title.
-            if let Some((_, body)) = current.as_mut() {
-                body.push_str(line);
-                body.push('\n');
-            }
-        } else if let Some((_, body)) = current.as_mut() {
-            body.push_str(line);
-            body.push('\n');
+            // Any other `#` line is text: overview before the first
+            // section, body after it.
+            push_text(&mut current, &mut overview, line);
         } else {
-            overview.push_str(line);
-            overview.push('\n');
+            push_text(&mut current, &mut overview, line);
         }
     }
     if let Some((heading, body)) = current {
@@ -517,6 +565,47 @@ pub fn parse_markdown(text: &str) -> ParsedMarkdown {
         overview: overview.trim().to_string(),
         sections,
         untracked_phase_headings,
+        unclosed_fence_phase_headings: if fence.is_some() {
+            fenced_phase_headings
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// Append a line to the open section's body, or to the overview before
+/// the first section.
+fn push_text(current: &mut Option<(String, String)>, overview: &mut String, line: &str) {
+    let target = match current.as_mut() {
+        Some((_, body)) => body,
+        None => overview,
+    };
+    target.push_str(line);
+    target.push('\n');
+}
+
+/// A code-fence opener: at most three spaces of indent, then three or more
+/// backticks or tildes. Returns the fence character and its run length.
+fn opens_fence(line: &str) -> Option<(char, usize)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let ch = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let run = rest.chars().take_while(|c| *c == ch).count();
+    (run >= 3).then_some((ch, run))
+}
+
+/// Does `line` close the fence `open`: the same character, a run at least
+/// as long, and nothing after it but whitespace?
+fn closes_fence(line: &str, (ch, len): (char, usize)) -> bool {
+    match opens_fence(line) {
+        Some((c, run)) if c == ch && run >= len => line
+            .trim_start_matches(' ')
+            .trim_start_matches(ch)
+            .trim()
+            .is_empty(),
+        _ => false,
     }
 }
 
@@ -528,12 +617,15 @@ fn section_from_heading(heading: &str, body: &str) -> SectionInput {
     }
 }
 
-/// Pull `N` out of a heading naming a phase. Case-insensitive; tolerates
-/// the separators these documents actually use (`—`, `-`, `:`, `.`).
+/// `N` for a heading that starts with `Phase N`. Case-insensitive; leading
+/// markup (`**Phase 2** — x`) is skipped, and the separators these
+/// documents use after the number (`—`, `-`, `:`, `.`) are fine. A heading
+/// that only mentions a phase (`Risks in phase 2`) is prose.
 fn parse_phase_number(heading: &str) -> Option<usize> {
-    let lower = heading.to_lowercase();
-    let idx = lower.find("phase")?;
-    lower[idx + "phase".len()..]
+    heading
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+        .strip_prefix("phase")?
         .trim_start()
         .chars()
         .take_while(|c| c.is_ascii_digit())
@@ -1719,6 +1811,113 @@ none
         let parsed = parse_markdown("# P\n\n## Phase 1 — go\n\nbody\n");
         assert_eq!(parsed.sections[0].phase, Some(1));
         assert!(parsed.untracked_phase_headings.is_empty());
+    }
+
+    fn headings(parsed: &ParsedMarkdown) -> Vec<(String, Option<usize>)> {
+        parsed
+            .sections
+            .iter()
+            .map(|s| (s.title.clone(), s.phase))
+            .collect()
+    }
+
+    #[test]
+    fn a_fenced_block_never_becomes_a_section_or_a_phase() {
+        let parsed = parse_markdown(
+            "# P\n\n## Design\n\nExample:\n\n```markdown\n## Phase 9 — fake\n### Phase 8 — fake\n```\n\n## Phase 1 — real\n\nbody\n",
+        );
+        assert_eq!(
+            headings(&parsed),
+            [
+                ("Design".to_string(), None),
+                ("Phase 1 — real".to_string(), Some(1))
+            ]
+        );
+        assert!(parsed.sections[0].content.contains("## Phase 9 — fake"));
+        assert!(
+            parsed.untracked_phase_headings.is_empty(),
+            "{:?}",
+            parsed.untracked_phase_headings
+        );
+    }
+
+    #[test]
+    fn tilde_and_longer_fences_close_correctly() {
+        let parsed = parse_markdown("## A\n\n~~~~\n## x\n~~~\n## y\n~~~~  \n\n## B\n\nb\n");
+        assert_eq!(
+            headings(&parsed),
+            [("A".to_string(), None), ("B".to_string(), None)]
+        );
+        assert!(parsed.sections[0].content.contains("## x"));
+        assert!(parsed.sections[0].content.contains("## y"));
+    }
+
+    #[test]
+    fn an_unclosed_fence_runs_to_the_end() {
+        let parsed = parse_markdown("## A\n\n```\n## B\n");
+        assert_eq!(headings(&parsed), [("A".to_string(), None)]);
+        assert!(parsed.sections[0].content.contains("## B"));
+    }
+
+    #[test]
+    fn an_unclosed_fence_reports_the_phases_it_swallowed() {
+        let parsed = parse_markdown("## A\n\n```\n## Phase 2 — b\n\nbody\n");
+        assert_eq!(parsed.unclosed_fence_phase_headings, ["Phase 2 — b"]);
+        assert!(parsed
+            .warnings()
+            .iter()
+            .any(|w| w.contains("Close the fence")));
+        // A closed fence reports nothing.
+        let closed = parse_markdown("## A\n\n```\n## Phase 2 — b\n```\n");
+        assert!(closed.unclosed_fence_phase_headings.is_empty());
+        assert!(closed.warnings().is_empty());
+    }
+
+    #[test]
+    fn only_a_heading_that_starts_with_phase_is_tracked() {
+        assert_eq!(parse_phase_number("Risks in phase 2"), None);
+        assert_eq!(parse_phase_number("**Phase 2** — storage"), Some(2));
+        assert_eq!(parse_phase_number("Phased rollout"), None);
+        assert_eq!(parse_phase_number("Phase 2a — x"), Some(2));
+    }
+
+    #[test]
+    fn a_hash_line_in_the_overview_is_kept() {
+        let parsed = parse_markdown("# T\n\nintro\n\n# Aside\n\nmore\n\n## S\n\nbody\n");
+        assert_eq!(parsed.title.as_deref(), Some("T"));
+        assert!(parsed.overview.contains("# Aside"), "{}", parsed.overview);
+        assert!(parsed.overview.contains("more"));
+    }
+
+    /// The title rule is unchanged: the first `# ` line before the first
+    /// section, wherever comments or front matter put it.
+    #[test]
+    fn comment_and_front_matter_led_documents_keep_their_title() {
+        for doc in [
+            "<!-- generated -->\n\n# Title\n\nintro\n\n## S\n\nbody\n",
+            "---\nowner: x\n---\n\n# Title\n\nintro\n\n## S\n\nbody\n",
+        ] {
+            let parsed = parse_markdown(doc);
+            assert_eq!(parsed.title.as_deref(), Some("Title"), "{doc}");
+            assert!(parsed.overview.contains("intro"));
+            assert_eq!(parsed.sections.len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_parser_is_total_on_hostile_text() {
+        let mut inputs = crate::test_support::hostile_corpus();
+        inputs.extend(crate::test_support::hostile_mixes(200, 0x9A75_E0FF));
+        for text in &inputs {
+            let fenced = format!("# {text}\n\n## Phase 1 {text}\n\n```\n## {text}\n```\n{text}\n");
+            for doc in [text.as_str(), fenced.as_str()] {
+                let parsed = parse_markdown(doc);
+                for section in &parsed.sections {
+                    let _ = slugify(&section.title);
+                }
+            }
+            let _ = parse_phase_number(text);
+        }
     }
 
     #[test]
