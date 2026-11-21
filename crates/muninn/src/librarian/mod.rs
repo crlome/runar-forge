@@ -1282,7 +1282,11 @@ impl MemoryLibrarian {
         entry_type: Option<EntryType>,
         extra_tags: &[String],
     ) -> StorageResult<Vec<SaveResult>> {
-        let items = crate::capture::parse_key_learnings(text);
+        // Strip before splitting. `propose` strips each item on its own, so a
+        // block opened in one bullet and closed in the next reached it as two
+        // halves, and the second half (no opening tag) was stored.
+        let (text, redactions) = crate::redact::strip_private(text);
+        let items = crate::capture::parse_key_learnings(&text);
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -1292,6 +1296,11 @@ impl MemoryLibrarian {
 
         for item in items {
             let mut tags: Vec<String> = vec!["auto-capture".into(), "key-learning".into()];
+            // `propose` adds this tag only when it strips something itself,
+            // and nothing is left for it to strip.
+            if redactions > 0 && item.content.contains("[redacted]") {
+                tags.push("redacted".into());
+            }
             if let Some(pid) = project_id {
                 tags.push(pid.to_string());
             }
@@ -2171,6 +2180,36 @@ mod tests {
 
         assert!(!results.is_empty());
         assert_eq!(results[0].title, "Database migration strategy");
+    }
+
+    #[tokio::test]
+    async fn capture_passive_strips_blocks_that_span_bullets() {
+        let lib = test_librarian().await;
+
+        // The text used to be split into items before anything was
+        // stripped, so the second half of this block (no opening tag) was
+        // stored.
+        let spanning =
+            "## Key Learnings\n- a <private>SENTINEL-1\n- SENTINEL-2</private> z\n- plain\n";
+        let saved = lib
+            .capture_passive(spanning, Some("proj-span"), None, &[])
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 2, "'a [redacted] z' and 'plain'");
+        let mut redacted_items = 0;
+        for res in &saved {
+            let entry = lib.get(res.id).await.unwrap();
+            assert!(
+                !entry.title.contains("SENTINEL") && !entry.content.contains("SENTINEL"),
+                "private text stored: {:?}",
+                entry.content
+            );
+            if entry.content.contains("[redacted]") {
+                assert!(entry.tags.iter().any(|t| t == "redacted"));
+                redacted_items += 1;
+            }
+        }
+        assert_eq!(redacted_items, 1);
     }
 
     #[tokio::test]
