@@ -4,6 +4,13 @@
 # binary for `runar update`, and sha256 checksums for both. The publish job
 # also generates manifest.json (consumed by `runar update`) and a final job
 # publishes the npm shim.
+#
+# Gates (pinned by `release_pipeline_keeps_its_gates` in
+# crates/muninn/src/update.rs): the tag must match the Cargo.toml version,
+# every binary the runner can execute must start and report that version,
+# npm publishes only after the GitHub release exists, and a missing
+# NPM_TOKEN fails the run. workflow_dispatch is the dry run: preflight and
+# build run, publish and npm-publish stay tag-only.
 name: release
 
 on:
@@ -16,30 +23,67 @@ permissions:
   contents: write
 
 jobs:
+  # Fail before five builds when the tag and Cargo.toml disagree: the
+  # manifest would advertise a version the binary does not report, and
+  # `runar update` (strict equality) would re-offer it forever. The job runs
+  # on every trigger, because `build` needs it and a skipped need would skip
+  # the workflow_dispatch dry run; only the comparison step is tag-only.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(awk -F'"' '/^\[workspace\.package\]/ {p = 1; next} /^\[/ {p = 0} p && /^version *=/ {print $2; exit}' Cargo.toml)"
+          if [ -z "$cargo_version" ]; then
+            echo "::error::no version under [workspace.package] in Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}: bump Cargo.toml or move the tag"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml ${cargo_version}"
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
+        # `smoke: true` marks the targets this runner can execute (see the
+        # "Smoke the built binary" step).
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+            smoke: true
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             cross: true
-          - runner: macos-14
+          # macos-latest, like ci.yml: a pinned image is retired under the
+          # pipeline (macos-14 was, failing both macOS builds before they
+          # start). The binaries' minimum macOS comes from rustc's default
+          # deployment target, not from the runner image.
+          - runner: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
+            smoke: true
           # Cross-compile Intel on the arm64 runner — Apple clang cross-builds
-          # x86_64 natively, and the macos-13 (Intel) hosted runner is being
-          # retired so its label can hang queued forever.
-          - runner: macos-14
+          # x86_64 natively, and the Intel hosted runners are being retired,
+          # so their labels can hang queued forever.
+          - runner: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+            smoke: true
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +118,28 @@ jobs:
       - name: Codesign (macOS, ad-hoc)
         if: runner.os == 'macOS'
         run: codesign --force --sign - target/${{ matrix.target }}/release/runar
+
+      # Run the binary that will be packaged (after codesign, which rewrites
+      # it in place on macOS): one that does not start must never ship.
+      # aarch64-linux is cross-built and x86_64-apple-darwin is built on an
+      # arm64 runner, so neither can run here. On tags the output must name
+      # the tag's version.
+      - name: Smoke the built binary
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/runar"
+          if [ "${{ matrix.archive }}" = "zip" ]; then bin="${bin}.exe"; fi
+          out="$("$bin" --version | tr -d '\r')"
+          echo "$out"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            want="runar ${GITHUB_REF_NAME#v}"
+            if [ "$out" != "$want" ]; then
+              echo "::error::$bin --version printed '$out', expected '$want'"
+              exit 1
+            fi
+          fi
 
       - name: Package
         id: pkg
@@ -166,9 +232,11 @@ jobs:
   # Publish the npm packages: one binary-only package per platform
   # (@runar-forge/cli-<os>-<cpu>) plus the launcher meta-package
   # (@runar-forge/cli). No postinstall — the binary is package content, so it
-  # installs under `ignore-scripts=true`. Gated so a missing NPM_TOKEN skips.
+  # installs under `ignore-scripts=true`. Runs only after the GitHub release
+  # exists, and a missing NPM_TOKEN fails the run: a release that ships no
+  # npm packages must not look green.
   npm-publish:
-    needs: build
+    needs: [build, publish]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -187,8 +255,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "NPM_TOKEN unset — skipping npm publish."
-            exit 0
+            echo "::error::NPM_TOKEN is not set: npm users would get nothing for this release. Add the secret and re-run this job."
+            exit 1
           fi
           VERSION="${GITHUB_REF_NAME#v}"
           ART="${GITHUB_WORKSPACE}/artifacts"
