@@ -475,6 +475,9 @@ pub struct MemoryStats {
     pub total_sessions: i64,
     pub entries_by_type: Vec<(String, i64)>,
     pub entries_by_layer: Vec<(u8, i64)>,
+    /// Every namespace in the store, whatever namespace the stats were
+    /// asked for. Never render it into injected context: it names other
+    /// projects, and on a shared database other users'.
     pub namespaces: Vec<String>,
 }
 

@@ -293,6 +293,38 @@ pub(crate) async fn session_paths_drop_private_blocks(
     }
 }
 
+/// The context packet names only its own project. Shared by the SQLite and
+/// live-Postgres tests; on a shared database `project` and `other` must be
+/// unique to the test.
+pub(crate) async fn context_packet_names_no_other_namespace(
+    lib: &crate::librarian::MemoryLibrarian,
+    project: &str,
+    other: &str,
+) {
+    use crate::types::{EntryType, MemoryEntryInput};
+
+    for (namespace, title) in [(project, "own entry"), (other, "other entry")] {
+        lib.propose(MemoryEntryInput {
+            title: title.into(),
+            content: "context packet scope check".into(),
+            entry_type: EntryType::Decision,
+            project_id: Some(namespace.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let packet = lib.get_context(None, Some(project), 3).await.unwrap();
+    let text = &packet.formatted;
+    assert!(!text.contains("Namespaces:"), "{text}");
+    assert!(!text.contains(other), "another namespace is named: {text}");
+    assert!(text.contains("own entry"), "{text}");
+    assert!(
+        text.contains("memory entries |"),
+        "the stats line stays: {text}"
+    );
+}
+
 /// Claim every queued outbox row and decode its payload the way
 /// `sync::push` does before sending it: exactly what the remote would
 /// receive.

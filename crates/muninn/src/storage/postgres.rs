@@ -2856,6 +2856,17 @@ mod tests {
     }
 
     pg_test!(
+        pg_context_packet_names_no_other_namespace,
+        "context-scope",
+        |adapter, namespace| {
+            let lib = pg_librarian(adapter, &namespace);
+            let other = format!("{namespace}-other");
+            crate::test_support::context_packet_names_no_other_namespace(&lib, &namespace, &other)
+                .await;
+        }
+    );
+
+    pg_test!(
         pg_session_text_drops_private_blocks,
         "session-private",
         |adapter, namespace| {

@@ -1500,9 +1500,9 @@ fn format_context_packet(
         "- {} memory entries | {} sessions",
         stats.total_entries, stats.total_sessions
     ));
-    if !stats.namespaces.is_empty() {
-        lines.push(format!("- Namespaces: {}", stats.namespaces.join(", ")));
-    }
+    // No namespace list: `stats.namespaces` spans the whole store, so it
+    // named every other project, and on a shared Postgres every other
+    // user's, in every session's context.
 
     lines.join("\n")
 }
@@ -1834,6 +1834,15 @@ mod tests {
             hits.iter().any(|e| e.id == saved.id),
             "the keyword arm still finds it"
         );
+    }
+
+    /// Every SessionStart packet ended with "- Namespaces: …", listing
+    /// every namespace in the store.
+    #[tokio::test]
+    async fn context_packet_names_no_other_project() {
+        let lib = test_librarian().await;
+        crate::test_support::context_packet_names_no_other_namespace(&lib, "proj_a", "proj_b")
+            .await;
     }
 
     /// Session text bypasses `propose`, and every path into the sessions
