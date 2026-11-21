@@ -27,7 +27,7 @@
 
 use crate::librarian::{content_limit, MemoryLibrarian};
 use crate::storage::StorageResult;
-use crate::types::{EntryType, MemoryEntry, MemoryEntryInput};
+use crate::types::{EntryType, MemoryEntry, MemoryEntryInput, SaveAction};
 
 pub const PLAN_PREFIX: &str = "plan:";
 pub const ICEBOX_PREFIX: &str = "icebox:";
@@ -247,6 +247,31 @@ fn set_tag(tags: &mut Vec<String>, prefix: &str, value: &str) {
     tags.push(format!("{prefix}{value}"));
 }
 
+/// Tags the plan store writes, and so may replace: identity, status and
+/// phase. Every other tag on an entry (`redacted`, `truncated`, a caller's
+/// own) survives a retag.
+fn is_store_tag(tag: &str) -> bool {
+    tag == "plan"
+        || tag == "icebox"
+        || [
+            PLAN_REF_TAG,
+            STATUS_TAG,
+            PHASE_TAG,
+            PHASE_STATUS_TAG,
+            PROMOTED_TAG,
+        ]
+        .iter()
+        .any(|prefix| tag.starts_with(prefix))
+}
+
+fn phase_rank(status: PhaseStatus) -> u8 {
+    match status {
+        PhaseStatus::Pending => 0,
+        PhaseStatus::InProgress => 1,
+        PhaseStatus::Done => 2,
+    }
+}
+
 // ── Documents ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -347,7 +372,9 @@ pub struct SectionInput {
     pub content: String,
     /// Set when this section is an executable phase rather than prose.
     pub phase: Option<usize>,
-    pub phase_status: PhaseStatus,
+    /// `None` keeps the phase's stored status when the plan is re-created
+    /// (see `PlanStore::create_plan`); a new phase starts as pending.
+    pub phase_status: Option<PhaseStatus>,
 }
 
 impl SectionInput {
@@ -356,7 +383,7 @@ impl SectionInput {
             title: title.into(),
             content: content.into(),
             phase: None,
-            phase_status: PhaseStatus::Pending,
+            phase_status: None,
         }
     }
 
@@ -365,10 +392,13 @@ impl SectionInput {
             title: title.into(),
             content: content.into(),
             phase: Some(phase),
-            phase_status: PhaseStatus::Pending,
+            phase_status: None,
         }
     }
 }
+
+/// Appended to every part of a split section but the last.
+const SPLIT_MARKER: &str = "\n\n… [continues in the next part]";
 
 /// Split one section's body into as many parts as the content cap requires.
 ///
@@ -383,7 +413,7 @@ pub fn split_section(content: &str, limit: usize) -> Vec<String> {
         return vec![content.to_string()];
     }
     // Leave room for the continuation marker each non-final part carries.
-    let marker = "\n\n… [continues in the next part]";
+    let marker = SPLIT_MARKER;
     let budget = limit.saturating_sub(marker.chars().count() + 1).max(1);
 
     let mut parts = Vec::new();
@@ -522,6 +552,113 @@ pub fn part_key(section_key: &str, part: usize, parts: usize) -> String {
     }
 }
 
+/// The heading slug inside a section key: `<name>` in
+/// `plan:<slug>:<nn>-<name>[--pNN]`. `slugify` never emits two dashes in a
+/// row, so the part suffix cannot be confused with the name.
+fn section_name(key: &str) -> Option<&str> {
+    let (_, section) = parse_plan_key(key)?;
+    let (_, name) = section?.split_once('-')?;
+    name.split(PART_SEP).next()
+}
+
+/// One stored phase part, as the carry rule sees it.
+struct StoredPhase<'a> {
+    name: &'a str,
+    phase: usize,
+    status: PhaseStatus,
+    content: &'a str,
+    key: &'a str,
+}
+
+fn stored_phases(entries: &[MemoryEntry]) -> Vec<StoredPhase<'_>> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let key = e.topic_key.as_deref()?;
+            Some(StoredPhase {
+                name: section_name(key)?,
+                phase: tag_value(&e.tags, PHASE_TAG)?.parse().ok()?,
+                status: tag_value(&e.tags, PHASE_STATUS_TAG)
+                    .and_then(PhaseStatus::parse)
+                    .unwrap_or_default(),
+                content: &e.content,
+                key,
+            })
+        })
+        .collect()
+}
+
+/// What a phase section inherits when its plan is written again.
+#[derive(Debug, PartialEq)]
+enum Carry {
+    /// The stored progress applies; `changed` when the body differs.
+    Kept { status: PhaseStatus, changed: bool },
+    /// The heading matches no stored phase, but stored progress existed
+    /// for its phase number: it starts over, and the caller says so.
+    Restarted,
+    /// Nothing stored to inherit.
+    New,
+}
+
+/// The carry rule, shared by `create_plan` and `save_section`, in order:
+///
+/// 1. the stored phase with the same heading slug, when every part of it
+///    carries one phase number (a renumbered phase keeps its progress);
+/// 2. otherwise the stored phase with the same number, when one heading
+///    slug extends the other at a `-` — `Phase 1 — x — SHIPPED` is still
+///    `Phase 1 — x`;
+/// 3. otherwise nothing: the phase starts as pending.
+///
+/// Parts of one phase carry the least advanced of their statuses, so a
+/// half-finished phase never reads as done. Redo, never skip: a renamed
+/// heading restarts.
+fn carry_phase(stored: &[StoredPhase<'_>], name: &str, phase: usize, content: &str) -> Carry {
+    let extends = |longer: &str, shorter: &str| {
+        longer
+            .strip_prefix(shorter)
+            .is_some_and(|rest| rest.starts_with('-'))
+    };
+    let same_heading: Vec<&StoredPhase<'_>> = stored.iter().filter(|p| p.name == name).collect();
+    let matched: Vec<&StoredPhase<'_>> = if !same_heading.is_empty()
+        && same_heading
+            .iter()
+            .all(|p| p.phase == same_heading[0].phase)
+    {
+        same_heading
+    } else {
+        stored
+            .iter()
+            .filter(|p| p.phase == phase && (extends(p.name, name) || extends(name, p.name)))
+            .collect()
+    };
+    let Some(status) = matched
+        .iter()
+        .map(|p| p.status)
+        .min_by_key(|s| phase_rank(*s))
+    else {
+        return if stored
+            .iter()
+            .any(|p| p.phase == phase && p.status != PhaseStatus::Pending)
+        {
+            Carry::Restarted
+        } else {
+            Carry::New
+        };
+    };
+    // Compare bodies the way the duplicate guard does (case and whitespace
+    // folded), over the parts in key order with the split markers removed.
+    let mut parts = matched;
+    parts.sort_by_key(|p| p.key);
+    let stored_body: String = parts
+        .iter()
+        .map(|p| p.content.replace(SPLIT_MARKER, ""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let changed =
+        crate::storage::content_hash("", &stored_body) != crate::storage::content_hash("", content);
+    Carry::Kept { status, changed }
+}
+
 // ── Reading ─────────────────────────────────────────────────────────
 
 fn section_from_entry(entry: &MemoryEntry) -> Option<PlanSection> {
@@ -569,9 +706,14 @@ fn owned_by_plan(slug: &str, entry: &MemoryEntry) -> bool {
 
 fn plan_from_entries(slug: &str, entries: &[MemoryEntry]) -> Option<PlanDocument> {
     let meta_key = plan_meta_key(slug);
-    let meta = entries.iter().find(|e| {
-        e.entry_type == EntryType::Plan && e.topic_key.as_deref() == Some(meta_key.as_str())
-    })?;
+    // Two live metas can exist when another machine's write crossed this
+    // one; the newest is the plan's current state.
+    let meta = entries
+        .iter()
+        .filter(|e| {
+            e.entry_type == EntryType::Plan && e.topic_key.as_deref() == Some(meta_key.as_str())
+        })
+        .max_by_key(|e| e.created_at)?;
     // Scope here rather than at the call sites: `list_plans` passes every
     // `plan:` entry in the namespace, and merging their phases together
     // made each plan report the union of all of them.
@@ -650,6 +792,63 @@ fn public_section(section: &SectionInput) -> (SectionInput, bool) {
         },
         title_blocks + content_blocks > 0,
     )
+}
+
+/// What `create_plan` did, for the caller to report.
+#[derive(Debug, Clone)]
+pub struct CreatedPlan {
+    pub slug: String,
+    /// Entries in the plan's key set: the meta plus every section part.
+    pub entries: usize,
+    /// Phase headings that restarted as pending although their phase
+    /// number had progress: the heading changed beyond an annotation.
+    pub restarted_phases: Vec<String>,
+    /// Phase headings that kept `done` although their body changed.
+    pub done_phases_changed: Vec<String>,
+}
+
+impl CreatedPlan {
+    /// One sentence per notice, for the MCP `warning` and the CLI.
+    pub fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.restarted_phases.is_empty() {
+            out.push(format!(
+                "{} phase(s) restarted as pending because the heading changed: {}. Set \
+                 them back with muninn_plan_set_status if the work is already done.",
+                self.restarted_phases.len(),
+                self.restarted_phases.join("; ")
+            ));
+        }
+        if !self.done_phases_changed.is_empty() {
+            out.push(format!(
+                "{} phase(s) are still done although their body changed: {}. Reset them \
+                 with muninn_plan_set_status if the change is new work.",
+                self.done_phases_changed.len(),
+                self.done_phases_changed.join("; ")
+            ));
+        }
+        out
+    }
+}
+
+/// One entry a write means to leave in the store.
+struct PlannedEntry {
+    key: String,
+    title: String,
+    content: String,
+    tags: Vec<String>,
+}
+
+impl PlannedEntry {
+    /// Would propose store exactly what `stored` holds? Title and content
+    /// go through the same secret redaction and bound first.
+    fn matches(&self, stored: &MemoryEntry) -> bool {
+        let (title, _) = crate::redact::redact_secrets(&self.title);
+        let (content, _) = crate::redact::redact_secrets(&self.content);
+        let (content, _) = crate::librarian::bound_content(&content, content_limit());
+        crate::storage::content_hash(&title, &content)
+            == crate::storage::content_hash(&stored.title, &stored.content)
+    }
 }
 
 // ── Store: the operations both surfaces call ────────────────────────
@@ -737,6 +936,8 @@ impl<'a> PlanStore<'a> {
         Ok(None)
     }
 
+    /// `propose` with the store's key and project, nothing more. Only
+    /// `save_section` still writes this way.
     async fn save(
         &self,
         title: &str,
@@ -759,52 +960,159 @@ impl<'a> PlanStore<'a> {
         Ok(())
     }
 
+    /// Write one entry so that afterwards the store holds exactly it.
+    ///
+    /// Two things `propose` alone does not do. An unchanged entry comes
+    /// back as a duplicate and its tags are never written, so a new status
+    /// on unchanged text was dropped: the store's own tags are replaced
+    /// here, keeping every other tag. And a topic-key supersede soft-deletes
+    /// the predecessor without queuing a delete, so the remote kept it
+    /// live — two metas for one plan; the predecessor is deprecated here,
+    /// which queues the tombstone.
+    async fn put(&self, entry: &PlannedEntry, entry_type: EntryType) -> StorageResult<()> {
+        let result = self
+            .lib
+            .propose(MemoryEntryInput {
+                title: entry.title.clone(),
+                content: entry.content.clone(),
+                entry_type,
+                tags: entry.tags.clone(),
+                project_id: self.project_id.clone(),
+                topic_key: Some(entry.key.clone()),
+                ..Default::default()
+            })
+            .await?;
+        if result.action == SaveAction::Duplicate {
+            let stored = self.lib.get(result.id).await?;
+            let mut merged: Vec<String> = stored
+                .tags
+                .iter()
+                .filter(|t| !is_store_tag(t))
+                .cloned()
+                .collect();
+            for tag in &entry.tags {
+                if !merged.contains(tag) {
+                    merged.push(tag.clone());
+                }
+            }
+            let mut want = merged.clone();
+            let mut have = stored.tags.clone();
+            want.sort();
+            have.sort();
+            if want != have {
+                self.lib.retag(result.id, merged).await?;
+            }
+        }
+        if let Some(old) = result.superseded {
+            self.lib.deprecate(old.id).await?;
+        }
+        Ok(())
+    }
+
     // ── Plans ───────────────────────────────────────────────────
 
     /// Create or replace a plan: meta entry plus one entry per section part.
     ///
-    /// Returns the slug and the number of entries written.
+    /// Re-creating keeps progress. Without `status` the stored plan status
+    /// stays (a new plan starts as draft), and every phase whose heading
+    /// is unchanged — or only annotated — keeps its status by the carry
+    /// rule (`carry_phase`); the result reports phases that restarted and
+    /// done phases whose body changed. A completed or abandoned plan is not
+    /// reopened by accident: changing it without a `status` is refused
+    /// before anything is written.
     pub async fn create_plan(
         &self,
         title: &str,
         slug: Option<&str>,
         overview: &str,
         sections: &[SectionInput],
-        status: PlanStatus,
-    ) -> StorageResult<(String, usize)> {
+        status: Option<PlanStatus>,
+    ) -> StorageResult<CreatedPlan> {
         let slug = slug_for(title, slug)?;
         let limit = content_limit();
-
-        let mut written_keys = Vec::new();
+        let existing = self.plan_entries(&slug).await?;
         let meta_key = plan_meta_key(&slug);
-        let mut meta_tags = vec!["plan".to_string()];
-        set_tag(&mut meta_tags, STATUS_TAG, status.as_str());
-        self.save(title, overview, EntryType::Plan, &meta_key, meta_tags)
-            .await?;
-        written_keys.push(meta_key);
+        let stored_status = plan_from_entries(&slug, &existing).map(|d| d.status);
+        let stored = stored_phases(&existing);
 
+        let mut planned = Vec::new();
+        let mut meta_tags = vec!["plan".to_string()];
+        let meta_status = status.or(stored_status).unwrap_or_default();
+        set_tag(&mut meta_tags, STATUS_TAG, meta_status.as_str());
+        planned.push(PlannedEntry {
+            key: meta_key,
+            title: title.to_string(),
+            content: overview.to_string(),
+            tags: meta_tags,
+        });
+
+        let mut created = CreatedPlan {
+            slug: slug.clone(),
+            entries: 0,
+            restarted_phases: Vec::new(),
+            done_phases_changed: Vec::new(),
+        };
         for (idx, section) in sections.iter().enumerate() {
             let (section, redacted) = public_section(section);
+            let phase_status = section.phase.map(|phase| {
+                section.phase_status.unwrap_or_else(|| {
+                    let (body, _) = crate::redact::redact_secrets(&section.content);
+                    match carry_phase(&stored, &slugify(&section.title), phase, &body) {
+                        Carry::Kept { status, changed } => {
+                            if changed && status == PhaseStatus::Done {
+                                created.done_phases_changed.push(section.title.clone());
+                            }
+                            status
+                        }
+                        Carry::Restarted => {
+                            created.restarted_phases.push(section.title.clone());
+                            PhaseStatus::Pending
+                        }
+                        Carry::New => PhaseStatus::Pending,
+                    }
+                })
+            });
             let section_key = plan_section_key(&slug, idx, &section.title);
             let parts = split_section(&section.content, limit);
             for (part_idx, body) in parts.iter().enumerate() {
-                let key = part_key(&section_key, part_idx + 1, parts.len());
                 let mut tags = vec!["plan".to_string(), format!("{PLAN_REF_TAG}{slug}")];
                 if redacted {
                     tags.push("redacted".to_string());
                 }
-                if let Some(phase) = section.phase {
+                if let (Some(phase), Some(phase_status)) = (section.phase, phase_status) {
                     set_tag(&mut tags, PHASE_TAG, &phase.to_string());
-                    set_tag(&mut tags, PHASE_STATUS_TAG, section.phase_status.as_str());
+                    set_tag(&mut tags, PHASE_STATUS_TAG, phase_status.as_str());
                 }
-                let title = if parts.len() > 1 {
-                    format!("{} (part {}/{})", section.title, part_idx + 1, parts.len())
-                } else {
-                    section.title.clone()
-                };
-                self.save(&title, body, EntryType::Plan, &key, tags).await?;
-                written_keys.push(key);
+                planned.push(PlannedEntry {
+                    key: part_key(&section_key, part_idx + 1, parts.len()),
+                    title: if parts.len() > 1 {
+                        format!("{} (part {}/{})", section.title, part_idx + 1, parts.len())
+                    } else {
+                        section.title.clone()
+                    },
+                    content: body.clone(),
+                    tags,
+                });
             }
+        }
+
+        if status.is_none() && stored_status.is_some_and(|s| s.is_closed()) {
+            let unchanged = planned.len() == existing.len()
+                && planned.iter().all(|p| {
+                    existing
+                        .iter()
+                        .any(|e| e.topic_key.as_deref() == Some(p.key.as_str()) && p.matches(e))
+                });
+            if !unchanged {
+                let closed = stored_status.unwrap_or_default();
+                return Err(crate::storage::StorageError::Invalid(format!(
+                    "plan '{slug}' is {closed}; pass status to reopen it, or use another slug"
+                )));
+            }
+        }
+
+        for entry in &planned {
+            self.put(entry, EntryType::Plan).await?;
         }
 
         // Retire anything of this plan's that this write did not produce — a
@@ -824,14 +1132,15 @@ impl<'a> PlanStore<'a> {
             .filter(|e| {
                 e.topic_key
                     .as_deref()
-                    .is_some_and(|k| !written_keys.iter().any(|w| w == k))
+                    .is_some_and(|k| !planned.iter().any(|p| p.key == k))
             })
             .collect();
         for entry in &stale {
             self.lib.deprecate(entry.id).await?;
         }
 
-        Ok((slug, written_keys.len()))
+        created.entries = planned.len();
+        Ok(created)
     }
 
     /// Upsert one section of an existing plan, leaving the rest alone.
@@ -1004,8 +1313,13 @@ impl<'a> PlanStore<'a> {
         let mut tags = vec!["icebox".to_string()];
         tags.extend(extra_tags.iter().cloned());
         set_tag(&mut tags, STATUS_TAG, IceboxStatus::Open.as_str());
-        self.save(title, content, EntryType::Icebox, &icebox_key(&slug), tags)
-            .await?;
+        let entry = PlannedEntry {
+            key: icebox_key(&slug),
+            title: title.to_string(),
+            content: content.to_string(),
+            tags,
+        };
+        self.put(&entry, EntryType::Icebox).await?;
         Ok(slug)
     }
 
@@ -1100,7 +1414,7 @@ pub(crate) mod parity {
                     SectionInput::phase(1, "Phase 1 — tokens", "issue tokens"),
                     SectionInput::prose("Notes", "auth-flow's own notes"),
                 ],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1112,7 +1426,7 @@ pub(crate) mod parity {
                 Some(auth),
                 "the prefix slug",
                 &[SectionInput::phase(1, "Phase 1 — login", "log in")],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1168,8 +1482,13 @@ pub(crate) mod parity {
             .await
             .is_err());
 
+        store
+            .set_plan_status(auth_flow, None, Some(1), Some(PhaseStatus::Done))
+            .await
+            .unwrap();
         // Re-create auth-flow with a section inserted first: every later
-        // section moves to a new index and must still be there.
+        // section moves to a new index and must still be there, with its
+        // progress.
         store
             .create_plan(
                 "auth flow",
@@ -1180,7 +1499,7 @@ pub(crate) mod parity {
                     SectionInput::phase(1, "Phase 1 — tokens", "issue tokens"),
                     SectionInput::prose("Notes", "auth-flow's own notes"),
                 ],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1191,7 +1510,7 @@ pub(crate) mod parity {
                 Some("other"),
                 "a third plan",
                 &[SectionInput::prose("Notes", "auth-flow's own notes")],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1203,6 +1522,21 @@ pub(crate) mod parity {
                 .map(|s| s.title.as_str())
                 .collect::<Vec<_>>(),
             ["Context", "Phase 1 — tokens", "Notes"]
+        );
+        assert_eq!(
+            flow.phase_progress(),
+            (1, 1),
+            "the moved phase is still done"
+        );
+        assert_eq!(
+            store
+                .get_plan(auth)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase_progress(),
+            (1, 1),
+            "auth keeps its own progress"
         );
         let other = store.get_plan("other").await.unwrap().unwrap();
         assert_eq!(
@@ -1558,7 +1892,7 @@ none
         let lib = test_lib().await;
         let store = PlanStore::new(&lib, None);
 
-        let (slug, written) = store
+        let created = store
             .create_plan(
                 "Auth rewrite",
                 None,
@@ -1568,10 +1902,12 @@ none
                     SectionInput::phase(1, "Extract middleware", "move the check into one layer"),
                     SectionInput::phase(2, "Delete the copies", "remove the other three"),
                 ],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
+        let slug = created.slug.clone();
+        let written = created.entries;
 
         assert_eq!(slug, "auth-rewrite");
         assert_eq!(written, 4, "one meta entry plus three sections");
@@ -1599,7 +1935,7 @@ none
     async fn phase_status_transition_supersedes_in_place() {
         let lib = test_lib().await;
         let store = PlanStore::new(&lib, None);
-        let (slug, _) = store
+        let created = store
             .create_plan(
                 "Ship sync",
                 None,
@@ -1608,10 +1944,11 @@ none
                     SectionInput::phase(1, "First", "do the first thing"),
                     SectionInput::phase(2, "Second", "do the second thing"),
                 ],
-                PlanStatus::Approved,
+                Some(PlanStatus::Approved),
             )
             .await
             .unwrap();
+        let slug = created.slug.clone();
 
         let doc = store
             .set_plan_status(&slug, None, Some(1), Some(PhaseStatus::Done))
@@ -1631,10 +1968,17 @@ none
     async fn completing_a_plan_marks_it_closed_so_it_is_not_re_executed() {
         let lib = test_lib().await;
         let store = PlanStore::new(&lib, None);
-        let (slug, _) = store
-            .create_plan("Done work", None, "overview", &[], PlanStatus::InProgress)
+        let created = store
+            .create_plan(
+                "Done work",
+                None,
+                "overview",
+                &[],
+                Some(PlanStatus::InProgress),
+            )
             .await
             .unwrap();
+        let slug = created.slug.clone();
 
         let doc = store
             .set_plan_status(&slug, Some(PlanStatus::Completed), None, None)
@@ -1664,12 +2008,12 @@ none
                     SectionInput::phase(1, "a", "x"),
                     SectionInput::phase(2, "b", "y"),
                 ],
-                PlanStatus::InProgress,
+                Some(PlanStatus::InProgress),
             )
             .await
             .unwrap();
         store
-            .create_plan("Plan two", None, "o", &[], PlanStatus::Draft)
+            .create_plan("Plan two", None, "o", &[], Some(PlanStatus::Draft))
             .await
             .unwrap();
         store
@@ -1706,7 +2050,7 @@ none
                     SectionInput::phase(1, "a", "x"),
                     SectionInput::phase(2, "b", "y"),
                 ],
-                PlanStatus::InProgress,
+                Some(PlanStatus::InProgress),
             )
             .await
             .unwrap();
@@ -1720,7 +2064,7 @@ none
                     SectionInput::phase(2, "d", "y"),
                     SectionInput::phase(3, "e", "z"),
                 ],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1763,7 +2107,7 @@ none
                 Some("auth"),
                 "o",
                 &[SectionInput::prose("Only mine", "x")],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1776,7 +2120,7 @@ none
                     SectionInput::prose("Theirs one", "y"),
                     SectionInput::prose("Theirs two", "z"),
                 ],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1815,7 +2159,7 @@ none
                     SectionInput::prose("Keep", "kept"),
                     SectionInput::prose("Drop", "dropped"),
                 ],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1825,7 +2169,7 @@ none
                 None,
                 "o",
                 &[SectionInput::prose("Keep", "kept")],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -1846,7 +2190,7 @@ none
         let lib = test_lib().await;
         let store = PlanStore::new(&lib, None);
         store
-            .create_plan("Parts", None, "o", &[], PlanStatus::Draft)
+            .create_plan("Parts", None, "o", &[], Some(PlanStatus::Draft))
             .await
             .unwrap();
 
@@ -1932,7 +2276,7 @@ none
         let lib = test_lib().await;
         let store = PlanStore::new(&lib, None);
         store
-            .create_plan("Shared name", None, "o", &[], PlanStatus::Draft)
+            .create_plan("Shared name", None, "o", &[], Some(PlanStatus::Draft))
             .await
             .unwrap();
         store
@@ -1975,7 +2319,7 @@ none
                 None,
                 "overview",
                 &[SectionInput::prose("One", "body")],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -2021,7 +2365,7 @@ none
                 Some("p"),
                 &parsed.overview,
                 &parsed.sections,
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -2042,7 +2386,7 @@ none
                     "Phase 1 — <private>zebra</private> rollout",
                     "x",
                 )],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -2074,7 +2418,7 @@ none
                 Some("p"),
                 "o",
                 &[SectionInput::prose("Long", body)],
-                PlanStatus::Draft,
+                Some(PlanStatus::Draft),
             )
             .await
             .unwrap();
@@ -2094,7 +2438,7 @@ none
         let store = PlanStore::new(&lib, None);
         let title = "<private>zebra</private> merger";
         assert!(store
-            .create_plan(title, None, "o", &[], PlanStatus::Draft)
+            .create_plan(title, None, "o", &[], Some(PlanStatus::Draft))
             .await
             .is_err());
         assert!(store.add_icebox(title, "later", None, &[]).await.is_err());
@@ -2104,14 +2448,14 @@ none
                 Some("<private>zebra</private>"),
                 "o",
                 &[],
-                PlanStatus::Draft
+                Some(PlanStatus::Draft)
             )
             .await
             .is_err());
         assert_eq!(leaks(&lib, "zebra").await, Vec::<String>::new());
 
         store
-            .create_plan(title, Some("merger"), "o", &[], PlanStatus::Draft)
+            .create_plan(title, Some("merger"), "o", &[], Some(PlanStatus::Draft))
             .await
             .unwrap();
         store
@@ -2176,6 +2520,143 @@ none
     }
 
     #[tokio::test]
+    async fn a_multi_part_phase_keeps_its_status_when_its_part_count_changes() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        let long = "paragraph body here\n\n".repeat(content_limit() / 10);
+        store
+            .create_plan(
+                "P",
+                Some("p"),
+                "o",
+                &[SectionInput::phase(1, "Phase 1 — big", long.clone())],
+                None,
+            )
+            .await
+            .unwrap();
+        let doc = store
+            .set_plan_status("p", None, Some(1), Some(PhaseStatus::Done))
+            .await
+            .unwrap();
+        assert!(doc.sections.len() > 1, "the phase must have been split");
+
+        let short = "now it fits in one part";
+        let created = store
+            .create_plan(
+                "P",
+                Some("p"),
+                "o",
+                &[SectionInput::phase(1, "Phase 1 — big", short)],
+                None,
+            )
+            .await
+            .unwrap();
+        let doc = store.get_plan("p").await.unwrap().unwrap();
+        assert_eq!(doc.sections.len(), 1);
+        assert_eq!(doc.phase_progress(), (1, 1));
+        assert_eq!(created.done_phases_changed, ["Phase 1 — big"]);
+    }
+
+    #[tokio::test]
+    async fn a_retag_keeps_the_tags_the_store_does_not_own() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        store
+            .create_plan(
+                "Tagged",
+                Some("tagged"),
+                "o",
+                &[],
+                Some(PlanStatus::Approved),
+            )
+            .await
+            .unwrap();
+        let meta = lib
+            .get_by_topic_key(None, "plan:tagged")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tags = meta.tags.clone();
+        tags.extend(["truncated".to_string(), "keep-me".to_string()]);
+        lib.retag(meta.id, tags).await.unwrap();
+
+        // Unchanged text, new status: a duplicate whose tags are rewritten.
+        store
+            .create_plan(
+                "Tagged",
+                Some("tagged"),
+                "o",
+                &[],
+                Some(PlanStatus::Completed),
+            )
+            .await
+            .unwrap();
+        let after = lib.get(meta.id).await.unwrap();
+        assert!(
+            after.tags.contains(&"status:completed".to_string()),
+            "{:?}",
+            after.tags
+        );
+        assert!(
+            !after.tags.contains(&"status:approved".to_string()),
+            "{:?}",
+            after.tags
+        );
+        for kept in ["truncated", "keep-me", "plan"] {
+            assert!(
+                after.tags.contains(&kept.to_string()),
+                "{kept}: {:?}",
+                after.tags
+            );
+        }
+    }
+
+    /// A topic-key supersede soft-deleted the old meta locally and queued
+    /// an insert for the new one only, so the remote kept both live.
+    #[tokio::test]
+    async fn a_superseded_meta_queues_its_tombstone() {
+        let _guard = crate::test_support::with_env("RUNAR_STORAGE_LOCAL", "1");
+        let storage = Arc::new(SqliteAdapter::in_memory("test").unwrap());
+        storage.initialize().await.unwrap();
+        let lib = MemoryLibrarian::new(
+            storage.clone(),
+            Arc::new(DisabledEmbeddingProvider),
+            "test",
+            None,
+        );
+        let store = PlanStore::new(&lib, None);
+        store
+            .create_plan("Synced", Some("synced"), "v1", &[], None)
+            .await
+            .unwrap();
+        let old = lib
+            .get_by_topic_key(None, "plan:synced")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::test_support::drain_outbox(&*storage).await;
+
+        store
+            .create_plan("Synced", Some("synced"), "v2", &[], None)
+            .await
+            .unwrap();
+        let queued = crate::test_support::drain_outbox(&*storage).await;
+        assert!(
+            queued
+                .iter()
+                .any(|e| e.id == old.id && e.deleted_at.is_some()),
+            "the old meta's tombstone must reach the outbox: {:?}",
+            queued
+                .iter()
+                .map(|e| (e.id, e.deleted_at))
+                .collect::<Vec<_>>()
+        );
+        assert!(queued
+            .iter()
+            .any(|e| e.id != old.id && e.deleted_at.is_none() && e.content == "v2"));
+    }
+
+    #[tokio::test]
     async fn plan_store_keeps_every_plans_data_on_sqlite() {
         let lib = test_lib().await;
         parity::keeps_every_plans_data(&lib, "parity").await;
@@ -2231,7 +2712,7 @@ none
             .is_err());
 
         store
-            .create_plan("Real", None, "o", &[], PlanStatus::Draft)
+            .create_plan("Real", None, "o", &[], Some(PlanStatus::Draft))
             .await
             .unwrap();
         assert!(

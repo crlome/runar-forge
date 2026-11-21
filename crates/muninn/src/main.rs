@@ -464,9 +464,11 @@ enum PlanAction {
         /// Stable id; derived from the title otherwise
         #[arg(long)]
         slug: Option<String>,
-        /// draft | approved | in-progress | completed | abandoned
-        #[arg(long, default_value = "draft")]
-        status: String,
+        /// draft | approved | in-progress | completed | abandoned. Omit to
+        /// keep the stored status when re-creating; a new plan starts as
+        /// draft. A completed or abandoned plan changes only when given.
+        #[arg(long)]
+        status: Option<String>,
         #[arg(short, long)]
         project: Option<String>,
     },
@@ -833,12 +835,15 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
             status,
             project,
         } => {
-            let status = PlanStatus::parse(&status).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown status '{status}' (use: {})",
-                    PlanStatus::all().join("|")
-                )
-            })?;
+            let status = match status {
+                Some(s) => Some(PlanStatus::parse(&s).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown status '{s}' (use: {})",
+                        PlanStatus::all().join("|")
+                    )
+                })?),
+                None => None,
+            };
 
             let (title, overview, sections, untracked) = match &file {
                 Some(path) => {
@@ -871,13 +876,17 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
             let project_id = resolve_project_id(project);
             let librarian = create_librarian().await?;
             let store = PlanStore::new(&librarian, Some(project_id.clone()));
-            let (slug, entries) = store
+            let created = store
                 .create_plan(&title, slug.as_deref(), &overview, &sections, status)
                 .await?;
 
             println!("Stored plan: {title}");
-            println!("  slug: {slug}");
-            println!("  sections: {} ({entries} entries)", sections.len());
+            println!("  slug: {}", created.slug);
+            println!(
+                "  sections: {} ({} entries)",
+                sections.len(),
+                created.entries
+            );
             let phases = sections.iter().filter(|s| s.phase.is_some()).count();
             if phases > 0 {
                 println!("  tracked phases: {phases}");
@@ -898,6 +907,9 @@ async fn cmd_plan(action: PlanAction) -> anyhow::Result<()> {
                 println!(
                     "  Promote them to `## Phase N — name` to track progress across sessions."
                 );
+            }
+            for notice in created.notices() {
+                println!("\n  WARNING — {notice}");
             }
         }
 
@@ -4109,6 +4121,20 @@ mod tests {
     /// never happens. This shipped once, in the gap between `autorefresh` and
     /// `graph autorefresh`, and was caught by running the real binary rather
     /// than by any test.
+    /// Without --status a re-create keeps the stored status; clap's old
+    /// default of `draft` reopened completed plans.
+    #[test]
+    fn plan_create_has_no_default_status() {
+        let cli = Cli::try_parse_from(["runar", "plan", "create", "Title"]).unwrap();
+        let Commands::Plan {
+            action: PlanAction::Create { status, .. },
+        } = cli.command
+        else {
+            panic!("parsed as another command");
+        };
+        assert_eq!(status, None);
+    }
+
     #[test]
     fn runar_save_refuses_the_plan_stores_types_and_scopes() {
         for t in ["plan", "icebox"] {

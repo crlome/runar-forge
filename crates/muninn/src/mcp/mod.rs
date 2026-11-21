@@ -696,7 +696,9 @@ fn plan_doc_json(doc: &crate::plans::PlanDocument) -> Value {
 async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
     let title = required_str(args, "title")?;
     let overview = arg_str(args, "overview").unwrap_or("");
-    let status = plan_status_arg(args, "status")?.unwrap_or_default();
+    // Omitted means "keep the stored status" on a re-create; a new plan
+    // starts as draft.
+    let status = plan_status_arg(args, "status")?;
 
     // Sections arrive either pre-split or as one markdown document. The
     // markdown form is what a /prd conversation naturally produces.
@@ -732,7 +734,7 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
     };
 
     let store = icebox_store(args, lib);
-    let (slug, entries) = store
+    let created = store
         .create_plan(title, arg_str(args, "slug"), overview, &sections, status)
         .await
         .map_err(|e| e.to_string())?;
@@ -740,19 +742,24 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
     let tracked = sections.iter().filter(|s| s.phase.is_some()).count();
     let mut response = serde_json::json!({
         "status": "saved",
-        "slug": slug,
-        "entriesWritten": entries,
+        "slug": created.slug,
+        "entriesWritten": created.entries,
         "sections": sections.len(),
         "trackedPhases": tracked,
         "hint": "track execution with muninn_plan_set_status(slug, phase, phaseStatus)",
     });
+    let mut warnings = Vec::new();
     if !untracked.is_empty() {
-        response["warning"] = serde_json::json!(format!(
+        warnings.push(format!(
             "{} heading(s) name a phase but sit below `##`, so they are body text and are \
              NOT tracked: {}. Promote them to `## Phase N — name`.",
             untracked.len(),
             untracked.join("; ")
         ));
+    }
+    warnings.extend(created.notices());
+    if !warnings.is_empty() {
+        response["warning"] = serde_json::json!(warnings.join(" "));
     }
     Ok(response.to_string())
 }
@@ -2289,7 +2296,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                             "required": ["title", "content"],
                         },
                     },
-                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"], "description": "Initial status (default: draft)" },
+                    "status": { "type": "string", "enum": ["draft", "approved", "in-progress", "completed", "abandoned"], "description": "Plan status. Omit to keep the stored status when re-creating (a new plan starts as draft); a completed or abandoned plan is only changed when a status is given" },
                     "projectId": { "type": "string" },
                 },
                 "required": ["title"],
@@ -3055,11 +3062,171 @@ mod tests {
             .unwrap()
     }
 
+    async fn set_phase(lib: &MemoryLibrarian, slug: &str, phase: u64, status: &str) {
+        call(tool_plan_set_status(
+            &serde_json::json!({ "slug": slug, "phase": phase, "phaseStatus": status }),
+            lib,
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn set_plan(lib: &MemoryLibrarian, slug: &str, status: &str) {
+        call(tool_plan_set_status(
+            &serde_json::json!({ "slug": slug, "status": status }),
+            lib,
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn phase_statuses(doc: &Value) -> Vec<String> {
+        doc["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["phase"].is_null())
+            .map(|s| s["phaseStatus"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// /prd tells agents to re-run create whenever the file changes. Every
+    /// re-run reset the plan to draft and every edited phase to pending.
+    #[tokio::test]
+    async fn re_creating_a_plan_keeps_its_progress() {
+        let lib = icebox_test_lib().await;
+        let md = "## Phase 1 — build\n\nbuild it\n\n## Phase 2 — ship\n\nship it\n";
+        let create = |overview: &str, md: &str| serde_json::json!({ "title": "Ship", "overview": overview, "markdown": md });
+        call(tool_plan_create(&create("v1", md), &lib))
+            .await
+            .unwrap();
+        set_phase(&lib, "ship", 1, "done").await;
+        set_plan(&lib, "ship", "in-progress").await;
+
+        let edited = md.replace("build it", "build it, with tests");
+        call(tool_plan_create(&create("v2", &edited), &lib))
+            .await
+            .unwrap();
+
+        let doc = plan(&lib, "ship").await;
+        assert_eq!(doc["status"], "in-progress");
+        assert_eq!(doc["closed"], false);
+        assert_eq!(doc["overview"], "v2");
+        assert_eq!(phase_statuses(&doc), ["done", "pending"]);
+    }
+
+    #[tokio::test]
+    async fn re_creating_a_completed_plan_keeps_it_closed() {
+        let lib = icebox_test_lib().await;
+        let create = |overview: &str| serde_json::json!({ "title": "Done", "overview": overview });
+        call(tool_plan_create(&create("v1"), &lib)).await.unwrap();
+        set_plan(&lib, "done", "completed").await;
+
+        let err = tool_plan_create(&create("v2"), &lib).await.unwrap_err();
+        assert!(err.contains("completed") && err.contains("status"), "{err}");
+        assert!(!looks_like_storage_err(&err), "{err}");
+        let doc = plan(&lib, "done").await;
+        assert_eq!(doc["overview"], "v1", "a refused re-create writes nothing");
+        assert_eq!(doc["closed"], true);
+        let drafts = call(tool_plan_list(
+            &serde_json::json!({ "status": "draft" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(drafts["count"], 0);
+
+        // Unchanged content is not a change: no status needed.
+        call(tool_plan_create(&create("v1"), &lib)).await.unwrap();
+        // Reopening is explicit.
+        let mut reopen = create("v2");
+        reopen["status"] = "in-progress".into();
+        call(tool_plan_create(&reopen, &lib)).await.unwrap();
+        let doc = plan(&lib, "done").await;
+        assert_eq!(doc["status"], "in-progress");
+        assert_eq!(doc["overview"], "v2");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_status_on_an_unchanged_re_create_is_applied() {
+        let lib = icebox_test_lib().await;
+        let mut args =
+            serde_json::json!({ "title": "Same", "overview": "o", "status": "approved" });
+        call(tool_plan_create(&args, &lib)).await.unwrap();
+        args["status"] = "completed".into();
+        call(tool_plan_create(&args, &lib)).await.unwrap();
+        assert_eq!(plan(&lib, "same").await["status"], "completed");
+    }
+
+    /// Plans annotate a finished phase in its heading (`— SHIPPED`); the
+    /// phase keeps its progress.
+    #[tokio::test]
+    async fn an_annotated_heading_keeps_its_phase_done() {
+        let lib = icebox_test_lib().await;
+        create_md(
+            &lib,
+            "P",
+            "p",
+            "## Phase 1 — storage\n\nx\n\n## Phase 2 — api\n\ny\n",
+        )
+        .await;
+        set_phase(&lib, "p", 1, "done").await;
+        let created = create_md(
+            &lib,
+            "P",
+            "p",
+            "## Phase 1 — storage — SHIPPED\n\nx\n\n## Phase 2 — api\n\ny\n",
+        )
+        .await;
+        assert!(created.get("warning").is_none(), "{created}");
+        assert_eq!(phase_statuses(&plan(&lib, "p").await), ["done", "pending"]);
+    }
+
+    #[tokio::test]
+    async fn a_renamed_heading_restarts_and_is_reported() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "P", "p", "## Phase 1 — storage\n\nx\n").await;
+        set_phase(&lib, "p", 1, "done").await;
+        let created = create_md(&lib, "P", "p", "## Phase 1 — persistence\n\nx\n").await;
+        let warning = created["warning"].as_str().unwrap_or_default();
+        assert!(warning.contains("Phase 1 — persistence"), "{created}");
+        assert_eq!(phase_statuses(&plan(&lib, "p").await), ["pending"]);
+    }
+
+    #[tokio::test]
+    async fn a_done_phase_whose_body_changed_is_reported() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "P", "p", "## Phase 1 — storage\n\nx\n").await;
+        set_phase(&lib, "p", 1, "done").await;
+        let created = create_md(&lib, "P", "p", "## Phase 1 — storage\n\nx, and y\n").await;
+        let warning = created["warning"].as_str().unwrap_or_default();
+        assert!(warning.contains("still done"), "{created}");
+        assert_eq!(phase_statuses(&plan(&lib, "p").await), ["done"]);
+    }
+
+    #[tokio::test]
+    async fn a_renumbered_phase_in_the_sections_array_keeps_its_status() {
+        let lib = icebox_test_lib().await;
+        let create = |n: u64| {
+            serde_json::json!({
+                "title": "P",
+                "sections": [{ "title": "Storage", "content": "x", "phase": n }],
+            })
+        };
+        call(tool_plan_create(&create(1), &lib)).await.unwrap();
+        set_phase(&lib, "p", 1, "done").await;
+        call(tool_plan_create(&create(2), &lib)).await.unwrap();
+        let doc = plan(&lib, "p").await;
+        assert_eq!(doc["sections"][0]["phase"], 2);
+        assert_eq!(phase_statuses(&doc), ["done"]);
+    }
+
     #[tokio::test]
     async fn inserting_a_section_keeps_every_later_section() {
         let lib = icebox_test_lib().await;
         let md = "## Context\n\nc\n\n## Phase 1 — a\n\na\n\n## Phase 2 — b\n\nb\n";
         create_md(&lib, "Ship", "ship", md).await;
+        set_phase(&lib, "ship", 1, "done").await;
         let with_risks = md.replace("## Phase 1", "## Risks\n\nr\n\n## Phase 1");
         create_md(&lib, "Ship", "ship", &with_risks).await;
 
@@ -3069,6 +3236,7 @@ mod tests {
             ["Context", "Risks", "Phase 1 — a", "Phase 2 — b"]
         );
         assert_eq!(doc["phasesTotal"], 2);
+        assert_eq!(doc["phasesDone"], 1, "the moved phase keeps its progress");
     }
 
     #[tokio::test]
