@@ -32,6 +32,55 @@ use crate::types::{EntryType, MemoryEntry, MemoryEntryInput};
 pub const PLAN_PREFIX: &str = "plan:";
 pub const ICEBOX_PREFIX: &str = "icebox:";
 
+/// Refuse a generic save (`muninn_save`, `muninn_capture_passive`,
+/// `runar save`) that would write into the plan store's space.
+///
+/// The storage topic-key supersede replaces whatever is live at a key, so a
+/// decision saved at `plan:<slug>` replaced that plan's meta entry: the
+/// plan showed the decision's title and read as an unstarted draft. The
+/// types are refused for the same reason — a generic save cannot follow
+/// the key and tag conventions this module owns. A key holding `<` or `>`
+/// is refused too: keys are stored as given, so a `<private>` block inside
+/// one would outlive the redaction applied to every other field.
+///
+/// The messages name the right tool and avoid every word the MCP breaker
+/// reads as a storage failure.
+pub fn check_generic_save(entry_type: EntryType, topic_key: Option<&str>) -> Result<(), String> {
+    match entry_type {
+        EntryType::Plan => {
+            return Err("plans are written with muninn_plan_create and \
+                        muninn_plan_save_section (CLI: `runar plan`), not with a generic save"
+                .to_string())
+        }
+        EntryType::Icebox => {
+            return Err("icebox items are written with muninn_icebox_add \
+                        (CLI: `runar icebox`), not with a generic save"
+                .to_string())
+        }
+        _ => {}
+    }
+    let Some(key) = topic_key else {
+        return Ok(());
+    };
+    let folded = key.trim().to_ascii_lowercase();
+    if folded.starts_with(PLAN_PREFIX) || folded.starts_with(ICEBOX_PREFIX) {
+        return Err(format!(
+            "topic key '{}' is in the `plan:` or `icebox:` scope, which belongs to the plan \
+             tools (muninn_plan_create, muninn_icebox_add); use a scope such as \
+             'feature:decision'",
+            key.trim()
+        ));
+    }
+    if key.contains(['<', '>']) {
+        return Err(
+            "a topic key cannot contain '<' or '>': keys are kept as given, so a \
+                    private block inside one would not be redacted"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Separator between a section key and its part number. Two dashes, because
 /// a single dash is already legal inside a slugified section name and the
 /// two would be indistinguishable.
@@ -1843,6 +1892,26 @@ none
             "meta + section + icebox item must all be queued for the remote, got {}",
             health.total()
         );
+    }
+
+    #[test]
+    fn generic_saves_cannot_use_the_plan_stores_scopes() {
+        for (t, key) in [
+            (EntryType::Plan, None),
+            (EntryType::Icebox, None),
+            (EntryType::Decision, Some("plan:x")),
+            (EntryType::Decision, Some(" Icebox:x")),
+            (EntryType::Note, Some("auth:<private>x</private>")),
+        ] {
+            assert!(check_generic_save(t, key).is_err(), "{t:?} {key:?}");
+        }
+        for (t, key) in [
+            (EntryType::Decision, Some("planning:x")),
+            (EntryType::Decision, Some("auth:approach")),
+            (EntryType::Note, None),
+        ] {
+            assert!(check_generic_save(t, key).is_ok(), "{t:?} {key:?}");
+        }
     }
 
     #[tokio::test]

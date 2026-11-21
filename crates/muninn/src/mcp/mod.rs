@@ -425,6 +425,10 @@ async fn tool_capture_passive(args: &Value, lib: &MemoryLibrarian) -> Result<Str
         .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    // Its keys are `learning:<hash>`, so only the type can trespass.
+    if let Some(t) = entry_type {
+        crate::plans::check_generic_save(t, None)?;
+    }
 
     let results = lib
         .capture_passive(text, project_id.as_deref(), entry_type, &extra_tags)
@@ -508,6 +512,7 @@ async fn tool_save(args: &Value, lib: &MemoryLibrarian) -> Result<String, String
         let hash = crate::storage::content_hash(&clean_title, &clean_content);
         format!("{key}-{}", hash.chars().take(8).collect::<String>())
     });
+    crate::plans::check_generic_save(entry_type, Some(&effective_topic_key))?;
 
     let confidence = resolve_confidence(args.get("confidence"));
 
@@ -2030,12 +2035,12 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "content": { "type": "string", "description": "Full content of the memory (10-10,000 chars)" },
                     "type": {
                         "type": "string",
-                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt", "plan", "icebox"],
-                        "description": "Category of this memory. Prefer the muninn_plan_* / muninn_icebox_* tools over saving \"plan\"/\"icebox\" directly — they own the topic-key and status conventions."
+                        "enum": ["decision", "pattern", "bug", "rule", "business-rule", "architecture", "tech-debt", "session", "context", "preference", "note", "auto-change", "user-prompt"],
+                        "description": "Category of this memory. Plans and icebox items are not saved here: use muninn_plan_create / muninn_icebox_add, which own their keys and statuses."
                     },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags for filtering (max 10)" },
                     "projectId": { "type": "string", "description": "Optional project this memory belongs to" },
-                    "topicKey": { "type": "string", "description": "Optional stable key for upsert. Format: \"scope:key\" e.g. \"auth:approach\"" },
+                    "topicKey": { "type": "string", "description": "Optional stable key for upsert. Format: \"scope:key\" e.g. \"auth:approach\". The `plan:` and `icebox:` scopes belong to the plan tools and are refused, as are keys containing '<' or '>'." },
                     "confidence": {
                         "description": "Source confidence multiplier applied to search ranking. Preset string (verified=1.0, observed=0.9, inferred=0.7, speculative=0.4) or a numeric 0..1 value. Default: observed.",
                         "oneOf": [
@@ -3033,6 +3038,100 @@ mod tests {
                 "a wrong slug must not count toward the MCP breaker: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn muninn_save_refuses_the_plan_stores_types() {
+        let lib = icebox_test_lib().await;
+        for (t, tool) in [
+            ("plan", "muninn_plan_create"),
+            ("icebox", "muninn_icebox_add"),
+        ] {
+            let err = tool_save(
+                &serde_json::json!({
+                    "title": "Auth rewrite",
+                    "content": "replace the session check",
+                    "type": t,
+                }),
+                &lib,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains(tool), "{err}");
+            assert!(!looks_like_storage_err(&err), "{err}");
+        }
+        let listed = call(tool_plan_list(&serde_json::json!({}), &lib))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn muninn_save_refuses_reserved_scopes_and_leaves_the_plan_alone() {
+        let lib = icebox_test_lib().await;
+        create_md(
+            &lib,
+            "Auth rewrite",
+            "auth-rewrite",
+            "## Phase 1 — a\n\nx\n",
+        )
+        .await;
+
+        for key in ["plan:auth-rewrite", "ICEBOX:later", " plan:x", "auth:<b>"] {
+            let err = tool_save(
+                &serde_json::json!({
+                    "title": "Use JWT",
+                    "content": "stateless tokens",
+                    "type": "decision",
+                    "topicKey": key,
+                }),
+                &lib,
+            )
+            .await
+            .unwrap_err();
+            assert!(!looks_like_storage_err(&err), "{key}: {err}");
+        }
+        for key in ["planning:x", "auth:approach"] {
+            tool_save(
+                &serde_json::json!({
+                    "title": format!("Use JWT for {key}"),
+                    "content": format!("stateless tokens, filed at {key}"),
+                    "type": "decision",
+                    "topicKey": key,
+                }),
+                &lib,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{key} is an ordinary scope: {e}"));
+        }
+        let plan = call(tool_plan_get(
+            &serde_json::json!({ "slug": "auth-rewrite" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(plan["title"], "Auth rewrite");
+        assert_eq!(plan["phasesTotal"], 1);
+    }
+
+    #[tokio::test]
+    async fn capture_passive_refuses_the_plan_type() {
+        let lib = icebox_test_lib().await;
+        let err = tool_capture_passive(
+            &serde_json::json!({
+                "text": "## Key Learnings:\n- the outbox must coalesce by entry id",
+                "type": "plan",
+            }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("muninn_plan_create"), "{err}");
+        assert!(lib
+            .list(crate::types::ListFilters::default())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

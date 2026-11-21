@@ -200,7 +200,10 @@ enum Commands {
         title: String,
         /// Entry content
         content: String,
-        /// Entry type (default: note)
+        /// Entry type: decision | pattern | bug | rule | business-rule |
+        /// architecture | tech-debt | context | preference | note (default).
+        /// Plans and icebox items have their own commands: `runar plan`,
+        /// `runar icebox`.
         #[arg(short = 't', long, default_value = "note")]
         entry_type: String,
         /// Project identifier (optional)
@@ -209,7 +212,8 @@ enum Commands {
         /// Comma-separated tags (e.g. "refactor,db,auth")
         #[arg(long)]
         tags: Option<String>,
-        /// Stable topic key for upsert semantics (e.g. "auth:approach")
+        /// Stable topic key for upsert semantics (e.g. "auth:approach").
+        /// The `plan:` and `icebox:` scopes are refused.
         #[arg(long)]
         topic_key: Option<String>,
     },
@@ -3006,6 +3010,31 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
     Ok(())
 }
 
+/// The entry type for `runar save`, refusing what belongs to the plan
+/// store: the plan and icebox types, and keys in their scopes. Same rule as
+/// `muninn_save`, through the same check.
+fn save_entry_type(t: &str, topic_key: Option<&str>) -> anyhow::Result<types::EntryType> {
+    let et = match t {
+        "decision" => types::EntryType::Decision,
+        "pattern" => types::EntryType::Pattern,
+        "bug" => types::EntryType::Bug,
+        "rule" => types::EntryType::Rule,
+        "business-rule" => types::EntryType::BusinessRule,
+        "architecture" => types::EntryType::Architecture,
+        "tech-debt" => types::EntryType::TechDebt,
+        "context" => types::EntryType::Context,
+        "preference" => types::EntryType::Preference,
+        "note" => types::EntryType::Note,
+        "plan" => types::EntryType::Plan,
+        "icebox" => types::EntryType::Icebox,
+        other => anyhow::bail!(
+            "unknown type '{other}' (use: decision|pattern|bug|rule|business-rule|architecture|tech-debt|context|preference|note)"
+        ),
+    };
+    runar_muninn::plans::check_generic_save(et, topic_key).map_err(anyhow::Error::msg)?;
+    Ok(et)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Before anything that could panic on user text: std's default hook
@@ -3697,23 +3726,7 @@ async fn main() -> anyhow::Result<()> {
             tags,
             topic_key,
         } => {
-            let et = match entry_type.as_str() {
-                "decision" => types::EntryType::Decision,
-                "pattern" => types::EntryType::Pattern,
-                "bug" => types::EntryType::Bug,
-                "rule" => types::EntryType::Rule,
-                "business-rule" => types::EntryType::BusinessRule,
-                "architecture" => types::EntryType::Architecture,
-                "tech-debt" => types::EntryType::TechDebt,
-                "context" => types::EntryType::Context,
-                "preference" => types::EntryType::Preference,
-                "note" => types::EntryType::Note,
-                "plan" => types::EntryType::Plan,
-                "icebox" => types::EntryType::Icebox,
-                other => anyhow::bail!(
-                    "unknown type '{other}' (use: decision|pattern|bug|rule|business-rule|architecture|tech-debt|context|preference|note|plan|icebox)"
-                ),
-            };
+            let et = save_entry_type(&entry_type, topic_key.as_deref())?;
             let parsed_tags: Vec<String> = tags
                 .map(|s| {
                     s.split(',')
@@ -4096,6 +4109,28 @@ mod tests {
     /// never happens. This shipped once, in the gap between `autorefresh` and
     /// `graph autorefresh`, and was caught by running the real binary rather
     /// than by any test.
+    #[test]
+    fn runar_save_refuses_the_plan_stores_types_and_scopes() {
+        for t in ["plan", "icebox"] {
+            let err = save_entry_type(t, None).unwrap_err().to_string();
+            assert!(err.contains(&format!("runar {t}")), "{err}");
+        }
+        assert!(save_entry_type("decision", Some("plan:x")).is_err());
+        assert!(save_entry_type("decision", Some("Icebox:later")).is_err());
+        assert!(save_entry_type("frozen", None).is_err());
+        assert_eq!(
+            save_entry_type("decision", Some("auth:approach")).unwrap(),
+            types::EntryType::Decision
+        );
+        assert_eq!(
+            save_entry_type("note", None).unwrap(),
+            types::EntryType::Note
+        );
+        // The CLI still parses these; the refusal happens at save time,
+        // with a message naming the right command.
+        assert!(Cli::try_parse_from(["runar", "save", "t", "c", "-t", "plan"]).is_ok());
+    }
+
     #[test]
     fn every_installed_hook_command_still_parses() {
         let argvs = setup::installed_hook_argvs("proj");

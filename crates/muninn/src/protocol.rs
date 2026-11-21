@@ -64,7 +64,7 @@ Call `muninn_save` IMMEDIATELY after ANY of these:
 ### During planning/design:
 - Search memory first for related past decisions
 - After planning, save each key decision as a separate `muninn_save` (not the full plan)
-- Use topicKey for evolving decisions: "plan:feature-name"
+- Use topicKey for evolving decisions: "feature-name:decision" (the `plan:` and `icebox:` scopes belong to the plan tools)
 
 ### After completing a multi-step task:
 - Save a summary: what was built, key decisions made, files changed
@@ -314,6 +314,37 @@ pub fn parse_user_prompt(stdin_payload: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `"scope:key"` the protocol shows an agent, as written.
+    fn suggested_keys(protocol: &str) -> Vec<&str> {
+        protocol
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| token.contains(':') && !token.contains(' '))
+            .collect()
+    }
+
+    /// The protocol told agents to key decisions `plan:<feature>`, the
+    /// scope the plan store owns: such a save replaced a plan's meta entry.
+    #[test]
+    fn the_protocol_only_suggests_keys_muninn_save_accepts() {
+        let out = build_memory_protocol("p", &[]);
+        let keys = suggested_keys(&out);
+        assert!(!keys.is_empty(), "the protocol still shows example keys");
+        for key in keys {
+            let folded = key.trim().to_ascii_lowercase();
+            assert!(
+                !folded.starts_with("plan:") && !folded.starts_with("icebox:"),
+                "the protocol suggests a reserved key: {key}"
+            );
+            assert!(
+                crate::plans::check_generic_save(crate::types::EntryType::Decision, Some(key))
+                    .is_ok(),
+                "muninn_save would refuse the protocol's own example: {key}"
+            );
+        }
+    }
 
     #[test]
     fn agent_system_prompts_are_not_user_prompts() {
