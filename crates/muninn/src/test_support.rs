@@ -122,6 +122,30 @@ pub(crate) fn hostile_corpus() -> Vec<String> {
     corpus
 }
 
+/// An embedder that is always available and returns the same vector for
+/// every input, so semantic search ranks every stored copy of that vector as
+/// a perfect match.
+pub(crate) struct FixedEmbeddings(pub Vec<f32>);
+
+#[async_trait::async_trait]
+impl crate::embedding::EmbeddingProvider for FixedEmbeddings {
+    fn name(&self) -> &str {
+        "fixed"
+    }
+    fn dimensions(&self) -> usize {
+        self.0.len()
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+        Some(self.0.clone())
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
 /// Claim every queued outbox row and decode its payload the way
 /// `sync::push` does before sending it: exactly what the remote would
 /// receive.

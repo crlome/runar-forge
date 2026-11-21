@@ -5,8 +5,17 @@
 //! whose cut point fell mid-character permanently killed the PreToolUse
 //! context hook for three projects, because the context packet is a fixed
 //! recency window that kept re-including the same row on every fire.
+//!
+//! The two prefix helpers below hold the only raw slices in this module,
+//! each at an index that is a char boundary by construction.
+
+#![deny(clippy::string_slice)]
 
 /// Char-boundary-safe prefix. Never panics, whatever `s` contains.
+#[allow(
+    clippy::string_slice,
+    reason = "the index comes from char_indices, so it is a char boundary"
+)]
 pub fn char_prefix(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => &s[..idx],
@@ -23,6 +32,10 @@ pub fn char_prefix(s: &str, max_chars: usize) -> &str {
 /// `String::truncate(n)` and `&s[..n]` both panic when `n` lands inside a
 /// multibyte character. This floors to the nearest boundary at or below the
 /// budget, so it always returns at most `max_bytes` and never panics.
+#[allow(
+    clippy::string_slice,
+    reason = "the index is lowered until is_char_boundary holds"
+)]
 pub fn byte_prefix(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;

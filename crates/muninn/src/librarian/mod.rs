@@ -1,3 +1,6 @@
+// Text is cut with the `crate::text` helpers or `str::get`, never `&s[a..b]`.
+#![deny(clippy::string_slice)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -1509,7 +1512,10 @@ async fn auto_link_entry(
 
     let entry = storage.get(entry_id).await?;
     let search_text = format!("{} {}", entry.title, entry.content);
-    let search_text = &search_text[..search_text.len().min(500)];
+    // A 500-byte budget, floored to a char boundary: a raw `[..500]` panicked
+    // whenever byte 500 fell inside a multibyte character (most CJK text),
+    // and the entry never got its related links.
+    let search_text = crate::text::byte_prefix(&search_text, 500);
 
     let query_emb = match embedding.embed(search_text).await {
         Some(e) => e,
@@ -1628,6 +1634,59 @@ mod tests {
             "the tombstone must carry deleted_at, or the remote resolver \
              treats it as a live entry and the deletion never propagates"
         );
+    }
+
+    /// The auto-link query was cut with `[..500]`, which panicked whenever
+    /// byte 500 fell inside a multibyte character (most CJK text): the
+    /// spawned task died and the entry never got its related links.
+    #[tokio::test]
+    async fn auto_link_survives_a_multibyte_char_at_byte_500() {
+        let storage = SqliteAdapter::in_memory("test").unwrap();
+        storage.initialize().await.unwrap();
+        let unit = [1.0, 0.0, 0.0, 0.0];
+        let fixed = crate::test_support::FixedEmbeddings(unit.to_vec());
+        let anchor = storage
+            .save(
+                MemoryEntryInput {
+                    title: "anchor".into(),
+                    content: "plain ascii".into(),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        storage.save_embedding(anchor.id, &unit).await.unwrap();
+
+        for atom in crate::test_support::HOSTILE_ATOMS
+            .iter()
+            .filter(|atom| !atom.is_ascii())
+        {
+            // The query is "t " + content, so the atom starts at byte 499
+            // and byte 500 falls inside it.
+            let content = crate::test_support::straddling(498, atom);
+            let entry = storage
+                .save(
+                    MemoryEntryInput {
+                        title: "t".into(),
+                        content,
+                        ..Default::default()
+                    },
+                    "test",
+                )
+                .await
+                .unwrap();
+            auto_link_entry(&storage, &fixed, entry.id, "test")
+                .await
+                .unwrap();
+            let edges = storage.get_edges(entry.id, None).await.unwrap();
+            assert!(
+                edges
+                    .iter()
+                    .any(|e| e.edge_type == EdgeType::Related && e.to_id == anchor.id),
+                "no related link for an entry straddling byte 500 with {atom:?}"
+            );
+        }
     }
 
     /// The outbox payload is a snapshot of the stored row, so private text
