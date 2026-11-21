@@ -66,14 +66,18 @@ jobs:
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             cross: true
-          - runner: macos-14
+          # macos-latest, like ci.yml: a pinned image is retired under the
+          # pipeline (macos-14 was, failing both macOS builds before they
+          # start). The binaries' minimum macOS comes from rustc's default
+          # deployment target, not from the runner image.
+          - runner: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             smoke: true
           # Cross-compile Intel on the arm64 runner — Apple clang cross-builds
-          # x86_64 natively, and the macos-13 (Intel) hosted runner is being
-          # retired so its label can hang queued forever.
-          - runner: macos-14
+          # x86_64 natively, and the Intel hosted runners are being retired,
+          # so their labels can hang queued forever.
+          - runner: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - runner: windows-latest
