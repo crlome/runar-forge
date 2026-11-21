@@ -695,7 +695,7 @@ fn plan_doc_json(doc: &crate::plans::PlanDocument) -> Value {
 
 async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String, String> {
     let title = required_str(args, "title")?;
-    let overview = arg_str(args, "overview").unwrap_or("");
+    let mut overview = arg_str(args, "overview").unwrap_or("").to_string();
     // Omitted means "keep the stored status" on a re-create; a new plan
     // starts as draft.
     let status = plan_status_arg(args, "status")?;
@@ -727,6 +727,11 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
             Some(md) => {
                 let parsed = crate::plans::parse_markdown(md);
                 parse_warnings = parsed.warnings();
+                // The prose before the first section is the overview, as
+                // on the CLI, unless the caller gave one explicitly.
+                if overview.is_empty() {
+                    overview = parsed.overview;
+                }
                 parsed.sections
             }
             None => Vec::new(),
@@ -735,7 +740,7 @@ async fn tool_plan_create(args: &Value, lib: &MemoryLibrarian) -> Result<String,
 
     let store = icebox_store(args, lib);
     let created = store
-        .create_plan(title, arg_str(args, "slug"), overview, &sections, status)
+        .create_plan(title, arg_str(args, "slug"), &overview, &sections, status)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2274,7 +2279,7 @@ fn tool_definitions() -> Vec<ToolInfo> {
                     "title": { "type": "string", "description": "Plan title" },
                     "slug": { "type": "string", "description": "Optional stable id; derived from the title otherwise" },
                     "overview": { "type": "string", "description": "Problem statement and goals — the plan's summary" },
-                    "markdown": { "type": "string", "description": "Whole plan as markdown; each '## Heading' becomes a section, and a heading naming a phase ('## Phase 2 — storage') becomes a tracked phase" },
+                    "markdown": { "type": "string", "description": "Whole plan as markdown; each '## Heading' becomes a section, a heading starting with a phase number ('## Phase 2 — storage') becomes a tracked phase, and the prose before the first '##' becomes the overview unless 'overview' is given. Headings inside code fences are ignored" },
                     "sections": {
                         "type": "array",
                         "description": "Sections given explicitly, instead of markdown",
@@ -3280,6 +3285,28 @@ mod tests {
             assert_eq!(doc["sections"][0]["phaseStatus"], "done", "{doc}");
             assert_eq!(doc["phasesTotal"], 1);
         }
+    }
+
+    /// /prd passes the whole document as markdown; its problem statement
+    /// was dropped, while the CLI kept it.
+    #[tokio::test]
+    async fn plan_create_keeps_the_markdown_overview() {
+        let lib = icebox_test_lib().await;
+        let md = "# T\n\nThe problem statement.\n\n## Phase 1 — x\n\nbody\n";
+        call(tool_plan_create(
+            &serde_json::json!({ "title": "T", "markdown": md }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        call(tool_plan_create(
+            &serde_json::json!({ "title": "U", "overview": "explicit", "markdown": md }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(plan(&lib, "t").await["overview"], "The problem statement.");
+        assert_eq!(plan(&lib, "u").await["overview"], "explicit");
     }
 
     #[tokio::test]
