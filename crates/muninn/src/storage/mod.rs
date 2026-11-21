@@ -111,6 +111,11 @@ pub trait MemoryStorage: Send + Sync {
     ///
     /// `prefix` is matched literally — implementations must escape `%` and
     /// `_` so a key containing them cannot widen the match.
+    ///
+    /// Case sensitivity is NOT part of the contract: `LIKE` folds ASCII
+    /// case on SQLite and does not on Postgres. Callers normalize the
+    /// prefix first and filter the result with an exact comparison in Rust
+    /// (as `PlanStore` does), so both backends return the same answer.
     async fn list_by_topic_prefix(
         &self,
         namespace: &str,

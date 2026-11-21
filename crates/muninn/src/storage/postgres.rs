@@ -599,6 +599,9 @@ impl MemoryStorage for PostgresAdapter {
     ) -> StorageResult<Vec<MemoryEntry>> {
         let client = self.get_client().await?;
         let pattern = super::escape_like_prefix(prefix);
+        // Case-sensitive here, ASCII-case-insensitive on SQLite: callers
+        // normalize the prefix and filter exact keys in Rust, so the two
+        // backends agree (trait doc).
         let rows = client
             .query(
                 "SELECT * FROM muninn.memory_entries

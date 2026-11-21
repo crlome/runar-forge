@@ -555,6 +555,9 @@ impl MemoryStorage for SqliteAdapter {
             .lock()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         let pattern = super::escape_like_prefix(prefix);
+        // SQLite's LIKE folds ASCII case (no case_sensitive_like pragma is
+        // set), Postgres's does not: callers filter exact keys in Rust, so
+        // the extra case variants returned here never reach a decision.
         let mut stmt = db
             .prepare(
                 "SELECT * FROM memory_entries

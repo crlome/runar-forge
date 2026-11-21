@@ -2898,6 +2898,143 @@ mod tests {
         assert_eq!(own["sections"].as_array().unwrap().len(), 1, "{own}");
     }
 
+    async fn create_md(lib: &MemoryLibrarian, title: &str, slug: &str, markdown: &str) -> Value {
+        call(tool_plan_create(
+            &serde_json::json!({ "title": title, "slug": slug, "markdown": markdown }),
+            lib,
+        ))
+        .await
+        .unwrap()
+    }
+
+    async fn phase_status_of(lib: &MemoryLibrarian, slug: &str, index: usize) -> String {
+        let doc = call(tool_plan_get(&serde_json::json!({ "slug": slug }), lib))
+            .await
+            .unwrap();
+        doc["sections"][index]["phaseStatus"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_phase_update_never_touches_a_prefix_sibling() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth", "auth", "## Phase 1 — a\n\nauth's phase\n").await;
+        create_md(
+            &lib,
+            "auth flow",
+            "auth-flow",
+            "## Phase 1 — a\n\nflow's phase\n",
+        )
+        .await;
+
+        call(tool_plan_set_status(
+            &serde_json::json!({ "slug": "auth", "phase": 1, "phaseStatus": "done" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(phase_status_of(&lib, "auth", 0).await, "done");
+        assert_eq!(phase_status_of(&lib, "auth-flow", 0).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_phase_update_on_an_unknown_slug_is_an_error_not_a_panic() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth flow", "auth-flow", "## Phase 1 — a\n\nx\n").await;
+
+        let err = tool_plan_set_status(
+            &serde_json::json!({ "slug": "auth", "phase": 1, "phaseStatus": "done" }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no plan with slug 'auth'"), "{err}");
+        assert_eq!(phase_status_of(&lib, "auth-flow", 0).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_update_writes_nothing() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth flow", "auth-flow", "## Phase 1 — a\n\nx\n").await;
+
+        assert!(tool_plan_set_status(
+            &serde_json::json!({
+                "slug": "auth",
+                "status": "completed",
+                "phase": 1,
+                "phaseStatus": "done",
+            }),
+            &lib,
+        )
+        .await
+        .is_err());
+        // A real plan, a phase it does not have: the status half must not
+        // land either.
+        assert!(tool_plan_set_status(
+            &serde_json::json!({
+                "slug": "auth-flow",
+                "status": "completed",
+                "phase": 9,
+                "phaseStatus": "done",
+            }),
+            &lib,
+        )
+        .await
+        .is_err());
+        let flow = call(tool_plan_get(
+            &serde_json::json!({ "slug": "auth-flow" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(flow["sections"][0]["phaseStatus"], "pending");
+        assert_eq!(flow["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn a_mixed_case_slug_resolves_to_the_same_plan() {
+        let lib = icebox_test_lib().await;
+        create_md(&lib, "auth", "auth", "## Phase 1 — a\n\nx\n").await;
+
+        let set = call(tool_plan_set_status(
+            &serde_json::json!({ "slug": "Auth", "phase": 1, "phaseStatus": "done" }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(set["slug"], "auth");
+        assert_eq!(set["phasesDone"], 1);
+        call(tool_plan_get(&serde_json::json!({ "slug": "AUTH" }), &lib))
+            .await
+            .expect("a case variant reads the same plan");
+    }
+
+    #[tokio::test]
+    async fn plan_errors_are_not_storage_failures() {
+        let lib = icebox_test_lib().await;
+        let plan = tool_plan_set_status(
+            &serde_json::json!({ "slug": "nope", "status": "completed" }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        let item = tool_icebox_set_status(
+            &serde_json::json!({ "slug": "nope", "status": "dropped" }),
+            &lib,
+        )
+        .await
+        .unwrap_err();
+        for err in [plan, item] {
+            assert!(
+                !looks_like_storage_err(&err),
+                "a wrong slug must not count toward the MCP breaker: {err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_decision_under_a_plan_key_is_not_a_plan() {
         let lib = icebox_test_lib().await;

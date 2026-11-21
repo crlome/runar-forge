@@ -592,14 +592,56 @@ impl<'a> PlanStore<'a> {
             .collect())
     }
 
-    /// The live icebox entry at `icebox:<slug>`, typed as one. The type
-    /// check sits in the predicate, so a note at the same key never hides
-    /// the item.
+    /// Find plan `slug` the way it was stored: the exact slug first, so a
+    /// legacy slug written before every writer slugified still resolves,
+    /// then its slugified form, which is what `create_plan` writes — so
+    /// `Auth`, `AUTH` and `auth flow` reach the plans `auth` and
+    /// `auth-flow`. Returns the resolved slug and the plan's own entries.
+    ///
+    /// Resolution never relies on the storage `LIKE`: it is case-insensitive
+    /// for ASCII on SQLite and case-sensitive on Postgres. The slug is
+    /// normalized before the query and the final match is an exact Rust
+    /// comparison, so both backends agree.
+    async fn resolve_plan(&self, slug: &str) -> StorageResult<Option<(String, Vec<MemoryEntry>)>> {
+        let normalized = slugify(slug);
+        let candidates = if normalized == slug {
+            vec![normalized]
+        } else {
+            vec![slug.to_string(), normalized]
+        };
+        for candidate in candidates {
+            let entries = self.plan_entries(&candidate).await?;
+            let meta_key = plan_meta_key(&candidate);
+            if entries
+                .iter()
+                .any(|e| e.topic_key.as_deref() == Some(meta_key.as_str()))
+            {
+                return Ok(Some((candidate, entries)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The live icebox entry for `slug`, typed as one, resolved exact-first
+    /// like `resolve_plan`. The type check sits in the predicate, so a note
+    /// at the same key never hides the item.
     async fn icebox_entry(&self, slug: &str) -> StorageResult<Option<MemoryEntry>> {
-        let key = icebox_key(slug);
-        Ok(self.entries_under(&key).await?.into_iter().find(|e| {
-            e.entry_type == EntryType::Icebox && e.topic_key.as_deref() == Some(key.as_str())
-        }))
+        let normalized = slugify(slug);
+        let candidates = if normalized == slug {
+            vec![normalized]
+        } else {
+            vec![slug.to_string(), normalized]
+        };
+        for candidate in candidates {
+            let key = icebox_key(&candidate);
+            let found = self.entries_under(&key).await?.into_iter().find(|e| {
+                e.entry_type == EntryType::Icebox && e.topic_key.as_deref() == Some(key.as_str())
+            });
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
     async fn save(
@@ -738,8 +780,10 @@ impl<'a> PlanStore<'a> {
     }
 
     pub async fn get_plan(&self, slug: &str) -> StorageResult<Option<PlanDocument>> {
-        let entries = self.entries_under(&plan_scope_prefix(slug)).await?;
-        Ok(plan_from_entries(slug, &entries))
+        Ok(self
+            .resolve_plan(slug)
+            .await?
+            .and_then(|(slug, entries)| plan_from_entries(&slug, &entries)))
     }
 
     pub async fn list_plans(
@@ -781,9 +825,11 @@ impl<'a> PlanStore<'a> {
 
     /// Set a plan's status, or one phase's status when `phase` is given.
     ///
-    /// Re-saves the affected entry under its existing key, so the change
-    /// supersedes in place: history is preserved through the supersede edge
-    /// and the transition itself enqueues to the outbox like any other write.
+    /// Retags the affected entries in place (same id), so the transition
+    /// enqueues to the outbox like any other write. Everything is checked
+    /// before the first write: an unknown slug or a phase the plan does not
+    /// have changes nothing, and only the named plan's entries are touched
+    /// — never a sibling that shares the slug as a prefix.
     pub async fn set_plan_status(
         &self,
         slug: &str,
@@ -791,51 +837,55 @@ impl<'a> PlanStore<'a> {
         phase: Option<usize>,
         phase_status: Option<PhaseStatus>,
     ) -> StorageResult<PlanDocument> {
-        let entries = self.entries_under(&plan_scope_prefix(slug)).await?;
-        if entries.is_empty() {
-            return Err(crate::storage::StorageError::Database(format!(
-                "no plan with slug '{slug}'"
-            )));
-        }
+        use crate::storage::StorageError::Invalid;
 
-        if let (Some(phase), Some(phase_status)) = (phase, phase_status) {
-            let mut touched = 0usize;
-            for entry in &entries {
-                if tag_value(&entry.tags, PHASE_TAG).and_then(|v| v.parse::<usize>().ok())
-                    != Some(phase)
-                {
-                    continue;
+        let Some((slug, entries)) = self.resolve_plan(slug).await? else {
+            return Err(Invalid(format!("no plan with slug '{slug}'")));
+        };
+        let meta_key = plan_meta_key(&slug);
+
+        let phase_update = match (phase, phase_status) {
+            (Some(phase), Some(phase_status)) => {
+                let targets: Vec<&MemoryEntry> = entries
+                    .iter()
+                    .filter(|e| {
+                        tag_value(&e.tags, PHASE_TAG).and_then(|v| v.parse::<usize>().ok())
+                            == Some(phase)
+                    })
+                    .collect();
+                if targets.is_empty() {
+                    return Err(Invalid(format!("plan '{slug}' has no phase {phase}")));
                 }
+                Some((targets, phase_status))
+            }
+            _ => None,
+        };
+
+        if let Some((targets, phase_status)) = phase_update {
+            for entry in targets {
                 let mut tags = entry.tags.clone();
                 set_tag(&mut tags, PHASE_STATUS_TAG, phase_status.as_str());
                 self.lib.retag(entry.id, tags).await?;
-                touched += 1;
-            }
-            if touched == 0 {
-                return Err(crate::storage::StorageError::Database(format!(
-                    "plan '{slug}' has no phase {phase}"
-                )));
             }
         }
-
         if let Some(status) = status {
-            let meta_key = plan_meta_key(slug);
-            let meta = entries
+            // Present by construction: resolve_plan only returns a slug
+            // whose meta it found.
+            if let Some(meta) = entries
                 .iter()
                 .find(|e| e.topic_key.as_deref() == Some(meta_key.as_str()))
-                .ok_or_else(|| {
-                    crate::storage::StorageError::Database(format!(
-                        "plan '{slug}' has no meta entry"
-                    ))
-                })?;
-            let mut tags = meta.tags.clone();
-            set_tag(&mut tags, STATUS_TAG, status.as_str());
-            self.lib.retag(meta.id, tags).await?;
+            {
+                let mut tags = meta.tags.clone();
+                set_tag(&mut tags, STATUS_TAG, status.as_str());
+                self.lib.retag(meta.id, tags).await?;
+            }
         }
 
-        self.get_plan(slug)
-            .await
-            .map(|d| d.expect("plan was present at the start of this call and was not deleted"))
+        self.get_plan(&slug).await?.ok_or_else(|| {
+            Invalid(format!(
+                "plan '{slug}' changed during the update; read it again"
+            ))
+        })
     }
 
     // ── Icebox ──────────────────────────────────────────────────
@@ -886,7 +936,7 @@ impl<'a> PlanStore<'a> {
         promoted_to: Option<&str>,
     ) -> StorageResult<IceboxItem> {
         let entry = self.icebox_entry(slug).await?.ok_or_else(|| {
-            crate::storage::StorageError::Database(format!("no icebox item with slug '{slug}'"))
+            crate::storage::StorageError::Invalid(format!("no icebox item with slug '{slug}'"))
         })?;
 
         let mut tags = entry.tags.clone();
@@ -935,7 +985,7 @@ pub(crate) mod parity {
     }
 
     pub(crate) async fn keeps_every_plans_data(lib: &MemoryLibrarian, project: &str) {
-        let [auth, auth_flow, _, _] = COLLIDING_SLUGS;
+        let [auth, auth_flow, upper, _] = COLLIDING_SLUGS;
         let store = PlanStore::new(lib, Some(project.to_string()));
 
         store
@@ -996,6 +1046,24 @@ pub(crate) mod parity {
         lib.get(note)
             .await
             .expect("the note under icebox: is untouched");
+
+        // A case variant resolves to `auth` and advances only auth.
+        let advanced = store
+            .set_plan_status(upper, None, Some(1), Some(PhaseStatus::Done))
+            .await
+            .unwrap();
+        assert_eq!(advanced.slug, auth);
+        assert_eq!(advanced.phase_progress(), (1, 1));
+        let flow = store.get_plan(auth_flow).await.unwrap().unwrap();
+        assert_eq!(
+            flow.phase_progress(),
+            (0, 1),
+            "the prefix sibling is untouched"
+        );
+        assert!(store
+            .set_plan_status("missing", Some(PlanStatus::Completed), None, None)
+            .await
+            .is_err());
     }
 }
 
@@ -1775,6 +1843,25 @@ none
             "meta + section + icebox item must all be queued for the remote, got {}",
             health.total()
         );
+    }
+
+    #[tokio::test]
+    async fn icebox_slugs_resolve_like_plan_slugs() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        let slug = store
+            .add_icebox("Later idea", "worth a look", Some("Later-Idea"), &[])
+            .await
+            .unwrap();
+        assert_eq!(slug, "later-idea");
+
+        assert!(store.get_icebox("Later-Idea").await.unwrap().is_some());
+        let item = store
+            .set_icebox_status("LATER IDEA", IceboxStatus::Dropped, None)
+            .await
+            .unwrap();
+        assert_eq!(item.slug, "later-idea");
+        assert_eq!(item.status, IceboxStatus::Dropped);
     }
 
     #[tokio::test]
