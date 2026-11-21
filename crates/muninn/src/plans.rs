@@ -436,6 +436,11 @@ pub struct ParsedMarkdown {
 /// heading alone whether a section will be tracked, and no section is
 /// silently promoted into work.
 pub fn parse_markdown(text: &str) -> ParsedMarkdown {
+    // Strip the whole document before splitting it: a block that spans a
+    // heading would otherwise be cut in two, the heading inside it would
+    // become a section (title and key), and the half after the cut has no
+    // opening tag left for propose to find.
+    let (text, _) = crate::redact::strip_private(text);
     let mut title = None;
     let mut overview = String::new();
     let mut sections: Vec<SectionInput> = Vec::new();
@@ -608,6 +613,45 @@ fn icebox_from_entry(entry: &MemoryEntry) -> Option<IceboxItem> {
     })
 }
 
+/// The slug for a new plan or icebox item. A slug derived from a title
+/// that holds a private block would carry its words into the key, which is
+/// stored as given; such a title needs an explicit slug. An explicit slug
+/// may not hold a block either.
+fn slug_for(title: &str, slug: Option<&str>) -> StorageResult<String> {
+    use crate::storage::StorageError::Invalid;
+    match slug {
+        Some(explicit) => {
+            if crate::redact::strip_private(explicit).1 > 0 {
+                return Err(Invalid("a slug cannot hold a private block".to_string()));
+            }
+            Ok(slugify(explicit))
+        }
+        None if crate::redact::strip_private(title).1 > 0 => Err(Invalid(
+            "the title holds a private block, so a slug derived from it would expose it: \
+             pass an explicit slug"
+                .to_string(),
+        )),
+        None => Ok(slugify(title)),
+    }
+}
+
+/// A section with its private blocks removed, before its key is built and
+/// before it is split into parts. Stripping per part, after the split,
+/// leaves the text between a part boundary and the closing tag in the
+/// clear.
+fn public_section(section: &SectionInput) -> (SectionInput, bool) {
+    let (title, title_blocks) = crate::redact::strip_private(&section.title);
+    let (content, content_blocks) = crate::redact::strip_private(&section.content);
+    (
+        SectionInput {
+            title,
+            content,
+            ..section.clone()
+        },
+        title_blocks + content_blocks > 0,
+    )
+}
+
 // ── Store: the operations both surfaces call ────────────────────────
 
 /// Thin façade over `MemoryLibrarian` holding the plan/icebox conventions.
@@ -728,7 +772,7 @@ impl<'a> PlanStore<'a> {
         sections: &[SectionInput],
         status: PlanStatus,
     ) -> StorageResult<(String, usize)> {
-        let slug = slug.map(slugify).unwrap_or_else(|| slugify(title));
+        let slug = slug_for(title, slug)?;
         let limit = content_limit();
 
         let mut written_keys = Vec::new();
@@ -740,11 +784,15 @@ impl<'a> PlanStore<'a> {
         written_keys.push(meta_key);
 
         for (idx, section) in sections.iter().enumerate() {
+            let (section, redacted) = public_section(section);
             let section_key = plan_section_key(&slug, idx, &section.title);
             let parts = split_section(&section.content, limit);
             for (part_idx, body) in parts.iter().enumerate() {
                 let key = part_key(&section_key, part_idx + 1, parts.len());
                 let mut tags = vec!["plan".to_string(), format!("{PLAN_REF_TAG}{slug}")];
+                if redacted {
+                    tags.push("redacted".to_string());
+                }
                 if let Some(phase) = section.phase {
                     set_tag(&mut tags, PHASE_TAG, &phase.to_string());
                     set_tag(&mut tags, PHASE_STATUS_TAG, section.phase_status.as_str());
@@ -795,12 +843,18 @@ impl<'a> PlanStore<'a> {
         content: &str,
         phase: Option<usize>,
     ) -> StorageResult<String> {
+        let (title, title_blocks) = crate::redact::strip_private(title);
+        let (content, content_blocks) = crate::redact::strip_private(content);
+        let (title, content) = (title.as_str(), content.as_str());
         let section_key = plan_section_key(slug, index, title);
         let parts = split_section(content, content_limit());
         let mut written = Vec::new();
         for (part_idx, body) in parts.iter().enumerate() {
             let key = part_key(&section_key, part_idx + 1, parts.len());
             let mut tags = vec!["plan".to_string(), format!("{PLAN_REF_TAG}{slug}")];
+            if title_blocks + content_blocks > 0 {
+                tags.push("redacted".to_string());
+            }
             if let Some(phase) = phase {
                 set_tag(&mut tags, PHASE_TAG, &phase.to_string());
                 set_tag(&mut tags, PHASE_STATUS_TAG, PhaseStatus::Pending.as_str());
@@ -946,7 +1000,7 @@ impl<'a> PlanStore<'a> {
         slug: Option<&str>,
         extra_tags: &[String],
     ) -> StorageResult<String> {
-        let slug = slug.map(slugify).unwrap_or_else(|| slugify(title));
+        let slug = slug_for(title, slug)?;
         let mut tags = vec!["icebox".to_string()];
         tags.extend(extra_tags.iter().cloned());
         set_tag(&mut tags, STATUS_TAG, IceboxStatus::Open.as_str());
@@ -1892,6 +1946,137 @@ none
             "meta + section + icebox item must all be queued for the remote, got {}",
             health.total()
         );
+    }
+
+    /// Every place `sentinel` survives in the store: keys, titles, contents
+    /// and tags of every keyed entry.
+    async fn leaks(lib: &MemoryLibrarian, sentinel: &str) -> Vec<String> {
+        lib.list_by_topic_prefix(None, "")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.topic_key.as_deref().unwrap_or("").contains(sentinel)
+                    || e.title.contains(sentinel)
+                    || e.content.contains(sentinel)
+                    || e.tags.iter().any(|t| t.contains(sentinel))
+            })
+            .map(|e| format!("{:?}: {}", e.topic_key, e.title))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_private_block_spanning_sections_stores_none_of_its_words() {
+        let lib = test_lib().await;
+        let parsed = parse_markdown(
+            "# P\n\n## A\n\nopen <private>zebra one\n\n## Zebra heading\n\nzebra two</private> after\n\n## B\n\nb\n",
+        );
+        PlanStore::new(&lib, None)
+            .create_plan(
+                "P",
+                Some("p"),
+                &parsed.overview,
+                &parsed.sections,
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+        assert_eq!(leaks(&lib, "ebra").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_section_title_never_puts_private_words_in_a_key() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        store
+            .create_plan(
+                "P",
+                Some("p"),
+                "o",
+                &[SectionInput::phase(
+                    1,
+                    "Phase 1 — <private>zebra</private> rollout",
+                    "x",
+                )],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+        store
+            .save_section("p", 1, "<private>zebra</private> notes", "y", None)
+            .await
+            .unwrap();
+        assert_eq!(leaks(&lib, "zebra").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_private_block_across_a_part_boundary_stays_private() {
+        // A block with paragraph breaks inside, opened just before the
+        // split point: the first part holds the opening tag, the second the
+        // closing one, and redaction ran per part, after the split.
+        let lib = test_lib().await;
+        let paragraph = "public paragraph text.\n\n";
+        let before = paragraph.repeat((content_limit() - 300) / paragraph.len());
+        let block = format!(
+            "<private>{}zebra closes the block</private>",
+            "hidden line.\n\n".repeat(200)
+        );
+        // Long enough that the section still splits once the block is gone.
+        let after = paragraph.repeat(content_limit() / paragraph.len());
+        let body = format!("{before}{block}\n\n{after}");
+        PlanStore::new(&lib, None)
+            .create_plan(
+                "P",
+                Some("p"),
+                "o",
+                &[SectionInput::prose("Long", body)],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+        let doc = PlanStore::new(&lib, None)
+            .get_plan("p")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(doc.sections.len() > 1, "the section must have been split");
+        assert_eq!(leaks(&lib, "zebra").await, Vec::<String>::new());
+        assert_eq!(leaks(&lib, "hidden line").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_title_with_a_private_block_needs_an_explicit_slug() {
+        let lib = test_lib().await;
+        let store = PlanStore::new(&lib, None);
+        let title = "<private>zebra</private> merger";
+        assert!(store
+            .create_plan(title, None, "o", &[], PlanStatus::Draft)
+            .await
+            .is_err());
+        assert!(store.add_icebox(title, "later", None, &[]).await.is_err());
+        assert!(store
+            .create_plan(
+                "Merger",
+                Some("<private>zebra</private>"),
+                "o",
+                &[],
+                PlanStatus::Draft
+            )
+            .await
+            .is_err());
+        assert_eq!(leaks(&lib, "zebra").await, Vec::<String>::new());
+
+        store
+            .create_plan(title, Some("merger"), "o", &[], PlanStatus::Draft)
+            .await
+            .unwrap();
+        store
+            .add_icebox(title, "later", Some("merger-later"), &[])
+            .await
+            .unwrap();
+        assert_eq!(leaks(&lib, "zebra").await, Vec::<String>::new());
+        let doc = store.get_plan("merger").await.unwrap().unwrap();
+        assert!(doc.title.contains("[redacted]"), "{}", doc.title);
     }
 
     #[test]
