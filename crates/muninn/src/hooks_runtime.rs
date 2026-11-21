@@ -123,6 +123,45 @@ pub fn count_hook_panics() -> (usize, Option<String>) {
     (panics.len(), last)
 }
 
+/// Replace std's panic hook for the whole process. std's message for a
+/// failed str slice quotes up to 256 bytes of the text being cut, and hook
+/// stderr is appended to `hook.log` (the MCP server's stderr reaches the
+/// client's log), so a text-slicing bug wrote user text, private blocks
+/// included, into both. Call first thing in `main`.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("Box<dyn Any>");
+        let location = info
+            .location()
+            .map_or_else(|| "<unknown>".to_string(), ToString::to_string);
+        let current = std::thread::current();
+        let report = render_panic(current.name().unwrap_or("<unnamed>"), &location, payload);
+        // `eprintln!` panics when stderr is closed; a panic inside the panic
+        // hook aborts the process.
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{report}");
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            let _ = writeln!(stderr, "stack backtrace:\n{backtrace}");
+        }
+    }));
+}
+
+/// What the panic hook prints. Keeps std's `thread '…' panicked at
+/// <location>:` line, which [`count_hook_panics`] and the release soak count,
+/// and elides the sliced text from the message.
+pub fn render_panic(thread: &str, location: &str, payload: &str) -> String {
+    format!(
+        "thread '{thread}' panicked at {location}:\n{}",
+        crate::redact::elide_panic_input(payload)
+    )
+}
+
 /// Serialize a Claude Code hook response that actually reaches the model.
 ///
 /// The contract is `hookSpecificOutput.additionalContext` with the event name
@@ -146,6 +185,40 @@ mod tests {
     use super::*;
 
     use crate::test_support::{with_runar_home, HOME_LOCK};
+
+    /// The message std builds for a real mid-character slice, which is what
+    /// the default hook printed.
+    #[allow(
+        clippy::string_slice,
+        reason = "the test needs std's own message for a bad slice"
+    )]
+    fn std_slice_panic_message(s: &str, end: usize) -> String {
+        let s = std::hint::black_box(s.to_string());
+        let end = std::hint::black_box(end);
+        let payload = std::panic::catch_unwind(|| s[..end].len()).unwrap_err();
+        *payload.downcast::<String>().expect("a formatted message")
+    }
+
+    #[test]
+    fn render_panic_elides_the_sliced_text() {
+        let raw = std_slice_panic_message("\u{0130}<private>SENTINEL-P</private>", 1);
+        // Positive control: std quotes the text it was cutting.
+        assert!(raw.contains("SENTINEL-P"), "{raw}");
+
+        let report = render_panic("main", "src/redact.rs:34:5", &raw);
+        assert!(!report.contains("SENTINEL-P"), "{report}");
+        assert!(report.contains("is not a char boundary"), "{report}");
+        assert!(report.ends_with("<input elided>`"), "{report}");
+        // The line doctor and the release soak count.
+        assert!(report.starts_with("thread 'main' panicked at src/redact.rs:34:5:"));
+    }
+
+    #[test]
+    fn render_panic_caps_other_messages() {
+        let report = render_panic("t", "l:1:1", &"x".repeat(1000));
+        let message = report.lines().nth(1).unwrap();
+        assert_eq!(message, format!("{}...", "x".repeat(300)));
+    }
 
     /// The regression test for the defect that made the whole memory system a
     /// no-op: assert on the shape the *consumer* reads, not on what we print.

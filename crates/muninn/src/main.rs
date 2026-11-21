@@ -3004,6 +3004,10 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything that could panic on user text: std's default hook
+    // quotes the text a bad slice was cutting into hook.log.
+    hooks_runtime::install_panic_hook();
+
     // Load `~/.runar-forge/.env` into the process env BEFORE anything reads
     // `std::env::var`. `dotenvy::from_path` does not overwrite vars already
     // set by the parent shell / Claude Code MCP env block. Missing file is

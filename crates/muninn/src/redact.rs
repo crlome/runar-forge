@@ -352,6 +352,22 @@ pub fn scrub(text: &mut String) -> usize {
     total
 }
 
+/// Elide the input from a panic message. std's message for a failed str
+/// slice quotes up to 256 bytes of the string being cut, after ` of `` or
+/// ` when slicing ``; the message is cut there. Every message is capped at
+/// 300 chars. No regex, because this runs inside the panic hook.
+pub fn elide_panic_input(msg: &str) -> String {
+    for subject in [" of `", " when slicing `"] {
+        if let Some(head) = msg
+            .find(subject)
+            .and_then(|at| msg.get(..at + subject.len()))
+        {
+            return crate::text::truncate_ellipsis(&format!("{head}<input elided>`"), 300);
+        }
+    }
+    crate::text::truncate_ellipsis(msg, 300)
+}
+
 /// [`strip_private`] in place, then [`scrub`]: the order `propose` uses, so
 /// a secret inside a private block goes with the block. For write paths that
 /// bypass `propose` (session goals, summaries, discoveries). Returns private
