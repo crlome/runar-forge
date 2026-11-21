@@ -419,6 +419,21 @@ mod tests {
     }
 
     #[test]
+    fn redact_secrets_leaves_hostile_text_alone_and_still_catches_secrets() {
+        // Assembled at runtime so no secret-shaped literal sits in the source.
+        let fake = ["Zq8x", "7Lm2", "Pw9R", "t4Kd"].concat();
+        for s in crate::test_support::hostile_corpus() {
+            let label = crate::text::char_prefix(&s, 40);
+            let (out, hits) = redact_secrets(&s);
+            assert_eq!(out, s, "clean text changed: {label:?}");
+            assert_eq!(total_hits(&hits), 0, "false hit on {label:?}");
+
+            let (out, _) = redact_secrets(&format!("{s} DB_PASSWORD={fake} {s}"));
+            assert!(!out.contains(&fake), "secret survived next to {label:?}");
+        }
+    }
+
+    #[test]
     fn redacts_github_tokens() {
         let (out, hits) = redact_secrets("push with ghp_abcdefghijklmnopqrstuvwxyz0123456789 now");
         assert!(out.contains("[REDACTED:github-token]"), "{out}");

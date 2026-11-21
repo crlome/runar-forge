@@ -133,4 +133,36 @@ mod tests {
         assert_eq!(truncate_ellipsis("anything", 0), "...");
         assert_eq!(truncate_ellipsis("", 0), "");
     }
+
+    /// The prefix helpers are how text code is meant to cut, so they must be
+    /// total on the shared hostile corpus. Every cut is tried on strings up
+    /// to 2 KB; longer ones are sampled, since a full sweep is quadratic.
+    #[test]
+    fn prefix_helpers_are_total_on_hostile_text() {
+        for s in crate::test_support::hostile_corpus() {
+            let label = char_prefix(&s, 40).to_string();
+            let end = s.len() + 3;
+            let cuts: Vec<usize> = if s.len() <= 2048 {
+                (0..=end).collect()
+            } else {
+                (0..=end).step_by(97).chain([s.len(), end]).collect()
+            };
+            for n in cuts {
+                let bytes = byte_prefix(&s, n);
+                assert!(
+                    bytes.len() <= n && s.starts_with(bytes),
+                    "byte_prefix({n}) on {label:?}"
+                );
+                let chars = char_prefix(&s, n);
+                assert!(
+                    chars.chars().count() <= n && s.starts_with(chars),
+                    "char_prefix({n}) on {label:?}"
+                );
+                assert!(
+                    truncate_ellipsis(&s, n).starts_with(chars),
+                    "truncate_ellipsis({n}) on {label:?}"
+                );
+            }
+        }
+    }
 }

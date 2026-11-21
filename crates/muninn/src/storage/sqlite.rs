@@ -3123,6 +3123,42 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 mod tests {
     use super::*;
 
+    /// FTS5 reports a malformed query as a row error, and `fts_search` drops
+    /// row errors, so `Ok` alone proves nothing. Each query therefore also
+    /// carries a word that must still find the saved entry.
+    #[tokio::test]
+    async fn fts_search_finds_through_every_hostile_query() {
+        let adapter = SqliteAdapter::in_memory("test").unwrap();
+        adapter.initialize().await.unwrap();
+        adapter
+            .save(
+                MemoryEntryInput {
+                    title: "zebra crossing".into(),
+                    content: "striped".into(),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+
+        for s in crate::test_support::hostile_corpus() {
+            let hits = adapter
+                .fts_search(SearchQuery {
+                    query: format!("{s} zebra {s}"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "a query around {:?} lost the match",
+                crate::text::char_prefix(&s, 40)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fts_search_applies_type_and_project_predicates() {
         let adapter = SqliteAdapter::in_memory("test").unwrap();
