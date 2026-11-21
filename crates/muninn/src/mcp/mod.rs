@@ -2809,6 +2809,109 @@ mod tests {
         );
     }
 
+    async fn propose_decision(
+        lib: &MemoryLibrarian,
+        title: &str,
+        content: &str,
+        key: &str,
+    ) -> Uuid {
+        lib.propose(MemoryEntryInput {
+            title: title.into(),
+            content: content.into(),
+            entry_type: EntryType::Decision,
+            topic_key: Some(key.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn call(
+        tool: impl std::future::Future<Output = Result<String, String>>,
+    ) -> Result<Value, String> {
+        tool.await.map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    /// `plan:auth` is a prefix of `plan:auth-flow`, and the stale pass read
+    /// every key under the raw prefix: creating `auth` retired the other
+    /// plan and a decision that only shared the scope.
+    #[tokio::test]
+    async fn creating_a_plan_never_retires_a_plan_it_prefixes() {
+        let lib = icebox_test_lib().await;
+        call(tool_plan_create(
+            &serde_json::json!({
+                "title": "auth flow",
+                "slug": "auth-flow",
+                "markdown": "## Phase 1 — a\n\nx\n\n## Notes\n\ny\n",
+            }),
+            &lib,
+        ))
+        .await
+        .unwrap();
+        let decision = propose_decision(
+            &lib,
+            "Auth notes",
+            "keep the check in one layer",
+            "plan:auth-notes",
+        )
+        .await;
+        // Inside auth's own key space, shaped like a section key: only the
+        // entry type says it is not auth's.
+        let inside = propose_decision(
+            &lib,
+            "Legacy auth decision",
+            "filed under the plan by a generic save",
+            "plan:auth:00-legacy",
+        )
+        .await;
+        for _ in 0..2 {
+            call(tool_plan_create(
+                &serde_json::json!({
+                    "title": "auth",
+                    "slug": "auth",
+                    "markdown": "## Only mine\n\nz\n",
+                }),
+                &lib,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let other = call(tool_plan_get(
+            &serde_json::json!({ "slug": "auth-flow" }),
+            &lib,
+        ))
+        .await
+        .expect("the longer slug's plan survives");
+        assert_eq!(other["sections"].as_array().unwrap().len(), 2);
+        assert_eq!(other["phasesTotal"], 1);
+        lib.get(decision)
+            .await
+            .expect("a decision under the plan scope is not the plan's to retire");
+        lib.get(inside)
+            .await
+            .expect("a decision inside the plan's key space is not a section");
+        let own = call(tool_plan_get(&serde_json::json!({ "slug": "auth" }), &lib))
+            .await
+            .unwrap();
+        assert_eq!(own["sections"].as_array().unwrap().len(), 1, "{own}");
+    }
+
+    #[tokio::test]
+    async fn a_decision_under_a_plan_key_is_not_a_plan() {
+        let lib = icebox_test_lib().await;
+        propose_decision(&lib, "Use JWT", "stateless tokens", "plan:ghost").await;
+
+        let listed = call(tool_plan_list(&serde_json::json!({}), &lib))
+            .await
+            .unwrap();
+        assert_eq!(listed["count"], 0, "{listed}");
+        assert!(tool_plan_get(&serde_json::json!({ "slug": "ghost" }), &lib)
+            .await
+            .is_err());
+    }
+
     #[test]
     fn icebox_tools_are_declared_and_dispatchable() {
         // A handler with no ToolInfo is invisible to clients; a ToolInfo

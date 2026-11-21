@@ -62,6 +62,14 @@ pub enum StorageError {
 
     #[error("initialization error: {0}")]
     Init(String),
+
+    /// A caller mistake rather than a storage failure: an unknown plan
+    /// slug, a phase the plan does not have. The text carries no
+    /// "database error:" prefix on purpose: the MCP breaker counts errors
+    /// that look like storage failures, and three typos in a row must not
+    /// put the server in degraded mode.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 #[async_trait]

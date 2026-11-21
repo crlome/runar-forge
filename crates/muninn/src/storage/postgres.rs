@@ -2867,6 +2867,15 @@ mod tests {
     );
 
     pg_test!(
+        pg_plan_store_keeps_every_plans_data,
+        "plan-parity",
+        |adapter, namespace| {
+            let lib = pg_librarian(adapter, &namespace);
+            crate::plans::parity::keeps_every_plans_data(&lib, &namespace).await;
+        }
+    );
+
+    pg_test!(
         pg_session_text_drops_private_blocks,
         "session-private",
         |adapter, namespace| {

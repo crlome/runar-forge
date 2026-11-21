@@ -76,7 +76,12 @@ pub fn plan_meta_key(slug: &str) -> String {
     format!("{PLAN_PREFIX}{slug}")
 }
 
-/// Prefix matching a plan's meta entry *and* all of its sections.
+/// Storage prefix covering a plan's meta entry and its sections.
+///
+/// Coarse on purpose: it also matches every longer slug (`plan:auth`
+/// covers `plan:auth-flow`) and any non-plan row a generic save put under
+/// the scope. Never act on what it returns without filtering through
+/// `owned_by_plan`.
 pub fn plan_scope_prefix(slug: &str) -> String {
     format!("{PLAN_PREFIX}{slug}")
 }
@@ -495,21 +500,30 @@ fn key_belongs_to(slug: &str, key: &str) -> bool {
     key == meta || key.starts_with(&format!("{meta}:"))
 }
 
+/// Is this entry part of plan `slug` — the key boundary *and* the type?
+///
+/// The key half stops `plan:auth` claiming `plan:auth-flow`; the type half
+/// stops a decision saved under a `plan:` key (the shape the old protocol
+/// advice produced) reading as a plan, or being retired as one.
+fn owned_by_plan(slug: &str, entry: &MemoryEntry) -> bool {
+    entry.entry_type == EntryType::Plan
+        && entry
+            .topic_key
+            .as_deref()
+            .is_some_and(|k| key_belongs_to(slug, k))
+}
+
 fn plan_from_entries(slug: &str, entries: &[MemoryEntry]) -> Option<PlanDocument> {
     let meta_key = plan_meta_key(slug);
-    let meta = entries
-        .iter()
-        .find(|e| e.topic_key.as_deref() == Some(meta_key.as_str()))?;
+    let meta = entries.iter().find(|e| {
+        e.entry_type == EntryType::Plan && e.topic_key.as_deref() == Some(meta_key.as_str())
+    })?;
     // Scope here rather than at the call sites: `list_plans` passes every
     // `plan:` entry in the namespace, and merging their phases together
     // made each plan report the union of all of them.
     let mut sections: Vec<PlanSection> = entries
         .iter()
-        .filter(|e| {
-            e.topic_key
-                .as_deref()
-                .is_some_and(|k| key_belongs_to(slug, k))
-        })
+        .filter(|e| owned_by_plan(slug, e))
         .filter_map(section_from_entry)
         .collect();
     // The storage query orders by topic_key, which is already reading order;
@@ -527,6 +541,9 @@ fn plan_from_entries(slug: &str, entries: &[MemoryEntry]) -> Option<PlanDocument
 }
 
 fn icebox_from_entry(entry: &MemoryEntry) -> Option<IceboxItem> {
+    if entry.entry_type != EntryType::Icebox {
+        return None;
+    }
     let topic_key = entry.topic_key.as_deref()?;
     let slug = parse_icebox_key(topic_key)?;
     Some(IceboxItem {
@@ -562,6 +579,27 @@ impl<'a> PlanStore<'a> {
         self.lib
             .list_by_topic_prefix(self.project_id.as_deref(), prefix)
             .await
+    }
+
+    /// Every live entry of plan `slug` and nothing else: the prefix query
+    /// filtered by `owned_by_plan`.
+    async fn plan_entries(&self, slug: &str) -> StorageResult<Vec<MemoryEntry>> {
+        Ok(self
+            .entries_under(&plan_scope_prefix(slug))
+            .await?
+            .into_iter()
+            .filter(|e| owned_by_plan(slug, e))
+            .collect())
+    }
+
+    /// The live icebox entry at `icebox:<slug>`, typed as one. The type
+    /// check sits in the predicate, so a note at the same key never hides
+    /// the item.
+    async fn icebox_entry(&self, slug: &str) -> StorageResult<Option<MemoryEntry>> {
+        let key = icebox_key(slug);
+        Ok(self.entries_under(&key).await?.into_iter().find(|e| {
+            e.entry_type == EntryType::Icebox && e.topic_key.as_deref() == Some(key.as_str())
+        }))
     }
 
     async fn save(
@@ -630,15 +668,18 @@ impl<'a> PlanStore<'a> {
             }
         }
 
-        // Retire anything left under this plan's prefix that this write did
-        // not produce — a section removed from the plan, or a trailing part
-        // of a section that shrank. The completeness premise holds here and
-        // only here: we just wrote the plan's entire key set, so a key under
-        // the prefix that is absent from it is stale by construction. (The
-        // retired `.sql` reconciliation pass failed precisely because that
-        // premise did not hold for it.)
+        // Retire anything of this plan's that this write did not produce — a
+        // section removed from the plan, or a trailing part of a section
+        // that shrank. The completeness premise holds over the plan's own
+        // keys and only there: we just wrote the plan's entire key set, so
+        // an owned key absent from it is stale by construction. The raw
+        // prefix query does not return the plan's keys alone — it also
+        // returns every longer slug's and any decision filed under the
+        // scope — which is why the candidates go through `plan_entries`.
+        // (The retired `.sql` reconciliation pass failed because its
+        // premise did not hold either.)
         let stale: Vec<_> = self
-            .entries_under(&plan_scope_prefix(&slug))
+            .plan_entries(&slug)
             .await?
             .into_iter()
             .filter(|e| {
@@ -708,6 +749,9 @@ impl<'a> PlanStore<'a> {
         let entries = self.entries_under(PLAN_PREFIX).await?;
         let mut summaries = Vec::new();
         for entry in &entries {
+            if entry.entry_type != EntryType::Plan {
+                continue;
+            }
             let Some(key) = entry.topic_key.as_deref() else {
                 continue;
             };
@@ -814,10 +858,9 @@ impl<'a> PlanStore<'a> {
 
     pub async fn get_icebox(&self, slug: &str) -> StorageResult<Option<IceboxItem>> {
         Ok(self
-            .entries_under(&icebox_key(slug))
+            .icebox_entry(slug)
             .await?
-            .iter()
-            .find(|e| e.topic_key.as_deref() == Some(icebox_key(slug).as_str()))
+            .as_ref()
             .and_then(icebox_from_entry))
     }
 
@@ -842,15 +885,9 @@ impl<'a> PlanStore<'a> {
         status: IceboxStatus,
         promoted_to: Option<&str>,
     ) -> StorageResult<IceboxItem> {
-        let key = icebox_key(slug);
-        let entry = self
-            .entries_under(&key)
-            .await?
-            .into_iter()
-            .find(|e| e.topic_key.as_deref() == Some(key.as_str()))
-            .ok_or_else(|| {
-                crate::storage::StorageError::Database(format!("no icebox item with slug '{slug}'"))
-            })?;
+        let entry = self.icebox_entry(slug).await?.ok_or_else(|| {
+            crate::storage::StorageError::Database(format!("no icebox item with slug '{slug}'"))
+        })?;
 
         let mut tags = entry.tags.clone();
         set_tag(&mut tags, STATUS_TAG, status.as_str());
@@ -859,9 +896,106 @@ impl<'a> PlanStore<'a> {
         }
         self.lib.retag(entry.id, tags).await?;
 
-        self.get_icebox(slug)
+        self.get_icebox(slug).await?.ok_or_else(|| {
+            crate::storage::StorageError::Invalid(format!(
+                "icebox item '{slug}' changed during the update; read it again"
+            ))
+        })
+    }
+}
+
+/// One scenario, run over in-memory SQLite (`tests` below) and live
+/// Postgres (`storage::postgres` tests): the two backends have diverged on
+/// plan identity before, so both must keep every plan's data the same way.
+#[cfg(test)]
+pub(crate) mod parity {
+    use super::*;
+
+    /// Slugs that collide in every way the store has got wrong: a prefix
+    /// pair, a case variant and a spaced variant.
+    pub(crate) const COLLIDING_SLUGS: [&str; 4] = ["auth", "auth-flow", "AUTH", "auth flow"];
+
+    async fn propose_other(
+        lib: &MemoryLibrarian,
+        project: &str,
+        t: EntryType,
+        key: &str,
+    ) -> uuid::Uuid {
+        lib.propose(MemoryEntryInput {
+            title: format!("{t:?} under {key}"),
+            content: format!("filed under {key} by a generic save"),
+            entry_type: t,
+            project_id: Some(project.to_string()),
+            topic_key: Some(key.to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    pub(crate) async fn keeps_every_plans_data(lib: &MemoryLibrarian, project: &str) {
+        let [auth, auth_flow, _, _] = COLLIDING_SLUGS;
+        let store = PlanStore::new(lib, Some(project.to_string()));
+
+        store
+            .create_plan(
+                "auth flow",
+                Some(auth_flow),
+                "the longer slug",
+                &[
+                    SectionInput::phase(1, "Phase 1 — tokens", "issue tokens"),
+                    SectionInput::prose("Notes", "auth-flow's own notes"),
+                ],
+                PlanStatus::Draft,
+            )
             .await
-            .map(|i| i.expect("item was present at the start of this call"))
+            .unwrap();
+        let ghost = propose_other(lib, project, EntryType::Decision, "plan:ghost").await;
+        let note = propose_other(lib, project, EntryType::Note, "icebox:x").await;
+        store
+            .create_plan(
+                "auth",
+                Some(auth),
+                "the prefix slug",
+                &[SectionInput::phase(1, "Phase 1 — login", "log in")],
+                PlanStatus::Draft,
+            )
+            .await
+            .unwrap();
+
+        let flow = store
+            .get_plan(auth_flow)
+            .await
+            .unwrap()
+            .expect("auth-flow survives auth");
+        assert_eq!(
+            flow.sections
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Phase 1 — tokens", "Notes"]
+        );
+        let slugs: Vec<String> = store
+            .list_plans(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(
+            slugs.len(),
+            2,
+            "a decision under plan: is not a plan: {slugs:?}"
+        );
+        assert!(store.get_plan("ghost").await.unwrap().is_none());
+        assert!(store.get_icebox("x").await.unwrap().is_none());
+        lib.get(ghost)
+            .await
+            .expect("the decision under plan: is not retired");
+        lib.get(note)
+            .await
+            .expect("the note under icebox: is untouched");
     }
 }
 
@@ -1640,6 +1774,45 @@ none
             health.total() >= 3,
             "meta + section + icebox item must all be queued for the remote, got {}",
             health.total()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_store_keeps_every_plans_data_on_sqlite() {
+        let lib = test_lib().await;
+        parity::keeps_every_plans_data(&lib, "parity").await;
+    }
+
+    #[tokio::test]
+    async fn a_decision_under_an_icebox_key_is_not_an_icebox_item() {
+        let lib = test_lib().await;
+        let decision = lib
+            .propose(MemoryEntryInput {
+                title: "Later".into(),
+                content: "revisit the queue design".into(),
+                entry_type: EntryType::Decision,
+                topic_key: Some("icebox:ghost".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let store = PlanStore::new(&lib, None);
+
+        assert!(store.list_icebox(None).await.unwrap().is_empty());
+        assert!(store.get_icebox("ghost").await.unwrap().is_none());
+        assert!(store
+            .set_icebox_status("ghost", IceboxStatus::Dropped, None)
+            .await
+            .is_err());
+        assert!(
+            !lib.get(decision)
+                .await
+                .unwrap()
+                .tags
+                .iter()
+                .any(|t| t.starts_with("status:")),
+            "the decision must not be retagged as an icebox item"
         );
     }
 

@@ -194,6 +194,14 @@ explicitly, not assume it. Where the premise genuinely holds, say so in a
 comment naming why — as `PlanStore::create_plan` does, having just written
 the plan's entire key set.
 
+A complete written set is not enough on its own: the candidate set must hold
+only what the pass owns before the difference is taken. `create_plan`'s
+written set was complete, but its candidates came from a raw `plan:<slug>`
+prefix query, which also returns every longer slug's keys and any decision
+filed under the scope — so creating plan `auth` retired plan `auth-flow`.
+Filter candidates by what makes them yours (key boundary and entry type),
+and test with a sibling that shares the prefix.
+
 ## Text handling: chars, not bytes
 
 Two releases were patched for the same defect. `&s[..n]` and
