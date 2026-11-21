@@ -346,6 +346,18 @@ pub fn scrub(text: &mut String) -> usize {
     total
 }
 
+/// [`strip_private`] in place, then [`scrub`]: the order `propose` uses, so
+/// a secret inside a private block goes with the block. For write paths that
+/// bypass `propose` (session goals, summaries, discoveries). Returns private
+/// blocks plus secret hits. A second pass changes nothing.
+pub fn scrub_all(text: &mut String) -> usize {
+    let (stripped, blocks) = strip_private(text);
+    if blocks > 0 {
+        *text = stripped;
+    }
+    blocks + scrub(text)
+}
+
 /// Recursively redact every string leaf of a JSON value (hook payloads carry
 /// tool input/output as nested JSON). Returns the total number of hits.
 pub fn redact_secrets_value(value: &mut serde_json::Value) -> usize {

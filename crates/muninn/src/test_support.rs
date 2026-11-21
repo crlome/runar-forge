@@ -146,6 +146,83 @@ impl crate::embedding::EmbeddingProvider for FixedEmbeddings {
     }
 }
 
+/// The session-text scenario shared by the SQLite and live-Postgres tests:
+/// every session write path drops private blocks before storage. `project`
+/// must be unique to the test on a shared database.
+pub(crate) async fn session_paths_drop_private_blocks(
+    lib: &crate::librarian::MemoryLibrarian,
+    project: &str,
+) {
+    use crate::types::{EntryType, ListFilters, SessionInput, SessionSummary, SessionUpdate};
+
+    let session = lib
+        .propose_session(SessionInput {
+            goal: Some("ship <private>PRIV-S1</private> plan".into()),
+            project_id: Some(project.into()),
+            tool: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(session.goal.as_deref(), Some("ship [redacted] plan"));
+
+    lib.end_session(
+        session.id,
+        SessionSummary {
+            summary: "done <private>PRIV-S2</private>".into(),
+            goal: Some("g <private>PRIV-S3</private>".into()),
+            instructions: vec!["<private>PRIV-S4</private> rule".into()],
+            accomplished: vec!["a <private>PRIV-S5</private>".into()],
+            discoveries: vec!["d <private>PRIV-S6</private>".into()],
+            ..Default::default()
+        },
+        Some(project),
+    )
+    .await
+    .unwrap();
+    let stored = lib.get_session(session.id).await.unwrap();
+    assert_eq!(stored.goal.as_deref(), Some("g [redacted]"));
+    assert_eq!(stored.summary.as_deref(), Some("done [redacted]"));
+    assert_eq!(stored.discoveries, ["d [redacted]"]);
+
+    // The call the prompt hook makes with a session's first prompt.
+    let next = lib
+        .propose_session(SessionInput {
+            goal: None,
+            project_id: Some(project.into()),
+            tool: None,
+        })
+        .await
+        .unwrap();
+    lib.update_session(
+        next.id,
+        SessionUpdate {
+            goal: Some("<private>PRIV-S7</private> deploy the api".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let stored = lib.get_session(next.id).await.unwrap();
+    assert_eq!(stored.goal.as_deref(), Some("[redacted] deploy the api"));
+
+    let entries = lib
+        .list(ListFilters {
+            entry_type: Some(EntryType::Session),
+            namespace: Some(project.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!entries.is_empty(), "the session-summary entry was saved");
+    for entry in entries {
+        assert!(
+            !entry.title.contains("PRIV-") && !entry.content.contains("PRIV-"),
+            "private text in the session entry: {}",
+            entry.content
+        );
+    }
+}
+
 /// Claim every queued outbox row and decode its payload the way
 /// `sync::push` does before sending it: exactly what the remote would
 /// receive.

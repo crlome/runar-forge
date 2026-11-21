@@ -2983,8 +2983,10 @@ async fn persist_user_prompt(prompt: &str, project_id: Option<&str>) -> anyhow::
             .as_deref()
             .is_none_or(|g| g == "Auto-started session");
         if placeholder {
-            // Redact before storing: the goal column bypasses propose().
-            let (clean_prompt, _) = redact::redact_secrets(prompt);
+            // Clean before the 120-char cut, so the budget is spent on public
+            // text; update_session cleans again, which changes nothing.
+            let mut clean_prompt = prompt.to_string();
+            redact::scrub_all(&mut clean_prompt);
             let goal: String = char_prefix(&clean_prompt, 120).to_string();
             let _ = librarian
                 .update_session(

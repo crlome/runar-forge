@@ -356,13 +356,14 @@ impl MemoryLibrarian {
     // ── Sessions ───────────────────────────────────────────────
 
     pub async fn propose_session(&self, input: SessionInput) -> StorageResult<Session> {
-        // Straight to storage, so it scrubs here. The goal is model- or
+        // Straight to storage, so it cleans here. The goal is model- or
         // caller-supplied free text — "set up deploys with sk-ant-…" is an
-        // ordinary thing to write — and it is persisted on the session row and
-        // replayed into the next session's context packet.
+        // ordinary thing to write, and so is a <private> block — and it is
+        // persisted on the session row and replayed into the next session's
+        // context packet.
         let mut input = input;
         if let Some(ref mut goal) = input.goal {
-            crate::redact::scrub(goal);
+            crate::redact::scrub_all(goal);
         }
         let ns = self.ns(input.project_id.as_deref()).to_string();
         self.storage.create_session(input, &ns).await
@@ -396,19 +397,13 @@ impl MemoryLibrarian {
         checkpoint: bool,
     ) -> StorageResult<Session> {
         // This path persists via storage.save directly (no propose), so it
-        // must redact here: summaries/goals/discoveries are model-supplied
+        // must clean here: summaries/goals/discoveries are model-supplied
         // text and end up both in the sessions table and in an FTS-indexed
-        // session entry.
+        // session entry. Private blocks go first, as in propose.
         let mut summary = summary;
-        let redact_string = |s: &mut String| {
-            let (clean, hits) = crate::redact::redact_secrets(s);
-            if !hits.is_empty() {
-                *s = clean;
-            }
-        };
-        redact_string(&mut summary.summary);
+        crate::redact::scrub_all(&mut summary.summary);
         if let Some(ref mut g) = summary.goal {
-            redact_string(g);
+            crate::redact::scrub_all(g);
         }
         for item in summary
             .instructions
@@ -416,7 +411,7 @@ impl MemoryLibrarian {
             .chain(summary.accomplished.iter_mut())
             .chain(summary.discoveries.iter_mut())
         {
-            redact_string(item);
+            crate::redact::scrub_all(item);
         }
 
         // Goal and discoveries used to be dropped here (SessionUpdate had no
@@ -489,11 +484,23 @@ impl MemoryLibrarian {
             .find(|s| s.status == SessionStatus::Active))
     }
 
+    /// The chokepoint for session text written outside `end_session`: the
+    /// first-prompt goal, the ping and summarize hooks. Like `propose`, it
+    /// strips private blocks and redacts secrets before storage.
     pub async fn update_session(
         &self,
         id: uuid::Uuid,
         update: crate::types::SessionUpdate,
     ) -> StorageResult<Session> {
+        let mut update = update;
+        for text in update
+            .goal
+            .iter_mut()
+            .chain(update.summary.iter_mut())
+            .chain(update.discoveries.iter_mut().flatten())
+        {
+            crate::redact::scrub_all(text);
+        }
         self.storage.update_session(id, update).await
     }
 
@@ -1395,14 +1402,17 @@ fn format_context_packet(
         lines.push("### Recent Sessions".into());
         for s in sessions {
             let date = s.started_at.format("%Y-%m-%d").to_string();
+            // Stripped again at render time: rows written before session
+            // text was cleaned still hold private blocks, and every packet
+            // would replay them.
             let goal = s
                 .goal
                 .as_deref()
-                .map(|g| format!(": {g}"))
+                .map(|g| format!(": {}", crate::redact::strip_private(g).0))
                 .unwrap_or_default();
             lines.push(format!("- Session {date}{goal}"));
             if let Some(ref summary) = s.summary {
-                lines.push(format!("  {summary}"));
+                lines.push(format!("  {}", crate::redact::strip_private(summary).0));
             }
         }
         lines.push(String::new());
@@ -1634,6 +1644,53 @@ mod tests {
             "the tombstone must carry deleted_at, or the remote resolver \
              treats it as a live entry and the deletion never propagates"
         );
+    }
+
+    /// Session text bypasses `propose`, and every path into the sessions
+    /// table or the session-summary entry used to redact secrets only.
+    #[tokio::test]
+    async fn session_paths_drop_private_blocks() {
+        let lib = test_librarian().await;
+        crate::test_support::session_paths_drop_private_blocks(&lib, "p").await;
+    }
+
+    /// Rows written before session text was cleaned still hold private
+    /// blocks, and every SessionStart packet replayed them.
+    #[tokio::test]
+    async fn context_packet_strips_private_blocks_from_stored_sessions() {
+        let (lib, storage) = test_librarian_with_storage().await;
+        let legacy = storage
+            .create_session(
+                SessionInput {
+                    goal: Some("legacy <private>PRIV-L1</private> goal".into()),
+                    project_id: Some("p".into()),
+                    tool: None,
+                },
+                "p",
+            )
+            .await
+            .unwrap();
+        storage
+            .update_session(
+                legacy.id,
+                SessionUpdate {
+                    status: Some(SessionStatus::Completed),
+                    summary: Some("old <private>PRIV-L2</private> summary".into()),
+                    ended_at: Some(Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let packet = lib.get_context(None, Some("p"), 3).await.unwrap();
+        assert!(
+            packet.formatted.contains("legacy [redacted] goal")
+                && packet.formatted.contains("old [redacted] summary"),
+            "{}",
+            packet.formatted
+        );
+        assert!(!packet.formatted.contains("PRIV-L"), "{}", packet.formatted);
     }
 
     /// The auto-link query was cut with `[..500]`, which panicked whenever

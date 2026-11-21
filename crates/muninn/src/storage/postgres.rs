@@ -2822,6 +2822,21 @@ mod tests {
         format!("pgtest-{tag}-{}", Uuid::new_v4().simple())
     }
 
+    /// A librarian over the live adapter. Scenarios pass the test's own
+    /// namespace as the project id, never a literal: the CI database is
+    /// shared.
+    fn pg_librarian(
+        adapter: PostgresAdapter,
+        namespace: &str,
+    ) -> crate::librarian::MemoryLibrarian {
+        crate::librarian::MemoryLibrarian::new(
+            std::sync::Arc::new(adapter),
+            std::sync::Arc::new(crate::embedding::DisabledEmbeddingProvider),
+            namespace,
+            None,
+        )
+    }
+
     // Both idents are passed in rather than introduced by the macro:
     // macro-hygiene means a `namespace` bound inside the expansion is a
     // different identifier from the one the test body writes.
@@ -2839,6 +2854,15 @@ mod tests {
             }
         };
     }
+
+    pg_test!(
+        pg_session_text_drops_private_blocks,
+        "session-private",
+        |adapter, namespace| {
+            let lib = pg_librarian(adapter, &namespace);
+            crate::test_support::session_paths_drop_private_blocks(&lib, &namespace).await;
+        }
+    );
 
     pg_test!(
         pg_migrations_replay_to_head,
