@@ -229,11 +229,7 @@ pub fn is_machine_generated_prompt(s: &str) -> bool {
     ]
     .iter()
     .any(|p| opener.contains(p));
-    if second_person && has_embedded_data_block(s) {
-        return true;
-    }
-
-    false
+    second_person && has_embedded_data_block(s)
 }
 
 /// A fact block pasted in for a machine to consume: an XML-ish tag pair or a
