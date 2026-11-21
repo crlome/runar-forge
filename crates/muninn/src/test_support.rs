@@ -62,6 +62,30 @@ pub(crate) fn with_env(key: &'static str, val: &str) -> EnvGuard {
     }
 }
 
+/// Panic unless a plain `fs::write` in `dir` creates a file that group or
+/// others can read. Owner-only mode tests call this first: under umask 077
+/// every new file is private anyway, and they would pass without testing
+/// anything.
+#[cfg(unix)]
+pub(crate) fn require_umask_leak(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join(".umask-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+    std::fs::remove_file(&probe).unwrap();
+    assert!(
+        mode & 0o044 != 0,
+        "positive control unavailable under this umask: a new file is {mode:o}"
+    );
+}
+
+/// Permission bits of `path`.
+#[cfg(unix)]
+pub(crate) fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
 /// Characters and sequences that break text code written for ASCII.
 pub(crate) const HOSTILE_ATOMS: &[&str] = &[
     // Lowercase to a different byte length: an offset found in the

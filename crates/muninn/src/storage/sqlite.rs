@@ -67,8 +67,21 @@ pub struct SqliteAdapter {
 impl SqliteAdapter {
     pub fn new(path: &str, namespace: &str) -> StorageResult<Self> {
         let path = PathBuf::from(shellexpand(path));
+        let location = path.to_string_lossy();
+        let plain_file = location != ":memory:" && !location.starts_with("file:");
 
-        if let Some(parent) = path.parent() {
+        if plain_file {
+            // Owner-only, like the rest of the runar directory. The file is
+            // created empty before SQLite opens it: SQLite treats an empty
+            // file as a new database and gives -wal and -shm its mode. An
+            // existing file, including one another process created a moment
+            // ago, is never truncated.
+            let init_err = |e: std::io::Error| StorageError::Init(e.to_string());
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                crate::setup::create_private_dir(parent).map_err(init_err)?;
+            }
+            crate::setup::create_private_file(&path).map_err(init_err)?;
+        } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StorageError::Init(e.to_string()))?;
         }
 
@@ -3122,6 +3135,58 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQLite created memory.db 0644 under the usual umask, -wal and -shm
+    /// inherited it, and the parent directory was 0755.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_database_files_are_owner_only() {
+        use crate::test_support::{mode_of, require_umask_leak};
+        let tmp = tempfile::tempdir().unwrap();
+        require_umask_leak(tmp.path());
+        let path = tmp.path().join("sub").join("memory.db");
+        let adapter = SqliteAdapter::new(path.to_str().unwrap(), "test").unwrap();
+        adapter.initialize().await.unwrap();
+        adapter
+            .save(
+                MemoryEntryInput {
+                    title: "t".into(),
+                    content: "c".into(),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&path.with_extension("db-wal")), 0o600);
+        assert_eq!(mode_of(path.parent().unwrap()), 0o700);
+    }
+
+    /// The file is created before SQLite opens it; that must never truncate
+    /// a database that already exists.
+    #[tokio::test]
+    async fn opening_an_existing_database_keeps_its_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory.db");
+        let path = path.to_str().unwrap();
+        let first = SqliteAdapter::new(path, "test").unwrap();
+        first.initialize().await.unwrap();
+        let saved = first
+            .save(
+                MemoryEntryInput {
+                    title: "kept".into(),
+                    content: "row".into(),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let second = SqliteAdapter::new(path, "test").unwrap();
+        assert_eq!(second.get(saved.id).await.unwrap().title, "kept");
+    }
 
     /// FTS5 reports a malformed query as a row error, and `fts_search` drops
     /// row errors, so `Ok` alone proves nothing. Each query therefore also

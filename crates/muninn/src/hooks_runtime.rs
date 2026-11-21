@@ -73,7 +73,7 @@ pub fn hook_budget() -> Duration {
 pub fn append_hook_log(scope: &str, message: &str) {
     let path = hook_log_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        let _ = crate::setup::create_private_dir(parent);
     }
     if let Ok(meta) = fs::metadata(&path) {
         if meta.len() > HOOK_LOG_MAX_BYTES {
@@ -81,7 +81,16 @@ pub fn append_hook_log(scope: &str, message: &str) {
             let _ = fs::rename(&path, rotated);
         }
     }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    // Owner-only, including right after rotation: the log can quote what
+    // a hook was processing.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut f) = options.open(&path) {
         let ts = chrono::Utc::now().to_rfc3339();
         let _ = writeln!(f, "{ts} [{scope}] {message}");
     }
@@ -185,6 +194,19 @@ mod tests {
     use super::*;
 
     use crate::test_support::{with_runar_home, HOME_LOCK};
+
+    /// The log was created 0644, including right after each rotation.
+    #[cfg(unix)]
+    #[test]
+    fn hook_log_is_created_owner_only() {
+        use crate::test_support::{mode_of, require_umask_leak};
+        with_runar_home(|| {
+            require_umask_leak(&crate::setup::home_dir());
+            append_hook_log("test", "first line");
+            assert_eq!(mode_of(&hook_log_path()), 0o600);
+            assert_eq!(mode_of(&crate::setup::runar_dir()), 0o700);
+        });
+    }
 
     /// The message std builds for a real mid-character slice, which is what
     /// the default hook printed.

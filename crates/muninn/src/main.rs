@@ -1168,6 +1168,10 @@ async fn create_librarian_for_hook(project_id: &str) -> anyhow::Result<Arc<Memor
 }
 
 async fn create_librarian() -> anyhow::Result<Arc<MemoryLibrarian>> {
+    // Every hook, CLI command and MCP start that opens the store tightens
+    // an install whose files were created before they were owner-only.
+    // `runar doctor` never comes here, so it stays read-only.
+    setup::restrict_runar_permissions();
     let storage_type = std::env::var("RUNAR_STORAGE").unwrap_or_else(|_| "postgresql".into());
     let namespace = std::env::var("RUNAR_MEMORY_NAMESPACE").unwrap_or_else(|_| "default".into());
 

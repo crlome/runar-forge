@@ -28,11 +28,92 @@ pub fn runar_dir() -> PathBuf {
     home_dir().join(".runar-forge")
 }
 
+// ── Owner-only files ───────────────────────────────────────────────
+//
+// The runar directory holds every memory (captured prompts included), the
+// database URL and API keys in `.env`, and the hook log. Under the usual
+// 022 umask, `create_dir_all`, `fs::write` and SQLite made them readable by
+// every local account. Unix only: Windows profiles are per-user by ACL.
+
+/// Files in the runar directory that hold memories, credentials or logs.
+const PRIVATE_FILES: &[&str] = &[
+    ".env",
+    "memory.db",
+    "memory.db-wal",
+    "memory.db-shm",
+    "hook.log",
+    "hook.log.1",
+];
+
+/// Create `path` and any missing parents owner-only (0700 on Unix). An
+/// existing directory keeps its mode; [`restrict_runar_permissions`]
+/// tightens the runar directory itself.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Create `path` owner-only (0600 on Unix) and return it open for writing,
+/// or `None` when it already exists. Never truncates: a file that exists,
+/// or that another process created a moment ago, is left as it is.
+fn create_private_new(path: &Path) -> std::io::Result<Option<fs::File>> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create `path` empty and owner-only (0600 on Unix) unless it exists.
+pub fn create_private_file(path: &Path) -> std::io::Result<()> {
+    create_private_new(path).map(|_| ())
+}
+
+/// Make an existing install owner-only: clear the group and other bits on
+/// the runar directory and its [`PRIVATE_FILES`]. Runs at every store open,
+/// so the first command after an upgrade tightens an install made before
+/// files were created owner-only. Best effort: errors are ignored, symlinks
+/// are skipped, nothing is created, and private files are not touched.
+pub fn restrict_runar_permissions() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tighten = |path: &Path| {
+            let Ok(meta) = fs::symlink_metadata(path) else {
+                return;
+            };
+            let mode = meta.permissions().mode() & 0o7777;
+            if meta.file_type().is_symlink() || mode & 0o077 == 0 {
+                return;
+            }
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & !0o077));
+        };
+        let dir = runar_dir();
+        tighten(&dir);
+        for name in PRIVATE_FILES {
+            tighten(&dir.join(name));
+        }
+    }
+}
+
 // ── init ───────────────────────────────────────────────────────────
 
 pub fn write_env_file(storage: &str) -> anyhow::Result<PathBuf> {
     let dir = runar_dir();
-    fs::create_dir_all(&dir)?;
+    create_private_dir(&dir)?;
     let env_path = dir.join(".env");
 
     if env_path.exists() {
@@ -56,7 +137,11 @@ pub fn write_env_file(storage: &str) -> anyhow::Result<PathBuf> {
         }
     };
 
-    fs::write(&env_path, content)?;
+    // Owner-only and never truncated: if another process created the file
+    // a moment ago, keep it, as when it already existed above.
+    if let Some(mut file) = create_private_new(&env_path)? {
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
+    }
     Ok(env_path)
 }
 
@@ -1115,6 +1200,86 @@ pub fn ping_file_path(project_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `create_dir_all` and `fs::write` made the directory 0755 and `.env`
+    /// 0644 under the usual umask; `.env` holds the database URL and keys.
+    #[cfg(unix)]
+    #[test]
+    fn env_file_and_runar_dir_are_created_owner_only() {
+        use crate::test_support::{mode_of, require_umask_leak, with_runar_home};
+        with_runar_home(|| {
+            require_umask_leak(&home_dir());
+            let env = write_env_file("sqlite").unwrap();
+            assert_eq!(mode_of(&env), 0o600);
+            assert_eq!(mode_of(&runar_dir()), 0o700);
+        });
+    }
+
+    /// The store's file is created before SQLite opens it, and on a fresh
+    /// install the MCP server and the SessionStart hook do that at the same
+    /// moment: every caller succeeds, and an existing file is never
+    /// truncated.
+    #[test]
+    fn create_private_file_tolerates_races_and_never_truncates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory.db");
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || create_private_file(&path))
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap().unwrap();
+        }
+        #[cfg(unix)]
+        assert_eq!(crate::test_support::mode_of(&path), 0o600);
+
+        fs::write(&path, b"existing database").unwrap();
+        create_private_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"existing database");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_tightens_an_existing_install() {
+        use crate::test_support::{mode_of, with_runar_home};
+        use std::os::unix::fs::PermissionsExt;
+        with_runar_home(|| {
+            let dir = runar_dir();
+            restrict_runar_permissions();
+            assert!(!dir.exists(), "nothing is created without an install");
+
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let private = [
+                ".env",
+                "memory.db",
+                "memory.db-wal",
+                "memory.db-shm",
+                "hook.log",
+            ];
+            for name in private.iter().chain(&["notes.txt"]) {
+                let path = dir.join(name);
+                fs::write(&path, b"x").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+
+            for _ in 0..2 {
+                // The second pass must change nothing.
+                restrict_runar_permissions();
+                assert_eq!(mode_of(&dir), 0o700);
+                for name in private {
+                    assert_eq!(mode_of(&dir.join(name)), 0o600, "{name}");
+                }
+                assert_eq!(
+                    mode_of(&dir.join("notes.txt")),
+                    0o644,
+                    "other files keep their mode"
+                );
+            }
+        });
+    }
 
     #[test]
     fn parse_remote_patterns() {
